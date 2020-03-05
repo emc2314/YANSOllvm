@@ -20,7 +20,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Utils/Local.h" // For DemoteRegToStack and DemotePHIToStack
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 
@@ -28,7 +28,7 @@ using namespace llvm;
 
 namespace {
 struct Flattening : public FunctionPass {
-  static char ID; // Pass identification, replacement for typeid
+  static char ID;
 
   Flattening() : FunctionPass(ID) {
     initializeLowerSwitchPass(*PassRegistry::getPassRegistry());
@@ -49,7 +49,6 @@ Pass *createFlatteningPass() { return new Flattening(); }
 
 bool Flattening::runOnFunction(Function &F) {
   Function *tmp = &F;
-  // Do we obfuscate
   return flatten(tmp);
 }
 
@@ -105,14 +104,9 @@ void fixStack(Function *f) {
 bool Flattening::flatten(Function *f) {
   std::vector<BasicBlock *> origBB;
   BasicBlock *loopEntry;
-  //BasicBlock *loopEnd;
   LoadInst *load;
   SwitchInst *switchI;
   AllocaInst *switchVar;
-
-  // Lower switch
-  //FunctionPass *lower = createLowerSwitchPass();
-  //lower->runOnFunction(*f);
 
   // Save all original BB
   for (Function::iterator i = f->begin(); i != f->end(); ++i) {
@@ -134,7 +128,7 @@ bool Flattening::flatten(Function *f) {
   origBB.erase(origBB.begin());
 
   // Get a pointer on the first BB
-  Function::iterator tmp = f->begin(); //++tmp;
+  Function::iterator tmp = f->begin();
   BasicBlock *insert = &*tmp;
 
   // If main begin with an if
@@ -169,7 +163,6 @@ bool Flattening::flatten(Function *f) {
 
   // Create main loop
   loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
-  //loopEnd = BasicBlock::Create(f->getContext(), "loopEnd", f, insert);
 
   load = new LoadInst(switchVar, "switchVar", loopEntry);
 
@@ -177,20 +170,9 @@ bool Flattening::flatten(Function *f) {
   insert->moveBefore(loopEntry);
   BranchInst::Create(loopEntry, insert);
 
-  // loopEnd jump to loopEntry
-  //BranchInst::Create(loopEntry, loopEnd);
-
-  //BasicBlock *swDefault =
-  //    BasicBlock::Create(f->getContext(), "switchDefault", f, loopEnd);
-  //BranchInst::Create(loopEnd, swDefault);
-
   // Create switch instruction itself and set condition
   switchI = SwitchInst::Create(&*f->begin(), loopEntry, 0, loopEntry);
   switchI->setCondition(load);
-
-  // Remove branch jump from 1st BB and make a jump to the while
-  //f->begin()->getTerminator()->eraseFromParent();
-  //BranchInst::Create(loopEntry, &*f->begin());
 
   // Put all BB in the switch
   for (std::vector<BasicBlock *>::iterator b = origBB.begin();
@@ -228,13 +210,6 @@ bool Flattening::flatten(Function *f) {
       // Get next case
       numCase = switchI->findCaseDest(succ);
 
-      // If next case == default case (switchDefault)
-      //if (numCase == NULL) {
-      //  numCase = cast<ConstantInt>(
-      //      ConstantInt::get(switchI->getCondition()->getType(),
-      //                           switchI->getNumCases() - 1));
-      //}
-
       // Update switchVar and jump to the end of loop
       new StoreInst(numCase, load->getPointerOperand(), i);
       BranchInst::Create(loopEntry, i);
@@ -248,19 +223,6 @@ bool Flattening::flatten(Function *f) {
           switchI->findCaseDest(i->getTerminator()->getSuccessor(0));
       ConstantInt *numCaseFalse =
           switchI->findCaseDest(i->getTerminator()->getSuccessor(1));
-
-      // Check if next case == default case (switchDefault)
-      //if (numCaseTrue == NULL) {
-      //  numCaseTrue = cast<ConstantInt>(
-      //      ConstantInt::get(switchI->getCondition()->getType(),
-      //                           switchI->getNumCases() - 1));
-      //}
-
-      //if (numCaseFalse == NULL) {
-      //  numCaseFalse = cast<ConstantInt>(
-      //      ConstantInt::get(switchI->getCondition()->getType(),
-      //                           switchI->getNumCases() - 1));
-      //}
 
       // Create a SelectInst
       BranchInst *br = cast<BranchInst>(i->getTerminator());
