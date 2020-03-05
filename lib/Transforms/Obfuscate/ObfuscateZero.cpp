@@ -13,13 +13,18 @@ bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
       I != end; ++I) {
     Instruction &Inst = *I;
     if (isValidCandidateInstruction(Inst)) {
-      for (size_t i = 0; i < Inst.getNumOperands(); ++i) {
+      size_t opSize = Inst.getNumOperands();
+      if (isa<SwitchInst>(&Inst))
+        opSize = 1;
+      for (size_t i = 0; i < opSize; ++i) {
         if (Constant *C = isValidCandidateOperand(Inst.getOperand(i))) {
+          //errs() << "Original instruction!\n";
+          //errs() << Inst << "\n";
           if (Value *New_val = replaceZero(Inst, C)) {
             Inst.setOperand(i, New_val);
             modified = true;
-            errs() << "Modified instruction!\n";
-            errs() << Inst << "\n";
+            //errs() << "Modified instruction!\n";
+            //errs() << Inst << "\n";
           }
         }
       }
@@ -33,7 +38,9 @@ bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
 bool ObfuscateZero::isValidCandidateInstruction(Instruction &Inst) const {
   if (isa<GetElementPtrInst>(&Inst)) {
     return false;
-  } else if (isa<SwitchInst>(&Inst)) {
+  //} else if (isa<SwitchInst>(&Inst)) {
+  //  return false;
+  } else if (isa<ReturnInst>(&Inst)) {
     return false;
   } else if (isa<CallInst>(&Inst)) {
     return false;
@@ -76,7 +83,10 @@ Value *ObfuscateZero::createExpression
   // END HELP.
 
   // Tot = p*(x|any)^2
-  Value *temp = Builder.CreateOr(IntegerVect[Index], any);
+  Value *x = IntegerVect[Index];
+  Value *temp = Builder.CreateCast(CastInst::getCastOpcode(x, false, IntermediaryType, false),
+           x, IntermediaryType);
+  temp = Builder.CreateOr(temp, any);
   temp = Builder.CreateAnd(OverflowMask, temp);
   temp = Builder.CreateMul(temp,temp);
   temp = Builder.CreateMul(prime, temp);

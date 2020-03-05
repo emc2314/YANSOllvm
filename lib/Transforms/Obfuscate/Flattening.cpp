@@ -171,8 +171,7 @@ bool Flattening::flatten(Function *f) {
   BranchInst::Create(loopEntry, insert);
 
   // Create switch instruction itself and set condition
-  switchI = SwitchInst::Create(&*f->begin(), loopEntry, 0, loopEntry);
-  switchI->setCondition(load);
+  switchI = SwitchInst::Create(load, loopEntry, 0, loopEntry);
 
   // Put all BB in the switch
   for (std::vector<BasicBlock *>::iterator b = origBB.begin();
@@ -212,12 +211,9 @@ bool Flattening::flatten(Function *f) {
 
       // Update switchVar and jump to the end of loop
       new StoreInst(numCase, load->getPointerOperand(), i);
-      BranchInst::Create(loopEntry, i);
-      continue;
-    }
-
-    // If it's a conditional jump
-    if (i->getTerminator()->getNumSuccessors() == 2) {
+    } else {
+      // If it's a conditional jump
+      assert (i->getTerminator()->getNumSuccessors() == 2);
       // Get next cases
       ConstantInt *numCaseTrue =
           switchI->findCaseDest(i->getTerminator()->getSuccessor(0));
@@ -235,8 +231,24 @@ bool Flattening::flatten(Function *f) {
 
       // Update switchVar and jump to the end of loop
       new StoreInst(sel, load->getPointerOperand(), i);
-      BranchInst::Create(loopEntry, i);
-      continue;
+    }
+
+    //BranchInst::Create(loopEntry, i);
+    SwitchInst *switchII = SwitchInst::Create(ConstantInt::get(
+      IntegerType::get(i->getContext(), 32), 0), i, 0, i);
+    numCase = cast<ConstantInt>(ConstantInt::get(
+        switchII->getCondition()->getType(),
+        switchII->getNumCases()));
+    switchII->addCase(numCase, loopEntry);
+    for (std::vector<BasicBlock *>::iterator b2 = origBB.begin();
+         b2 != origBB.end(); ++b2) {
+      BasicBlock *j = *b2;
+      if(i != j){
+        numCase = cast<ConstantInt>(ConstantInt::get(
+            switchII->getCondition()->getType(),
+            switchII->getNumCases()));
+        switchII->addCase(numCase, j);
+      }
     }
   }
 
