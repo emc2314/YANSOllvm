@@ -1,0 +1,8 @@
+/*
+!lib/
+lib/*
+!lib/Transforms/
+lib/Transforms/*
+!lib/Transforms/Obfuscate
+lib/Transforms/Obfuscate/examples/*
+!.gitignore
