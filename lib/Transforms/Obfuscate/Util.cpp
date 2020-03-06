@@ -60,3 +60,12 @@ InlineAsm *generateGarbage(Function *f){
   InlineAsm *IA = InlineAsm::get(FunctionType::get(Type::getVoidTy(f->getContext()), false), s, "", true, false);
   return IA;
 }
+
+uint32_t fnvHash(const uint32_t data){
+  uint32_t b = fnvBasis;
+  b=(b^((data>>0)&0xFF))*fnvPrime;
+  b=(b^((data>>8)&0xFF))*fnvPrime;
+  b=(b^((data>>16)&0xFF))*fnvPrime;
+  b=(b^((data>>24)&0xFF))*fnvPrime;
+  return b;
+}

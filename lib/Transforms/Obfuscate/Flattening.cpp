@@ -57,7 +57,7 @@ bool Flattening::runOnFunction(Function &F) {
 
 bool Flattening::flatten(Function *f) {
   std::vector<BasicBlock *> origBB;
-  std::vector<uint32_t> bbIndex;
+  std::vector<uint32_t> bbIndex, bbHash;
   BasicBlock *loopEntry;
   LoadInst *load;
   SwitchInst *switchI;
@@ -109,7 +109,10 @@ bool Flattening::flatten(Function *f) {
 
   std::uniform_int_distribution<uint32_t> randomBBIndex(0, UINT32_MAX);
   for (size_t i = 0; i < origBB.size(); i++){
-    bbIndex.push_back(randomBBIndex(g));
+    uint32_t bbi = randomBBIndex(g);
+    bbIndex.push_back(bbi);
+    assert(std::count(bbHash.begin(), bbHash.end(), fnvHash(bbi)) == 0);
+    bbHash.push_back(fnvHash(bbi));
   }
 
   // Remove jump
@@ -125,14 +128,29 @@ bool Flattening::flatten(Function *f) {
   // Create main loop
   loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
 
-  load = new LoadInst(switchVar, "switchVar", loopEntry);
-
   // Move first BB on top
   insert->moveBefore(loopEntry);
   BranchInst::Create(loopEntry, insert);
 
+  //Calculate hash
+  load = new LoadInst(switchVar, "switchVar", loopEntry);
+  ConstantInt *byteConst = ConstantInt::get(i32, 0xFF);
+  ConstantInt *primeConst = ConstantInt::get(i32, fnvPrime);
+  ConstantInt *basisConst = ConstantInt::get(i32, fnvBasis);
+  BinaryOperator *dataVal = BinaryOperator::Create(BinaryOperator::And, load,
+                          ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
+  BinaryOperator *hashVal = BinaryOperator::Create(BinaryOperator::And, basisConst,
+                          ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
+  for(int i = 0; i < 4; i++){
+    BinaryOperator *t = BinaryOperator::Create(BinaryOperator::And, dataVal, byteConst, "", loopEntry);
+    hashVal = BinaryOperator::Create(BinaryOperator::Xor, hashVal, t, "", loopEntry);
+    hashVal = BinaryOperator::Create(BinaryOperator::Mul, hashVal, primeConst, "", loopEntry);
+    dataVal = BinaryOperator::Create(BinaryOperator::AShr, dataVal,
+              ConstantInt::get(i32, 8), "", loopEntry);
+  }
+
   // Create switch instruction itself and set condition
-  switchI = SwitchInst::Create(load, loopEntry, 0, loopEntry);
+  switchI = SwitchInst::Create(hashVal, loopEntry, 0, loopEntry);
 
   std::vector<size_t> bbSeq(origBB.size());
   std::iota(bbSeq.begin(), bbSeq.end(), 0);
@@ -149,7 +167,7 @@ bool Flattening::flatten(Function *f) {
     // Add case to switch
     numCase = cast<ConstantInt>(ConstantInt::get(
         switchI->getCondition()->getType(),
-        bbIndex[b]));
+        bbHash[b]));
     switchI->addCase(numCase, i);
   }
 
