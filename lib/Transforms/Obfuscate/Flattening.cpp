@@ -11,16 +11,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Transforms/Utils.h"
-
-#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils.h"
+
+#include "Util.h"
+
+#include <algorithm>
+#include <random>
 
 using namespace llvm;
 
@@ -52,55 +54,6 @@ bool Flattening::runOnFunction(Function &F) {
   return flatten(tmp);
 }
 
-bool valueEscapes(Instruction *Inst) {
-  BasicBlock *BB = Inst->getParent();
-  for (Value::use_iterator UI = Inst->use_begin(), E = Inst->use_end(); UI != E;
-       ++UI) {
-    Instruction *I = cast<Instruction>(*UI);
-    if (I->getParent() != BB || isa<PHINode>(I)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void fixStack(Function *f) {
-  // Try to remove phi node and demote reg to stack
-  std::vector<PHINode *> tmpPhi;
-  std::vector<Instruction *> tmpReg;
-  BasicBlock *bbEntry = &*f->begin();
-
-  do {
-    tmpPhi.clear();
-    tmpReg.clear();
-
-    for (Function::iterator i = f->begin(); i != f->end(); ++i) {
-
-      for (BasicBlock::iterator j = i->begin(); j != i->end(); ++j) {
-
-        if (isa<PHINode>(j)) {
-          PHINode *phi = cast<PHINode>(j);
-          tmpPhi.push_back(phi);
-          continue;
-        }
-        if (!(isa<AllocaInst>(j) && j->getParent() == bbEntry) &&
-            (valueEscapes(&*j) || j->isUsedOutsideOfBlock(&*i))) {
-          tmpReg.push_back(&*j);
-          continue;
-        }
-      }
-    }
-    for (unsigned int i = 0; i != tmpReg.size(); ++i) {
-      DemoteRegToStack(*tmpReg.at(i), f->begin()->getTerminator());
-    }
-
-    for (unsigned int i = 0; i != tmpPhi.size(); ++i) {
-      DemotePHIToStack(tmpPhi.at(i), f->begin()->getTerminator());
-    }
-
-  } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
-}
-
 bool Flattening::flatten(Function *f) {
   std::vector<BasicBlock *> origBB;
   BasicBlock *loopEntry;
@@ -111,12 +64,11 @@ bool Flattening::flatten(Function *f) {
   // Save all original BB
   for (Function::iterator i = f->begin(); i != f->end(); ++i) {
     BasicBlock *tmp = &*i;
-    origBB.push_back(tmp);
 
-    BasicBlock *bb = &*i;
-    if (isa<InvokeInst>(bb->getTerminator())) {
+    if (isa<InvokeInst>(tmp->getTerminator())) {
       return false;
     }
+    origBB.push_back(tmp);
   }
 
   // Nothing to flatten
@@ -173,6 +125,10 @@ bool Flattening::flatten(Function *f) {
   // Create switch instruction itself and set condition
   switchI = SwitchInst::Create(load, loopEntry, 0, loopEntry);
 
+  std::random_device rd;
+  std::mt19937 g(rd());
+  std::shuffle(origBB.begin(), origBB.end(), g);
+
   // Put all BB in the switch
   for (std::vector<BasicBlock *>::iterator b = origBB.begin();
        b != origBB.end(); ++b) {
@@ -180,7 +136,7 @@ bool Flattening::flatten(Function *f) {
     ConstantInt *numCase = NULL;
 
     // Move the BB inside the switch (only visual, no code logic)
-    i->moveAfter(loopEntry);
+    i->moveBefore(loopEntry);
 
     // Add case to switch
     numCase = cast<ConstantInt>(ConstantInt::get(
@@ -233,23 +189,7 @@ bool Flattening::flatten(Function *f) {
       new StoreInst(sel, load->getPointerOperand(), i);
     }
 
-    //BranchInst::Create(loopEntry, i);
-    SwitchInst *switchII = SwitchInst::Create(ConstantInt::get(
-      IntegerType::get(i->getContext(), 32), 0), i, 0, i);
-    numCase = cast<ConstantInt>(ConstantInt::get(
-        switchII->getCondition()->getType(),
-        switchII->getNumCases()));
-    switchII->addCase(numCase, loopEntry);
-    for (std::vector<BasicBlock *>::iterator b2 = origBB.begin();
-         b2 != origBB.end(); ++b2) {
-      BasicBlock *j = *b2;
-      if(i != j){
-        numCase = cast<ConstantInt>(ConstantInt::get(
-            switchII->getCondition()->getType(),
-            switchII->getNumCases()));
-        switchII->addCase(numCase, j);
-      }
-    }
+    BranchInst::Create(loopEntry, i);
   }
 
   fixStack(f);

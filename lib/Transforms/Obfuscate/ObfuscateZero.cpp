@@ -1,6 +1,34 @@
-#include "ObfuscateZero.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+
+#include <vector>
+#include <random>
 
 using namespace llvm;
+
+namespace {
+  class ObfuscateZero : public BasicBlockPass {
+    private:
+    std::vector<Value *> IntegerVect;
+    std::default_random_engine Generator;
+
+    public:
+    static char ID;
+    ObfuscateZero() : BasicBlockPass(ID) {}
+    bool runOnBasicBlock(BasicBlock &BB) override;
+
+    private:
+    bool isValidCandidateInstruction(Instruction &Inst) const;
+    Constant *isValidCandidateOperand(Value *V) const;
+    void registerInteger(Value &V);
+    // We replace 0 with:
+    // prime1 * ((x | any1)**2) != prime2 * ((y | any2)**2)
+    // with prime1 != prime2 and any1 != 0 and any2 != 0
+    Value *replaceZero(Instruction &Inst, Value *VReplace);
+    Value *createExpression(Type* IntermediaryType, const uint32_t p, IRBuilder<>& Builder);
+  };
+}
 
 bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
   IntegerVect.clear();

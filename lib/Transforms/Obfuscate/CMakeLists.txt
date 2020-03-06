@@ -3,8 +3,10 @@ if(WIN32 OR CYGWIN)
 endif()
 
 add_llvm_library( LLVMObf MODULE BUILDTREE_ONLY
+  Util.cpp
   ObfuscateZero.cpp
   Flattening.cpp
+  Connect.cpp
 
   DEPENDS
   intrinsics_gen
