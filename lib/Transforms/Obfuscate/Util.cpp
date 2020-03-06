@@ -3,6 +3,8 @@
 
 #include "Util.h"
 
+#include <string>
+
 using namespace llvm;
 bool valueEscapes(Instruction *Inst) {
   BasicBlock *BB = Inst->getParent();
@@ -51,4 +53,10 @@ void fixStack(Function *f) {
     }
 
   } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
+}
+
+InlineAsm *generateGarbage(Function *f){
+  std::string s(".byte 0xEB");
+  InlineAsm *IA = InlineAsm::get(FunctionType::get(Type::getVoidTy(f->getContext()), false), s, "", true, false);
+  return IA;
 }

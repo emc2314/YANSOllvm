@@ -76,8 +76,7 @@ bool Connect::runOnFunction(Function &F) {
     BasicBlock *destBB = i->getTerminator()->getSuccessor(0);
     i->getTerminator()->eraseFromParent();
     BasicBlock *defaultBB = BasicBlock::Create(f->getContext(), "", f, shuffleBB[num]);
-    InlineAsm *IA = InlineAsm::get(FunctionType::get(Type::getVoidTy(f->getContext()), false), ".byte 0xEB", "", true, false);
-    CallInst::Create(IA, "", defaultBB);
+    CallInst::Create(generateGarbage(f), "", defaultBB);
     new UnreachableInst(f->getContext(), defaultBB);
 
     ConstantInt *c0 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 0);
