@@ -123,6 +123,10 @@ bool Flattening::flatten(Function *f) {
 
   }
 
+  std::vector<size_t> bbSeq(origBB.size());
+  std::iota(bbSeq.begin(), bbSeq.end(), 0);
+  std::shuffle(bbSeq.begin(), bbSeq.end(), g);
+
   // Remove jump
   insert->getTerminator()->eraseFromParent();
 
@@ -154,12 +158,20 @@ bool Flattening::flatten(Function *f) {
   }
   new StoreInst(hashVal, hashVar, loopEntry);
 
+  //Convert hashVal to switch Index
+  BinaryOperator *switchIndex = BinaryOperator::Create(BinaryOperator::And,
+                          ConstantInt::get(i32, 0xFFFFFFFF),
+                          ConstantInt::get(i32, 0xFFFFFFFF),
+                          "", loopEntry);
+  for (size_t i = 0; i < bbSeq.size(); i++) {
+    Value *condition = new ICmpInst(*loopEntry, CmpInst::ICMP_EQ, hashVal, ConstantInt::get(i32, bbHash[bbSeq[i]]));
+    condition = new SExtInst(condition, i32, "", loopEntry);
+    condition = BinaryOperator::Create(BinaryOperator::And, condition,
+                          ConstantInt::get(i32, i+1), "", loopEntry);
+    switchIndex = BinaryOperator::Create(BinaryOperator::Add, condition, switchIndex, "", loopEntry);
+  }
   // Create switch instruction itself and set condition
-  switchI = SwitchInst::Create(hashVal, loopEntry, 0, loopEntry);
-
-  std::vector<size_t> bbSeq(origBB.size());
-  std::iota(bbSeq.begin(), bbSeq.end(), 0);
-  std::shuffle(bbSeq.begin(), bbSeq.end(), g);
+  switchI = SwitchInst::Create(switchIndex, loopEntry, 0, loopEntry);
 
   // Put all BB in the switch
   for (size_t b: bbSeq) {
@@ -172,7 +184,7 @@ bool Flattening::flatten(Function *f) {
     // Add case to switch
     numCase = cast<ConstantInt>(ConstantInt::get(
         switchI->getCondition()->getType(),
-        bbHash[b]));
+        switchI->getNumCases()));
     switchI->addCase(numCase, i);
   }
 
