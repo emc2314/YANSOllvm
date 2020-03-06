@@ -61,10 +61,13 @@ bool Flattening::flatten(Function *f) {
   BasicBlock *loopEntry;
   LoadInst *load;
   SwitchInst *switchI;
-  AllocaInst *switchVar;
+  AllocaInst *switchVar, *hashVar;
   std::random_device rd;
   std::mt19937 g(rd());
   IntegerType *i32 = Type::getInt32Ty(f->getContext());
+  ConstantInt *byteConst = ConstantInt::get(i32, 0xFF);
+  ConstantInt *primeConst = ConstantInt::get(i32, fnvPrime);
+  ConstantInt *basisConst = ConstantInt::get(i32, fnvBasis);
 
   // Save all original BB
   for (Function::iterator i = f->begin(); i != f->end(); ++i) {
@@ -111,19 +114,23 @@ bool Flattening::flatten(Function *f) {
   for (size_t i = 0; i < origBB.size(); i++){
     uint32_t bbi = randomBBIndex(g);
     bbIndex.push_back(bbi);
-    assert(std::count(bbHash.begin(), bbHash.end(), fnvHash(bbi)) == 0);
-    bbHash.push_back(fnvHash(bbi));
+    uint32_t bbh = fnvHash(bbi, fnvBasis);
+    for (size_t j = 0; j < randomBBIndex(g)%1001; j++){
+      assert(std::count(bbHash.begin(), bbHash.end(), bbh) == 0);
+      bbh = fnvHash(bbi, bbh);
+    }
+    bbHash.push_back(bbh);
+
   }
 
   // Remove jump
   insert->getTerminator()->eraseFromParent();
 
   // Create switch variable and set as it
-  switchVar =
-      new AllocaInst(i32, 0, "switchVar", insert);
-  new StoreInst(
-      ConstantInt::get(i32, bbIndex[0]),
-      switchVar, insert);
+  switchVar = new AllocaInst(i32, 0, "switchVar", insert);
+  new StoreInst(ConstantInt::get(i32, bbIndex[0]), switchVar, insert);
+  hashVar = new AllocaInst(i32, 0, "hashVar", insert);
+  new StoreInst(basisConst, hashVar, insert);
 
   // Create main loop
   loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
@@ -134,12 +141,9 @@ bool Flattening::flatten(Function *f) {
 
   //Calculate hash
   load = new LoadInst(switchVar, "switchVar", loopEntry);
-  ConstantInt *byteConst = ConstantInt::get(i32, 0xFF);
-  ConstantInt *primeConst = ConstantInt::get(i32, fnvPrime);
-  ConstantInt *basisConst = ConstantInt::get(i32, fnvBasis);
   BinaryOperator *dataVal = BinaryOperator::Create(BinaryOperator::And, load,
                           ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
-  BinaryOperator *hashVal = BinaryOperator::Create(BinaryOperator::And, basisConst,
+  BinaryOperator *hashVal = BinaryOperator::Create(BinaryOperator::And, new LoadInst(hashVar, "hashVar", loopEntry),
                           ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
   for(int i = 0; i < 4; i++){
     BinaryOperator *t = BinaryOperator::Create(BinaryOperator::And, dataVal, byteConst, "", loopEntry);
@@ -148,6 +152,7 @@ bool Flattening::flatten(Function *f) {
     dataVal = BinaryOperator::Create(BinaryOperator::AShr, dataVal,
               ConstantInt::get(i32, 8), "", loopEntry);
   }
+  new StoreInst(hashVal, hashVar, loopEntry);
 
   // Create switch instruction itself and set condition
   switchI = SwitchInst::Create(hashVal, loopEntry, 0, loopEntry);
@@ -208,6 +213,7 @@ bool Flattening::flatten(Function *f) {
 
     // Update switchVar and jump to the end of loop
     new StoreInst(finalVal, load->getPointerOperand(), i);
+    new StoreInst(basisConst, hashVar, i);
 
     BranchInst::Create(loopEntry, i);
   }

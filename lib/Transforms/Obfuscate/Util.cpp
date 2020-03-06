@@ -61,8 +61,7 @@ InlineAsm *generateGarbage(Function *f){
   return IA;
 }
 
-uint32_t fnvHash(const uint32_t data){
-  uint32_t b = fnvBasis;
+uint32_t fnvHash(const uint32_t data, uint32_t b){
   b=(b^((data>>0)&0xFF))*fnvPrime;
   b=(b^((data>>8)&0xFF))*fnvPrime;
   b=(b^((data>>16)&0xFF))*fnvPrime;
