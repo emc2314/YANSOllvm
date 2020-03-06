@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <random>
+#include <numeric>
 
 using namespace llvm;
 
@@ -56,10 +57,14 @@ bool Flattening::runOnFunction(Function &F) {
 
 bool Flattening::flatten(Function *f) {
   std::vector<BasicBlock *> origBB;
+  std::vector<uint32_t> bbIndex;
   BasicBlock *loopEntry;
   LoadInst *load;
   SwitchInst *switchI;
   AllocaInst *switchVar;
+  std::random_device rd;
+  std::mt19937 g(rd());
+  IntegerType *i32 = Type::getInt32Ty(f->getContext());
 
   // Save all original BB
   for (Function::iterator i = f->begin(); i != f->end(); ++i) {
@@ -102,15 +107,19 @@ bool Flattening::flatten(Function *f) {
     origBB.insert(origBB.begin(), tmpBB);
   }
 
+  std::uniform_int_distribution<uint32_t> randomBBIndex(0, UINT32_MAX);
+  for (size_t i = 0; i < origBB.size(); i++){
+    bbIndex.push_back(randomBBIndex(g));
+  }
+
   // Remove jump
   insert->getTerminator()->eraseFromParent();
 
   // Create switch variable and set as it
   switchVar =
-      new AllocaInst(Type::getInt32Ty(f->getContext()), 0, "switchVar", insert);
+      new AllocaInst(i32, 0, "switchVar", insert);
   new StoreInst(
-      ConstantInt::get(Type::getInt32Ty(f->getContext()),
-                       0),
+      ConstantInt::get(i32, bbIndex[0]),
       switchVar, insert);
 
   // Create main loop
@@ -125,14 +134,13 @@ bool Flattening::flatten(Function *f) {
   // Create switch instruction itself and set condition
   switchI = SwitchInst::Create(load, loopEntry, 0, loopEntry);
 
-  std::random_device rd;
-  std::mt19937 g(rd());
-  std::shuffle(++origBB.begin(), origBB.end(), g); //Do not shuffle first BB
+  std::vector<size_t> bbSeq(origBB.size());
+  std::iota(bbSeq.begin(), bbSeq.end(), 0);
+  std::shuffle(bbSeq.begin(), bbSeq.end(), g);
 
   // Put all BB in the switch
-  for (std::vector<BasicBlock *>::iterator b = origBB.begin();
-       b != origBB.end(); ++b) {
-    BasicBlock *i = *b;
+  for (size_t b: bbSeq) {
+    BasicBlock *i = origBB[b];
     ConstantInt *numCase = NULL;
 
     // Move the BB inside the switch (only visual, no code logic)
@@ -141,15 +149,15 @@ bool Flattening::flatten(Function *f) {
     // Add case to switch
     numCase = cast<ConstantInt>(ConstantInt::get(
         switchI->getCondition()->getType(),
-        switchI->getNumCases()));
+        bbIndex[b]));
     switchI->addCase(numCase, i);
   }
 
   // Recalculate switchVar
-  for (std::vector<BasicBlock *>::iterator b = origBB.begin();
-       b != origBB.end(); ++b) {
-    BasicBlock *i = *b;
-    ConstantInt *numCase = NULL;
+  for (size_t b: bbSeq) {
+    BasicBlock *i = origBB[b];
+    size_t succIndexTrue, succIndexFalse;
+    SExtInst *cond = nullptr;
 
     // Ret BB
     if (i->getTerminator()->getNumSuccessors() == 0) {
@@ -158,36 +166,30 @@ bool Flattening::flatten(Function *f) {
 
     // If it's a non-conditional jump
     if (i->getTerminator()->getNumSuccessors() == 1) {
-      // Get successor and delete terminator
-      BasicBlock *succ = i->getTerminator()->getSuccessor(0);
-      i->getTerminator()->eraseFromParent();
+      cond = new SExtInst(ConstantInt::get(Type::getInt1Ty(f->getContext()), 0), i32, "", i->getTerminator());
+      succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
+      succIndexTrue = std::distance(bbSeq.begin(), std::find(bbSeq.begin(), bbSeq.end(), b));
 
-      // Get next case
-      numCase = switchI->findCaseDest(succ);
-
-      // Update switchVar and jump to the end of loop
-      new StoreInst(numCase, load->getPointerOperand(), i);
     } else {
       // If it's a conditional jump
       assert (i->getTerminator()->getNumSuccessors() == 2);
-      // Get next cases
-      ConstantInt *numCaseTrue =
-          switchI->findCaseDest(i->getTerminator()->getSuccessor(0));
-      ConstantInt *numCaseFalse =
-          switchI->findCaseDest(i->getTerminator()->getSuccessor(1));
-
-      // Create a SelectInst
-      BranchInst *br = cast<BranchInst>(i->getTerminator());
-      SelectInst *sel =
-          SelectInst::Create(br->getCondition(), numCaseTrue, numCaseFalse, "",
-                             i->getTerminator());
-
-      // Erase terminator
-      i->getTerminator()->eraseFromParent();
-
-      // Update switchVar and jump to the end of loop
-      new StoreInst(sel, load->getPointerOperand(), i);
+      cond = new SExtInst(cast<BranchInst>(i->getTerminator())->getCondition(), i32, "", i->getTerminator());
+      succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(1)));
+      succIndexTrue = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
     }
+
+    BinaryOperator *tempValFalse = BinaryOperator::Create(BinaryOperator::Xor,
+                 ConstantInt::get(i32, bbIndex[b] ^ bbIndex[succIndexFalse]),
+                  load, "", i->getTerminator());
+    BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And, cond,
+                 ConstantInt::get(i32, bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]), "", i->getTerminator());
+    BinaryOperator *finalVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempValFalse, "", i->getTerminator());
+
+    // Erase terminator
+    i->getTerminator()->eraseFromParent();
+
+    // Update switchVar and jump to the end of loop
+    new StoreInst(finalVal, load->getPointerOperand(), i);
 
     BranchInst::Create(loopEntry, i);
   }
