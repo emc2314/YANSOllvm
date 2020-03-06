@@ -127,7 +127,7 @@ bool Flattening::flatten(Function *f) {
 
   std::random_device rd;
   std::mt19937 g(rd());
-  std::shuffle(origBB.begin(), origBB.end(), g);
+  std::shuffle(++origBB.begin(), origBB.end(), g); //Do not shuffle first BB
 
   // Put all BB in the switch
   for (std::vector<BasicBlock *>::iterator b = origBB.begin();

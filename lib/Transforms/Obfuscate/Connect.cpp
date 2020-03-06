@@ -37,17 +37,16 @@ bool Connect::runOnFunction(Function &F) {
   Function::iterator i = f->begin();
   for (++i; i != f->end(); ++i) {
     BasicBlock *tmp = &*i;
-    if(tmp->getTerminator()->getNumSuccessors() == 1)
-      origBB.push_back(tmp);
+    origBB.push_back(tmp);
   }
 
   for (std::vector<BasicBlock *>::iterator b = origBB.begin();
-       b != origBB.end(); ++b) {
+       b != origBB.end();) {
     BasicBlock *i = *b;
     BasicBlock::iterator it = i->getFirstInsertionPt();
     size_t bbSize = std::distance(it, i->end());
     if(bbSize < 4 ){
-      origBB.erase(b);
+      b=origBB.erase(b);
       continue;
     }
     std::advance(it, bbSize / 2);
@@ -55,6 +54,7 @@ bool Connect::runOnFunction(Function &F) {
     downBB.push_back(newBB);
     allBB.push_back(i);
     allBB.push_back(newBB);
+    ++b;
   }
 
   if(origBB.size() == 0){
@@ -81,7 +81,10 @@ bool Connect::runOnFunction(Function &F) {
     new UnreachableInst(f->getContext(), defaultBB);
 
     ConstantInt *c0 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 0);
-    BinaryOperator *tempVal = BinaryOperator::Create(BinaryOperator::Xor, c0, c0, "", i);
+    std::vector<Instruction::BinaryOps> vecBin{BinaryOperator::Xor, BinaryOperator::Add, BinaryOperator::Sub, BinaryOperator::Or,
+                                               BinaryOperator::Shl, BinaryOperator::LShr, BinaryOperator::AShr};
+    std::uniform_int_distribution<> dis(0, vecBin.size()-1);
+    BinaryOperator *tempVal = BinaryOperator::Create(vecBin[dis(g)], c0, c0, "", i);
     SwitchInst *switchII = SwitchInst::Create(tempVal, defaultBB, 0, i);
     for (std::vector<BasicBlock *>::iterator b = downBB.begin();
          b != downBB.end(); ++b) {
