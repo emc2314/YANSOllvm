@@ -80,7 +80,7 @@ bool Flattening::flatten(Function *f) {
   }
 
   // Nothing to flatten
-  if (origBB.size() <= 1) {
+  if (origBB.size() <= 2) {
     return false;
   }
 
@@ -110,12 +110,12 @@ bool Flattening::flatten(Function *f) {
     origBB.insert(origBB.begin(), tmpBB);
   }
 
-  std::uniform_int_distribution<uint32_t> randomBBIndex(0, UINT32_MAX);
+  std::uniform_int_distribution<uint32_t> randomUInt32(0, UINT32_MAX);
   for (size_t i = 0; i < origBB.size(); i++){
-    uint32_t bbi = randomBBIndex(g);
+    uint32_t bbi = randomUInt32(g);
     bbIndex.push_back(bbi);
     uint32_t bbh = fnvHash(bbi, fnvBasis);
-    for (size_t j = 0; j < randomBBIndex(g)%1001; j++){
+    for (size_t j = 0; j < randomUInt32(g)%1001; j++){
       assert(std::count(bbHash.begin(), bbHash.end(), bbh) == 0);
       bbh = fnvHash(bbi, bbh);
     }
@@ -166,7 +166,7 @@ bool Flattening::flatten(Function *f) {
                           ConstantInt::get(i32, 0xFFFFFFFF),
                           ConstantInt::get(i32, 0xFFFFFFFF),
                           "", loopEntry);
-  for (size_t i = 0; i < bbSeq.size(); i++) {
+  for (size_t i: bbSeq) {
     Value *condition = new ICmpInst(*loopEntry, CmpInst::ICMP_EQ, hashVal, ConstantInt::get(i32, bbHash[bbSeq[i]]));
     condition = new SExtInst(condition, i32, "", loopEntry);
     condition = BinaryOperator::Create(BinaryOperator::And, condition,
@@ -195,7 +195,7 @@ bool Flattening::flatten(Function *f) {
   for (size_t b: bbSeq) {
     BasicBlock *i = origBB[b];
     size_t succIndexTrue, succIndexFalse;
-    SExtInst *cond = nullptr;
+    Value *cond = nullptr;
 
     // Ret BB
     if (i->getTerminator()->getNumSuccessors() == 0) {
@@ -204,7 +204,7 @@ bool Flattening::flatten(Function *f) {
 
     // If it's a non-conditional jump
     if (i->getTerminator()->getNumSuccessors() == 1) {
-      cond = new SExtInst(ConstantInt::get(Type::getInt1Ty(f->getContext()), 0), i32, "", i->getTerminator());
+      cond = ConstantInt::get(i32, 0);
       succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
       succIndexTrue = std::distance(bbSeq.begin(), std::find(bbSeq.begin(), bbSeq.end(), b));
 
@@ -216,18 +216,36 @@ bool Flattening::flatten(Function *f) {
       succIndexTrue = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
     }
 
-    BinaryOperator *tempValFalse = BinaryOperator::Create(BinaryOperator::Xor,
-                 ConstantInt::get(i32, bbIndex[b] ^ bbIndex[succIndexFalse]),
-                  load, "", i->getTerminator());
-    BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And, cond,
+    std::vector<size_t> bbTemp = bbSeq;
+    std::shuffle(bbTemp.begin(), bbTemp.end(), g);
+    uint32_t randomXor = randomUInt32(g);
+    BinaryOperator *tempVal= BinaryOperator::Create(BinaryOperator::Xor,
+                 ConstantInt::get(i32, randomXor),
+                 load, "", i->getTerminator());
+    int garbageCap = bbTemp.size()/4;
+    garbageCap = garbageCap > 1 ? garbageCap : 1;
+    for(size_t d: bbTemp){
+      if(d == succIndexFalse){
+        tempVal= BinaryOperator::Create(BinaryOperator::Xor,
+                 ConstantInt::get(i32, bbIndex[b] ^ bbIndex[succIndexFalse] ^ randomXor),
+                 tempVal, "", i->getTerminator());
+      }else if(d == succIndexTrue){
+        BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And, cond,
                  ConstantInt::get(i32, bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]), "", i->getTerminator());
-    BinaryOperator *finalVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempValFalse, "", i->getTerminator());
+        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
+      }else if(randomUInt32(g)%garbageCap == 0){
+        BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And,
+                 ConstantInt::get(i32, 0),
+                 ConstantInt::get(i32, randomUInt32(g)), "", i->getTerminator());
+        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
+      }
+    }
 
     // Erase terminator
     i->getTerminator()->eraseFromParent();
 
     // Update switchVar and jump to the end of loop
-    new StoreInst(finalVal, load->getPointerOperand(), i);
+    new StoreInst(tempVal, load->getPointerOperand(), i);
     new StoreInst(basisConst, hashVar, i);
 
     BranchInst::Create(loopEntry, i);
