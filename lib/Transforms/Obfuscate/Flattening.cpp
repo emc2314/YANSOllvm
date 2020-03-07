@@ -128,11 +128,14 @@ bool Flattening::flatten(Function *f) {
   std::shuffle(bbSeq.begin(), bbSeq.end(), g);
 
   // Remove jump
+  std::ptrdiff_t entryBlock = std::distance(origBB.begin(),
+                          std::find(origBB.begin(),origBB.end(),
+                          insert->getTerminator()->getSuccessor(0)));
   insert->getTerminator()->eraseFromParent();
 
   // Create switch variable and set as it
   switchVar = new AllocaInst(i32, 0, "switchVar", insert);
-  new StoreInst(ConstantInt::get(i32, bbIndex[0]), switchVar, insert);
+  new StoreInst(ConstantInt::get(i32, bbIndex[entryBlock]), switchVar, insert);
   hashVar = new AllocaInst(i32, 0, "hashVar", insert);
   new StoreInst(basisConst, hashVar, insert);
 
