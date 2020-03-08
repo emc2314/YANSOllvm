@@ -20,12 +20,12 @@ namespace {
 
     private:
     bool isValidCandidateInstruction(Instruction &Inst) const;
-    Constant *isValidCandidateOperand(Value *V) const;
+    ConstantInt *isValidCandidateOperand(Value *V) const;
     void registerInteger(Value &V);
     // We replace 0 with:
     // prime1 * ((x | any1)**2) != prime2 * ((y | any2)**2)
     // with prime1 != prime2 and any1 != 0 and any2 != 0
-    Value *replaceZero(Instruction &Inst, Value *VReplace);
+    Value *replaceZero(Instruction &Inst, ConstantInt *VReplace);
     Value *createExpression(Type* IntermediaryType, const uint32_t p, IRBuilder<>& Builder);
   };
 }
@@ -45,7 +45,7 @@ bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
       if (isa<SwitchInst>(&Inst))
         opSize = 1;
       for (size_t i = 0; i < opSize; ++i) {
-        if (Constant *C = isValidCandidateOperand(Inst.getOperand(i))) {
+        if (ConstantInt *C = isValidCandidateOperand(Inst.getOperand(i))) {
           //errs() << "Original instruction!\n";
           //errs() << Inst << "\n";
           if (Value *New_val = replaceZero(Inst, C)) {
@@ -78,13 +78,9 @@ bool ObfuscateZero::isValidCandidateInstruction(Instruction &Inst) const {
 }
 
 // We do not analyze operands that are pointers, floats or the NULL value.
-Constant* ObfuscateZero::isValidCandidateOperand(Value *V) const {
-  if (Constant *C = dyn_cast<Constant>(V)) {
-    if (isa<PointerType>(C->getType())) {
-      return nullptr;
-    } else if (C->getType()->isFloatingPointTy()) {
-      return nullptr;
-    } else if (C->isNullValue()) {
+ConstantInt* ObfuscateZero::isValidCandidateOperand(Value *V) const {
+  if (ConstantInt *C = dyn_cast<ConstantInt>(V)) {
+    if (C->isZero()) {
       return C;
     } else {
       return nullptr;
@@ -95,7 +91,7 @@ Constant* ObfuscateZero::isValidCandidateOperand(Value *V) const {
 }
 
 void ObfuscateZero::registerInteger(Value &V) {
-  if (V.getType()->isIntegerTy())
+  if (V.getType()->isIntegerTy() && !dyn_cast<llvm::ConstantInt>(&V))
     IntegerVect.push_back(&V);
 }
 
@@ -127,19 +123,16 @@ Value *ObfuscateZero::createExpression
 // We replace 0 with:
 // prime1 * ((x | any1)**2) != prime2 * ((y | any2)**2)
 // with prime1 != prime2 and any1 != 0 and any2 != 0
-Value* ObfuscateZero::replaceZero(Instruction &Inst, Value *VReplace) {
+Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
   const uint32_t p1 = 431, p2 = 277;
 
-  Type *ReplacedType = VReplace->getType(),
+  IntegerType *ReplacedType = VReplace->getType(),
        *IntermediaryType = IntegerType::get(Inst.getParent()->getContext(),
            sizeof(uint32_t) * 8);
 
   if (IntegerVect.size() < 1) {
     return nullptr;
   }
-
-  std::uniform_int_distribution<size_t> Rand(0, IntegerVect.size() - 1);
-  std::uniform_int_distribution<size_t> RandAny(1, 10);
 
   IRBuilder<> Builder(&Inst);
 
@@ -152,8 +145,7 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, Value *VReplace) {
   // comp
   Value *comp =
     Builder.CreateICmp(CmpInst::ICMP_EQ, LhsTot, RhsTot);
-  registerInteger(*comp);
-  Value *castComp = Builder.CreateZExt(comp, ReplacedType);
+  Value *castComp = Builder.CreateSExt(comp, ReplacedType);
   registerInteger(*castComp);
 
   return castComp;

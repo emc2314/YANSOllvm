@@ -134,10 +134,10 @@ bool Flattening::flatten(Function *f) {
   insert->getTerminator()->eraseFromParent();
 
   // Create switch variable and set as it
-  switchVar = new AllocaInst(i32, 0, "switchVar", insert);
-  new StoreInst(ConstantInt::get(i32, bbIndex[entryBlock]), switchVar, insert);
   hashVar = new AllocaInst(i32, 0, "hashVar", insert);
   new StoreInst(basisConst, hashVar, insert);
+  switchVar = new AllocaInst(i32, 0, "switchVar", insert);
+  new StoreInst(ConstantInt::get(i32, bbIndex[entryBlock]), switchVar, insert);
 
   // Create main loop
   loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
@@ -204,14 +204,14 @@ bool Flattening::flatten(Function *f) {
 
     // If it's a non-conditional jump
     if (i->getTerminator()->getNumSuccessors() == 1) {
-      cond = ConstantInt::get(i32, 0);
+      cond = ConstantInt::get(Type::getInt1Ty(f->getContext()), 0);
       succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
       succIndexTrue = std::distance(bbSeq.begin(), std::find(bbSeq.begin(), bbSeq.end(), b));
 
     } else {
       // If it's a conditional jump
       assert (i->getTerminator()->getNumSuccessors() == 2);
-      cond = new SExtInst(cast<BranchInst>(i->getTerminator())->getCondition(), i32, "", i->getTerminator());
+      cond = cast<BranchInst>(i->getTerminator())->getCondition();
       succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(1)));
       succIndexTrue = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
     }
@@ -230,7 +230,8 @@ bool Flattening::flatten(Function *f) {
                  ConstantInt::get(i32, bbIndex[b] ^ bbIndex[succIndexFalse] ^ randomXor),
                  tempVal, "", i->getTerminator());
       }else if(d == succIndexTrue){
-        BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And, cond,
+        BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And,
+                 new SExtInst(cond, i32, "", i->getTerminator()),
                  ConstantInt::get(i32, bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]), "", i->getTerminator());
         tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
       }else if(randomUInt32(g)%garbageCap == 0){
