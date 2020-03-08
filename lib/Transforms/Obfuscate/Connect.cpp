@@ -82,15 +82,15 @@ bool Connect::runOnFunction(Function &F) {
     ConstantInt *c0 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 0);
     std::vector<Instruction::BinaryOps> vecBin{BinaryOperator::Xor, BinaryOperator::Add, BinaryOperator::Sub, BinaryOperator::Or,
                                                BinaryOperator::Shl, BinaryOperator::LShr, BinaryOperator::AShr};
-    std::uniform_int_distribution<> dis(0, vecBin.size()-1);
-    BinaryOperator *tempVal = BinaryOperator::Create(vecBin[dis(g)], c0, c0, "", i);
+    std::uniform_int_distribution<uint32_t> rand(0, UINT32_MAX);
+    BinaryOperator *tempVal = BinaryOperator::Create(vecBin[rand(g)%(vecBin.size())], c0, c0, "", i);
     SwitchInst *switchII = SwitchInst::Create(tempVal, defaultBB, 0, i);
     for (std::vector<BasicBlock *>::iterator b = downBB.begin();
          b != downBB.end(); ++b) {
       BasicBlock *j = *b;
       ConstantInt *numCase = cast<ConstantInt>(ConstantInt::get(
           switchII->getCondition()->getType(),
-          switchII->getNumCases()));
+          rand(g)));
       switchII->addCase(numCase, j);
       if(j == destBB){
         tempVal->setOperand(0, numCase);
