@@ -79,21 +79,28 @@ bool Connect::runOnFunction(Function &F) {
     CallInst::Create(generateGarbage(f), "", defaultBB);
     new UnreachableInst(f->getContext(), defaultBB);
 
-    ConstantInt *c0 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 0);
-    std::vector<Instruction::BinaryOps> vecBin{BinaryOperator::Xor, BinaryOperator::Add, BinaryOperator::Sub, BinaryOperator::Or,
-                                               BinaryOperator::Shl, BinaryOperator::LShr, BinaryOperator::AShr};
     std::uniform_int_distribution<uint32_t> rand(0, UINT32_MAX);
-    BinaryOperator *tempVal = BinaryOperator::Create(vecBin[rand(g)%(vecBin.size())], c0, c0, "", i);
-    SwitchInst *switchII = SwitchInst::Create(tempVal, defaultBB, 0, i);
-    for (std::vector<BasicBlock *>::iterator b = downBB.begin();
-         b != downBB.end(); ++b) {
-      BasicBlock *j = *b;
+    ConstantInt *c0 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 0);
+    ConstantInt *c1 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 1);
+    SwitchInst *switchII = SwitchInst::Create(c0, defaultBB, 0, i);
+    for (BasicBlock *j: downBB) {
       ConstantInt *numCase = cast<ConstantInt>(ConstantInt::get(
           switchII->getCondition()->getType(),
           rand(g)));
       switchII->addCase(numCase, j);
       if(j == destBB){
-        tempVal->setOperand(0, numCase);
+        BinaryOperator *tempVal = nullptr;
+        std::vector<Instruction::BinaryOps> vecBin{BinaryOperator::Xor, BinaryOperator::Add, BinaryOperator::Or};
+        if(rand(g)%2){
+          std::vector<Instruction::BinaryOps> vec1Bin{BinaryOperator::UDiv, BinaryOperator::Mul, BinaryOperator::SDiv};
+          tempVal = BinaryOperator::Create(vecBin[rand(g)%(vecBin.size())], c0, c0, "", switchII);
+          tempVal->setOperand(rand(g)%2, c1);
+          tempVal = BinaryOperator::Create(vec1Bin[rand(g)%(vec1Bin.size())], numCase, tempVal, "", switchII);
+        }else{
+          tempVal = BinaryOperator::Create(vecBin[rand(g)%(vecBin.size())], c0, c0, "", switchII);
+          tempVal->setOperand(rand(g)%2, numCase);
+        }
+        switchII->setCondition(tempVal);
       }
     }
   }
