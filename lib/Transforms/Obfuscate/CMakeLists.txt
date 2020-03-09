@@ -7,6 +7,7 @@ add_llvm_library( LLVMObf MODULE BUILDTREE_ONLY
   ObfuscateZero.cpp
   Flattening.cpp
   Connect.cpp
+  Merge.cpp
 
   DEPENDS
   intrinsics_gen
