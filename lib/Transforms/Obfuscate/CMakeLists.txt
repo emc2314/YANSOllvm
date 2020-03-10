@@ -8,6 +8,7 @@ add_llvm_library( LLVMObf MODULE BUILDTREE_ONLY
   Flattening.cpp
   Connect.cpp
   Merge.cpp
+  BB2Func.cpp
 
   DEPENDS
   intrinsics_gen
