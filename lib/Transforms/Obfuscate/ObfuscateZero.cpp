@@ -103,7 +103,7 @@ Value *ObfuscateZero::createExpression
   size_t Index = Rand(Generator);
   Constant *any = ConstantInt::get(IntermediaryType, 1 + RandAny(Generator)),
            *prime = ConstantInt::get(IntermediaryType, p),
-           *OverflowMask = ConstantInt::get(IntermediaryType, 0x00000007);
+           *OverflowMask = ConstantInt::get(IntermediaryType, 0x7FFFFFFF);
   // END HELP.
 
   // Tot = p*(x|any)^2
