@@ -115,7 +115,7 @@ bool Flattening::flatten(Function *f) {
     uint32_t bbi = randomUInt32(g);
     bbIndex.push_back(bbi);
     uint32_t bbh = fnvHash(bbi, fnvBasis);
-    for (size_t j = 0; j < randomUInt32(g)%1001; j++){
+    for (size_t j = 0; j < 10+randomUInt32(g)%100; j++){
       assert(std::count(bbHash.begin(), bbHash.end(), bbh) == 0);
       bbh = fnvHash(bbi, bbh);
     }
