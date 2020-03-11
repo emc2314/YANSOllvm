@@ -326,7 +326,7 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
       return CSR_64_Intel_OCL_BI_SaveList;
     break;
   }
-  case CallingConv::OBF_CALL :{
+  case CallingConv::OBF_CALL: {
     if (Is64Bit){
       return CSR_64_OBF_SaveList;
     }
@@ -445,6 +445,13 @@ X86RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
       return CSR_64_Intel_OCL_BI_AVX_RegMask;
     if (!HasAVX && !IsWin64 && Is64Bit)
       return CSR_64_Intel_OCL_BI_RegMask;
+    break;
+  }
+  case CallingConv::OBF_CALL: {
+    if (Is64Bit){
+      return CSR_64_OBF_RegMask;
+    }
+    return CSR_32_OBF_RegMask;
     break;
   }
   case CallingConv::HHVM:
