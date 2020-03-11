@@ -3,6 +3,7 @@
 lib/*
 !lib/Transforms/
 lib/Transforms/*
+!lib/Transforms/CMakeLists.txt
 !lib/Transforms/Obfuscate
 !lib/Target/
 lib/Target/*
