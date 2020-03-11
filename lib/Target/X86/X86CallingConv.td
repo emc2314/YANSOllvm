@@ -1053,10 +1053,10 @@ def CC_OBF_CALL : CallingConv<[
 
   CCIfType<[i1, i8, i16], CCPromoteToType<i32>>,
 
-  CCIfType<[i32], CCIfSubtarget<"is64Bit()", CCAssignToReg<[EAX, R15D, R10D, R9D]>>>,
-  CCIfType<[i64], CCIfSubtarget<"is64Bit()", CCAssignToReg<[RAX, R13, R11, R12]>>>,
+  CCIfType<[i32], CCIfSubtarget<"is64Bit()", CCAssignToReg<[EBX, R15D, R10D, R9D]>>>,
+  CCIfType<[i64], CCIfSubtarget<"is64Bit()", CCAssignToReg<[RBX, R13, R11, R12]>>>,
 
-  CCIfType<[i32], CCAssignToReg<[EAX, EBX, ESI, ECX]>>,
+  CCIfType<[i32], CCAssignToReg<[EDI, EBX, ESI, EAX]>>,
   CCIfType<[i64], CCAssignToStack<8, 4>>,
 
   CCIfType<[f32, f64, v4i32, v2i64, v4f32, v2f64],
