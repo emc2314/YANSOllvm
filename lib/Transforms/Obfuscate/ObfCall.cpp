@@ -1,6 +1,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/CallingConv.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/Triple.h"
@@ -31,6 +32,11 @@ bool ObfCall::runOnModule(Module &M){
     for(Function &F: M){
       if(F.getLinkage() == GlobalValue::InternalLinkage && !F.isVarArg()){
         F.setCallingConv(CallingConv::OBF_CALL);
+        for(Use &U: F.uses()){
+          if(CallBase *C = dyn_cast<CallBase>(U.getUser())){
+            C->setCallingConv(CallingConv::OBF_CALL);
+          }
+        }
         modified = true;
       }
     }
