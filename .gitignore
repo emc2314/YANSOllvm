@@ -10,7 +10,6 @@ lib/Target/*
 !lib/Target/X86/
 lib/Target/X86/*
 !lib/Target/X86/X86CallingConv.td
-!lib/Target/X86/X86CallingConv.cpp
 !lib/Target/X86/X86RegisterInfo.cpp
 !include/
 include/*
