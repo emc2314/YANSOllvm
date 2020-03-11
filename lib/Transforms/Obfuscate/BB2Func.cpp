@@ -42,10 +42,11 @@ bool BB2Func::runOnFunction(Function &F) {
     }
   }
   
-  if(bblist.size() > 10){
+  size_t sizeLimit = 32;
+  if(bblist.size() > sizeLimit){
     std::sort(bblist.begin(), bblist.end(), [](const BasicBlock *a, const BasicBlock *b){
               return a->getInstList().size() < b->getInstList().size();});
-    bblist.erase(bblist.begin()+10, bblist.end());
+    bblist.erase(bblist.begin()+sizeLimit, bblist.end());
   }
 
   for(BasicBlock *BB: bblist){
