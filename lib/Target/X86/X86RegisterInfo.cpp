@@ -326,6 +326,13 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
       return CSR_64_Intel_OCL_BI_SaveList;
     break;
   }
+  case CallingConv::OBF_CALL :{
+    if (Is64Bit){
+      return CSR_64_OBF_SaveList;
+    }
+    return CSR_32_OBF_SaveList;
+    break;
+  }
   case CallingConv::HHVM:
     return CSR_64_HHVM_SaveList;
   case CallingConv::X86_RegCall:

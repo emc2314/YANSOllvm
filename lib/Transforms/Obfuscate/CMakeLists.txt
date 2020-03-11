@@ -9,6 +9,7 @@ add_llvm_library( LLVMObf MODULE BUILDTREE_ONLY
   Connect.cpp
   Merge.cpp
   BB2Func.cpp
+  ObfCall.cpp
 
   DEPENDS
   intrinsics_gen
