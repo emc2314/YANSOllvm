@@ -13,6 +13,7 @@ lib/Target/X86/*
 !lib/Target/X86/genObfCC.py
 !lib/Target/X86/X86CallingConv.td
 !lib/Target/X86/X86RegisterInfo.cpp
+!lib/Target/X86/X86Subtarget.h
 !include/
 include/*
 !include/llvm/
