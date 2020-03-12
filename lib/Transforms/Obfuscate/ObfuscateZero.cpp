@@ -114,18 +114,73 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
 
   IRBuilder<> Builder(&Inst);
   std::uniform_int_distribution<size_t> Rand(0, IntegerVect.size() - 1);
+  std::uniform_int_distribution<uint32_t> rand32(0, UINT32_MAX);
   Value *temp = IntegerVect[Rand(Generator)];
   Value *x = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
+  temp = IntegerVect[Rand(Generator)];
+  Value *y = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
+  Value *replaced = nullptr;
 
-  uint32_t randp1 = randPrime(1<<8, 1<<16);
-  uint32_t randp2 = randPrime(1<<8, 1<<16);
-  while(randp1 == randp2)
-    randp2 = randPrime(1<<8, 1<<16);
-  Value* LhsTot = createExpression(x, randp1, Builder);
-  Value* RhsTot = createExpression(x, randp2, Builder);
-  Value *comp =
-    Builder.CreateICmp(CmpInst::ICMP_EQ, LhsTot, RhsTot);
-  Value *replaced = Builder.CreateSExt(comp, ReplacedType);
+  switch(rand32(Generator)%4){
+    case 0:{
+      // p1*(x|any)**2 != p2*(y|any)**2
+      uint32_t randp1 = randPrime(1<<8, 1<<16);
+      uint32_t randp2 = randPrime(1<<8, 1<<16);
+      while(randp1 == randp2)
+        randp2 = randPrime(1<<8, 1<<16);
+      Value* LhsTot = createExpression(x, randp1, Builder);
+      Value* RhsTot = createExpression(y, randp2, Builder);
+      Value *comp =
+        Builder.CreateICmp(CmpInst::ICMP_EQ, LhsTot, RhsTot);
+      replaced = Builder.CreateSExt(comp, ReplacedType);
+      break;
+    }
+    case 1:{
+      // x + y = x^y + 2*(x&y)
+      replaced = Builder.CreateAdd(x,y);
+      temp = Builder.CreateXor(x,y);
+      replaced = Builder.CreateSub(replaced, temp);
+      temp = Builder.CreateAnd(x,y);
+      temp = Builder.CreateShl(temp, ConstantInt::get(i32, 1));
+      replaced = Builder.CreateXor(replaced, temp);
+      replaced = Builder.CreateCast(
+        CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+      break;
+    }
+    case 2:{
+      // ((~x | 0x7AFAFA69) & 0xA061440) + ((x & 0x1050504) | 0x1010104) == 185013572
+      temp = Builder.CreateNot(x);
+      temp = Builder.CreateOr(temp, ConstantInt::get(i32, 0x7AFAFA69));
+      temp = Builder.CreateAnd(temp, ConstantInt::get(i32, 0xA061440));
+      replaced = Builder.CreateAnd(x, ConstantInt::get(i32, 0x1050504));
+      replaced = Builder.CreateOr(replaced, ConstantInt::get(i32, 0x1010104));
+      replaced = Builder.CreateAdd(replaced, temp);
+      replaced = Builder.CreateXor(replaced, ConstantInt::get(i32, 185013572));
+      replaced = Builder.CreateCast(
+        CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+      break;
+    }
+    case 3:{
+      // x ^ y == (x|~y) - 3*(~(x|y)) + 2*(~x) - y
+      Value *a = Builder.CreateNot(y);
+      a = Builder.CreateOr(x, a);
+      Value *b = Builder.CreateOr(x,y);
+      b = Builder.CreateNot(b);
+      b = Builder.CreateMul(b, ConstantInt::get(i32, -3));
+      Value *c = Builder.CreateNot(x);
+      c = Builder.CreateMul(c, ConstantInt::get(i32, 2));
+      c = Builder.CreateSub(c, y);
+      replaced = Builder.CreateXor(x,y);
+      replaced = Builder.CreateSub(replaced, a);
+      replaced = Builder.CreateSub(replaced, b);
+      replaced = Builder.CreateXor(replaced, c);
+      replaced = Builder.CreateCast(
+        CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+      break;
+    }
+    default:
+      errs() << "Impossible\n";
+  }
   registerInteger(*replaced);
 
   return replaced;
