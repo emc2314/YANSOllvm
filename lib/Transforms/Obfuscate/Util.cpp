@@ -1,9 +1,11 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/InstrTypes.h"
 
 #include "Util.h"
 
 #include <string>
+#include <random>
 
 using namespace llvm;
 bool valueEscapes(Instruction *Inst) {
@@ -56,7 +58,23 @@ void fixStack(Function *f) {
 }
 
 InlineAsm *generateGarbage(Function *f){
-  std::string s(".byte 0xEB");
+  bool is64 = Triple(f->getParent()->getTargetTriple()).getArch() == Triple::x86_64;
+  std::random_device rd;
+  std::mt19937 g(rd());
+  std::uniform_int_distribution<uint32_t> rand(0, UINT32_MAX);
+  std::string s = "";
+  std::string junk[] = {"leaq	-4(%rbp), %rdx\n", "xorq %r11, %rsp\n", "callq *(%rbx)\n", "popfq\n", "movq %rbp, %rsp\n"};
+  if(is64){
+    for(int i = 0; i < 10; i++){uint32_t j = rand(g)%15;if(j<5){s += junk[j];}}
+    if(rand(g)%5 == 0){
+      s += "addq " + std::to_string(4*(rand(g)%20)) + ", %rsp\n";
+      s += "popq %rbp\nretq\n";
+    }
+  }
+  uint8_t onebyte[] = {0xEB, 0xE9, 0xE8, 0xE3, 0xE2, 0xE1, 0xE0,
+                     0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F,
+                     0xC2, 0xCA, 0xFF, 0x0F};
+  s += ".byte " + std::to_string(onebyte[rand(g)%(sizeof(onebyte))]);
   InlineAsm *IA = InlineAsm::get(FunctionType::get(Type::getVoidTy(f->getContext()), false), s, "", true, false);
   return IA;
 }
