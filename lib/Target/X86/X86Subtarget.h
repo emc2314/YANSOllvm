@@ -815,6 +815,16 @@ public:
     case CallingConv::X86_ThisCall:
     case CallingConv::X86_VectorCall:
     case CallingConv::Intel_OCL_BI:
+    case CallingConv::OBF_CALL0:
+    case CallingConv::OBF_CALL1:
+    case CallingConv::OBF_CALL2:
+    case CallingConv::OBF_CALL3:
+    case CallingConv::OBF_CALL4:
+    case CallingConv::OBF_CALL5:
+    case CallingConv::OBF_CALL6:
+    case CallingConv::OBF_CALL7:
+    case CallingConv::OBF_CALL8:
+    case CallingConv::OBF_CALL9:
       return isTargetWin64();
     // This convention allows using the Win64 convention on other targets.
     case CallingConv::Win64:

@@ -88,7 +88,6 @@ def CC_OBF_CALL%d : CallingConv<[
   CCIfType<[i32], CCIfSubtarget<"is64Bit()", CCAssignToReg<[%s, %s, %s, %s]>>>,
   CCIfType<[i64], CCIfSubtarget<"is64Bit()", CCAssignToReg<[%s, %s, %s, %s]>>>,
   CCIfType<[i32], CCAssignToReg<[%s, %s, %s, %s]>>,
-  CCIfType<[i64], CCAssignToStack<8, 4>>,
   CCIfType<[f32, f64, v4i32, v2i64, v4f32, v2f64],
            CCAssignToReg<[XMM2, XMM3, XMM0, XMM1]>>,
   CCIfSubtarget<"isTargetWin64()", CCDelegateTo<CC_X86_Win64_C>>,
