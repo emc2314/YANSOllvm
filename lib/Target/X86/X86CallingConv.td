@@ -476,34 +476,6 @@ def RetCC_X86_64 : CallingConv<[
   CCDelegateTo<RetCC_X86_64_C>
 ]>;
 
-// OBF_CALL return-value convention.
-def RetCC_OBF_CALL : CallingConv<[
-
-  CCIfType<[i8] , CCAssignToReg<[ DL,  CL,  BL]>>,
-  CCIfType<[i16], CCAssignToReg<[ CX,  DX,  BX]>>,
-  CCIfType<[i32], CCAssignToReg<[ESI, EBX, EDX]>>,
-  CCIfType<[i64], CCAssignToReg<[RDI, RBX, RDX]>>,
-  CCIfType<[f32, f64, v4i32, v2i64, v4f32, v2f64],
-            CCAssignToReg<[XMM3,XMM2,XMM1,XMM0]>>,
-
-  CCIfType<[v8f32, v4f64, v8i32, v4i64],
-            CCAssignToReg<[YMM3,YMM2,YMM1,YMM0]>>,
-
-  CCDelegateTo<RetCC_X86Common>
-]>;
-
-// This is the return-value convention used for the entire X86 backend.
-let Entry = 1 in
-def RetCC_X86 : CallingConv<[
-
-  // Check if this is the Intel OpenCL built-ins calling convention
-  CCIfCC<"CallingConv::Intel_OCL_BI", CCDelegateTo<RetCC_Intel_OCL_BI>>,
-  CCIfCC<"CallingConv::OBF_CALL", CCDelegateTo<RetCC_OBF_CALL>>,
-
-  CCIfSubtarget<"is64Bit()", CCDelegateTo<RetCC_X86_64>>,
-  CCDelegateTo<RetCC_X86_32>
-]>;
-
 //===----------------------------------------------------------------------===//
 // X86-64 Argument Calling Conventions
 //===----------------------------------------------------------------------===//
@@ -1048,37 +1020,6 @@ def CC_X86_64 : CallingConv<[
   CCDelegateTo<CC_X86_64_C>
 ]>;
 
-// OBF_CALL calling convention.
-def CC_OBF_CALL : CallingConv<[
-
-  CCIfType<[i1, i8, i16], CCPromoteToType<i32>>,
-
-  CCIfType<[i32], CCIfSubtarget<"is64Bit()", CCAssignToReg<[EBX, R15D, R10D, R9D]>>>,
-  CCIfType<[i64], CCIfSubtarget<"is64Bit()", CCAssignToReg<[RBX, R13, R11, R12]>>>,
-
-  CCIfType<[i32], CCAssignToReg<[EDI, EBX, ESI, EAX]>>,
-  CCIfType<[i64], CCAssignToStack<8, 4>>,
-
-  CCIfType<[f32, f64, v4i32, v2i64, v4f32, v2f64],
-           CCAssignToReg<[XMM2, XMM3, XMM0, XMM1]>>,
-
-  CCIfType<[v8f32, v4f64, v8i32, v4i64],
-           CCAssignToReg<[YMM2, YMM3, YMM0, YMM1]>>,
-
-  CCIfSubtarget<"isTargetWin64()", CCDelegateTo<CC_X86_Win64_C>>,
-  CCIfSubtarget<"is64Bit()",       CCDelegateTo<CC_X86_64_C>>,
-  CCDelegateTo<CC_X86_32_C>
-]>;
-
-// This is the argument convention used for the entire X86 backend.
-let Entry = 1 in
-def CC_X86 : CallingConv<[
-  CCIfCC<"CallingConv::Intel_OCL_BI", CCDelegateTo<CC_Intel_OCL_BI>>,
-  CCIfCC<"CallingConv::OBF_CALL", CCDelegateTo<CC_OBF_CALL>>,
-  CCIfSubtarget<"is64Bit()", CCDelegateTo<CC_X86_64>>,
-  CCDelegateTo<CC_X86_32>
-]>;
-
 //===----------------------------------------------------------------------===//
 // Callee-saved Registers.
 //===----------------------------------------------------------------------===//
@@ -1087,9 +1028,6 @@ def CSR_NoRegs : CalleeSavedRegs<(add)>;
 
 def CSR_32 : CalleeSavedRegs<(add ESI, EDI, EBX, EBP)>;
 def CSR_64 : CalleeSavedRegs<(add RBX, R12, R13, R14, R15, RBP)>;
-
-def CSR_32_OBF : CalleeSavedRegs<(add EAX, EBP)>;
-def CSR_64_OBF : CalleeSavedRegs<(add RAX, R8, R14, RBP)>;
 
 def CSR_64_SwiftError : CalleeSavedRegs<(sub CSR_64, R12)>;
 
@@ -1187,3 +1125,4 @@ def CSR_SysV64_RegCall_NoSSE : CalleeSavedRegs<(add RBX, RBP, RSP,
 def CSR_SysV64_RegCall       : CalleeSavedRegs<(add CSR_SysV64_RegCall_NoSSE,               
                                                (sequence "XMM%u", 8, 15))>;
                                                
+include "ObfCall.td"

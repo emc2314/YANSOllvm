@@ -9,6 +9,8 @@ lib/Transforms/*
 lib/Target/*
 !lib/Target/X86/
 lib/Target/X86/*
+!lib/Target/X86/CMakeLists.txt
+!lib/Target/X86/genObfCC.py
 !lib/Target/X86/X86CallingConv.td
 !lib/Target/X86/X86RegisterInfo.cpp
 !include/

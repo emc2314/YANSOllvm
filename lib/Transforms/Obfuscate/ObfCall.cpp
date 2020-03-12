@@ -29,12 +29,16 @@ bool ObfCall::runOnModule(Module &M){
   bool modified = false;
   Triple::ArchType at = Triple(M.getTargetTriple()).getArch();
   if(at == Triple::x86_64 || at == Triple::x86){
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::uniform_int_distribution<CallingConv::ID> rand(CallingConv::OBF_CALL_START, CallingConv::OBF_CALL_END);
     for(Function &F: M){
+      CallingConv::ID obfCC = rand(g);
       if(F.getLinkage() == GlobalValue::InternalLinkage && !F.isVarArg()){
-        F.setCallingConv(CallingConv::OBF_CALL);
+        F.setCallingConv(obfCC);
         for(Use &U: F.uses()){
           if(CallBase *C = dyn_cast<CallBase>(U.getUser())){
-            C->setCallingConv(CallingConv::OBF_CALL);
+            C->setCallingConv(obfCC);
           }
         }
         modified = true;

@@ -223,7 +223,18 @@ namespace CallingConv {
     AArch64_VectorCall = 97,
 
     // Customm calling convention for obfuscation
-    OBF_CALL = 98,
+    OBF_CALL_START = 98,
+    OBF_CALL0 = 98,
+    OBF_CALL1 = 99,
+    OBF_CALL2 = 100,
+    OBF_CALL3 = 101,
+    OBF_CALL4 = 102,
+    OBF_CALL5 = 103,
+    OBF_CALL6 = 104,
+    OBF_CALL7 = 105,
+    OBF_CALL8 = 106,
+    OBF_CALL9 = 107,
+    OBF_CALL_END = 108,
 
     /// The highest possible calling convention ID. Must be some 2^k - 1.
     MaxID = 1023

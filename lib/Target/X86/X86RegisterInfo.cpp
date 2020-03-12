@@ -326,13 +326,17 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
       return CSR_64_Intel_OCL_BI_SaveList;
     break;
   }
-  case CallingConv::OBF_CALL: {
-    if (Is64Bit){
-      return CSR_64_OBF_SaveList;
-    }
-    return CSR_32_OBF_SaveList;
-    break;
-  }
+#define CASE_OBF_SAVE(x) case CallingConv::OBF_CALL##x:{if(Is64Bit){return CSR_64_OBF##x##_SaveList;}return CSR_32_OBF##x##_SaveList;break;}
+  CASE_OBF_SAVE(0)
+  CASE_OBF_SAVE(1)
+  CASE_OBF_SAVE(2)
+  CASE_OBF_SAVE(3)
+  CASE_OBF_SAVE(4)
+  CASE_OBF_SAVE(5)
+  CASE_OBF_SAVE(6)
+  CASE_OBF_SAVE(7)
+  CASE_OBF_SAVE(8)
+  CASE_OBF_SAVE(9)
   case CallingConv::HHVM:
     return CSR_64_HHVM_SaveList;
   case CallingConv::X86_RegCall:
@@ -447,13 +451,17 @@ X86RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
       return CSR_64_Intel_OCL_BI_RegMask;
     break;
   }
-  case CallingConv::OBF_CALL: {
-    if (Is64Bit){
-      return CSR_64_OBF_RegMask;
-    }
-    return CSR_32_OBF_RegMask;
-    break;
-  }
+#define CASE_OBF_MASK(x) case CallingConv::OBF_CALL##x:{if(Is64Bit){return CSR_64_OBF##x##_RegMask;}return CSR_32_OBF##x##_RegMask;break;}
+  CASE_OBF_MASK(0)
+  CASE_OBF_MASK(1)
+  CASE_OBF_MASK(2)
+  CASE_OBF_MASK(3)
+  CASE_OBF_MASK(4)
+  CASE_OBF_MASK(5)
+  CASE_OBF_MASK(6)
+  CASE_OBF_MASK(7)
+  CASE_OBF_MASK(8)
+  CASE_OBF_MASK(9)
   case CallingConv::HHVM:
     return CSR_64_HHVM_RegMask;
   case CallingConv::X86_RegCall:
