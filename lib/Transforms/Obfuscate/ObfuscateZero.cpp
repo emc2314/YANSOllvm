@@ -2,6 +2,8 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
+#include "Util.h"
+
 #include <vector>
 #include <random>
 
@@ -22,11 +24,8 @@ namespace {
     bool isValidCandidateInstruction(Instruction &Inst) const;
     ConstantInt *isValidCandidateOperand(Value *V) const;
     void registerInteger(Value &V);
-    // We replace 0 with:
-    // prime1 * ((x | any1)**2) != prime2 * ((y | any2)**2)
-    // with prime1 != prime2 and any1 != 0 and any2 != 0
     Value *replaceZero(Instruction &Inst, ConstantInt *VReplace);
-    Value *createExpression(Type* IntermediaryType, const uint32_t p, IRBuilder<>& Builder);
+    Value *createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder);
   };
 }
 
@@ -34,25 +33,20 @@ bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
   IntegerVect.clear();
   bool modified = false;
 
-  // We do not iterate from the beginning of a basic block, to avoid
-  // obfuscating the parameters of Phi-instructions.
   for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
       end = BB.end();
       I != end; ++I) {
     Instruction &Inst = *I;
     if (isValidCandidateInstruction(Inst)) {
       size_t opSize = Inst.getNumOperands();
+      //Do not obfuscate switch cases
       if (isa<SwitchInst>(&Inst))
         opSize = 1;
       for (size_t i = 0; i < opSize; ++i) {
         if (ConstantInt *C = isValidCandidateOperand(Inst.getOperand(i))) {
-          //errs() << "Original instruction!\n";
-          //errs() << Inst << "\n";
           if (Value *New_val = replaceZero(Inst, C)) {
             Inst.setOperand(i, New_val);
             modified = true;
-            //errs() << "Modified instruction!\n";
-            //errs() << Inst << "\n";
           }
         }
       }
@@ -62,7 +56,6 @@ bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
   return modified;
 }
 
-// We do not analyze pointers, switches and call instructions.
 bool ObfuscateZero::isValidCandidateInstruction(Instruction &Inst) const {
   if (isa<GetElementPtrInst>(&Inst)) {
     return false;
@@ -77,7 +70,6 @@ bool ObfuscateZero::isValidCandidateInstruction(Instruction &Inst) const {
   }
 }
 
-// We do not analyze operands that are pointers, floats or the NULL value.
 ConstantInt* ObfuscateZero::isValidCandidateOperand(Value *V) const {
   if (ConstantInt *C = dyn_cast<ConstantInt>(V)) {
     if (C->isZero()) {
@@ -95,39 +87,25 @@ void ObfuscateZero::registerInteger(Value &V) {
     IntegerVect.push_back(&V);
 }
 
-Value *ObfuscateZero::createExpression
-(Type* IntermediaryType, const uint32_t p, IRBuilder<>& Builder) {
-  // BEGIN HELP: You can use these declarations, or you can remove them.
-  std::uniform_int_distribution<size_t> Rand(0, IntegerVect.size() - 1);
-  std::uniform_int_distribution<size_t> RandAny(1, 10);
-  size_t Index = Rand(Generator);
-  Constant *any = ConstantInt::get(IntermediaryType, 1 + RandAny(Generator)),
+Value *ObfuscateZero::createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder) {
+  Type *IntermediaryType = x->getType();
+  std::uniform_int_distribution<size_t> RandAny(1, 256);
+  Constant *any = ConstantInt::get(IntermediaryType, RandAny(Generator)),
            *prime = ConstantInt::get(IntermediaryType, p),
-           *OverflowMask = ConstantInt::get(IntermediaryType, 0x7FFFFFFF);
-  // END HELP.
+           *OverflowMask = ConstantInt::get(IntermediaryType, 0xFF);
 
-  // Tot = p*(x|any)^2
-  Value *x = IntegerVect[Index];
-  Value *temp = Builder.CreateCast(CastInst::getCastOpcode(x, false, IntermediaryType, false),
-           x, IntermediaryType);
-  temp = Builder.CreateOr(temp, any);
+  Value *temp = Builder.CreateOr(x, any);
   temp = Builder.CreateAnd(OverflowMask, temp);
   temp = Builder.CreateMul(temp,temp);
   temp = Builder.CreateMul(prime, temp);
-  Value *Tot = temp;
-  registerInteger(*Tot);
+  registerInteger(*temp);
 
-  return Tot;
+  return temp;
 }
 
-// We replace 0 with:
-// prime1 * ((x | any1)**2) != prime2 * ((y | any2)**2)
-// with prime1 != prime2 and any1 != 0 and any2 != 0
 Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
-  const uint32_t p1 = 431, p2 = 277;
-
   IntegerType *ReplacedType = VReplace->getType(),
-       *IntermediaryType = IntegerType::get(Inst.getParent()->getContext(),
+       *i32 = IntegerType::get(Inst.getParent()->getContext(),
            sizeof(uint32_t) * 8);
 
   if (IntegerVect.size() < 1) {
@@ -135,20 +113,22 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
   }
 
   IRBuilder<> Builder(&Inst);
+  std::uniform_int_distribution<size_t> Rand(0, IntegerVect.size() - 1);
+  Value *temp = IntegerVect[Rand(Generator)];
+  Value *x = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
 
-  // lhs
-  Value* LhsTot = createExpression(IntermediaryType, p1, Builder);
-
-  // rhs
-  Value* RhsTot = createExpression(IntermediaryType, p2, Builder);
-
-  // comp
+  uint32_t randp1 = randPrime(1<<8, 1<<16);
+  uint32_t randp2 = randPrime(1<<8, 1<<16);
+  while(randp1 == randp2)
+    randp2 = randPrime(1<<8, 1<<16);
+  Value* LhsTot = createExpression(x, randp1, Builder);
+  Value* RhsTot = createExpression(x, randp2, Builder);
   Value *comp =
     Builder.CreateICmp(CmpInst::ICMP_EQ, LhsTot, RhsTot);
-  Value *castComp = Builder.CreateSExt(comp, ReplacedType);
-  registerInteger(*castComp);
+  Value *replaced = Builder.CreateSExt(comp, ReplacedType);
+  registerInteger(*replaced);
 
-  return castComp;
+  return replaced;
 }
 
 char ObfuscateZero::ID = 0;
