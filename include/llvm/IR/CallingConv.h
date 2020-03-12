@@ -234,7 +234,7 @@ namespace CallingConv {
     OBF_CALL7 = 105,
     OBF_CALL8 = 106,
     OBF_CALL9 = 107,
-    OBF_CALL_END = 108,
+    OBF_CALL_END = 107,
 
     /// The highest possible calling convention ID. Must be some 2^k - 1.
     MaxID = 1023

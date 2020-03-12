@@ -89,7 +89,7 @@ void ObfuscateZero::registerInteger(Value &V) {
 
 Value *ObfuscateZero::createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder) {
   Type *IntermediaryType = x->getType();
-  std::uniform_int_distribution<size_t> RandAny(1, 256);
+  std::uniform_int_distribution<size_t> RandAny(1, 255);
   Constant *any = ConstantInt::get(IntermediaryType, RandAny(Generator)),
            *prime = ConstantInt::get(IntermediaryType, p),
            *OverflowMask = ConstantInt::get(IntermediaryType, 0xFF);
