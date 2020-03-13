@@ -108,46 +108,16 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
        *i32 = IntegerType::get(Inst.getParent()->getContext(),
            sizeof(uint32_t) * 8);
 
-  if (IntegerVect.size() < 1) {
-    return nullptr;
-  }
-
-  IRBuilder<> Builder(&Inst);
-  std::uniform_int_distribution<size_t> Rand(0, IntegerVect.size() - 1);
-  std::uniform_int_distribution<uint32_t> rand32(0, UINT32_MAX);
-  Value *temp = IntegerVect[Rand(Generator)];
-  Value *x = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
-  temp = IntegerVect[Rand(Generator)];
-  Value *y = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
   Value *replaced = nullptr;
 
-  switch(rand32(Generator)%4){
-    case 0:{
-      // p1*(x|any)**2 != p2*(y|any)**2
-      uint32_t randp1 = randPrime(1<<8, 1<<16);
-      uint32_t randp2 = randPrime(1<<8, 1<<16);
-      while(randp1 == randp2)
-        randp2 = randPrime(1<<8, 1<<16);
-      Value* LhsTot = createExpression(x, randp1, Builder);
-      Value* RhsTot = createExpression(y, randp2, Builder);
-      Value *comp =
-        Builder.CreateICmp(CmpInst::ICMP_EQ, LhsTot, RhsTot);
-      replaced = Builder.CreateSExt(comp, ReplacedType);
-      break;
-    }
-    case 1:{
-      // x + y = x^y + 2*(x&y)
-      replaced = Builder.CreateAdd(x,y);
-      temp = Builder.CreateXor(x,y);
-      replaced = Builder.CreateSub(replaced, temp);
-      temp = Builder.CreateAnd(x,y);
-      temp = Builder.CreateShl(temp, ConstantInt::get(i32, 1));
-      replaced = Builder.CreateXor(replaced, temp);
-      replaced = Builder.CreateCast(
-        CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
-      break;
-    }
-    case 2:{
+  if(IntegerVect.size() > 0){
+    IRBuilder<> Builder(&Inst);
+    std::uniform_int_distribution<size_t> Rand(0, IntegerVect.size() - 1);
+    std::uniform_int_distribution<uint32_t> randswitch(0, 2);
+    size_t ix = Rand(Generator);
+    Value *temp = IntegerVect[ix];
+    Value *x = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
+    if(IntegerVect.size() == 1){
       // ((~x | 0x7AFAFA69) & 0xA061440) + ((x & 0x1050504) | 0x1010104) == 185013572
       temp = Builder.CreateNot(x);
       temp = Builder.CreateOr(temp, ConstantInt::get(i32, 0x7AFAFA69));
@@ -158,30 +128,63 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
       replaced = Builder.CreateXor(replaced, ConstantInt::get(i32, 185013572));
       replaced = Builder.CreateCast(
         CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
-      break;
+    }else{
+      size_t iy = Rand(Generator);
+      while(ix == iy)
+        iy = Rand(Generator);
+      temp = IntegerVect[iy];
+      Value *y = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
+
+      switch(randswitch(Generator)){
+        case 0:{
+          // p1*(x|any)**2 != p2*(y|any)**2
+          uint32_t randp1 = randPrime(1<<8, 1<<16);
+          uint32_t randp2 = randPrime(1<<8, 1<<16);
+          while(randp1 == randp2)
+            randp2 = randPrime(1<<8, 1<<16);
+          Value* LhsTot = createExpression(x, randp1, Builder);
+          Value* RhsTot = createExpression(y, randp2, Builder);
+          Value *comp =
+            Builder.CreateICmp(CmpInst::ICMP_EQ, LhsTot, RhsTot);
+          replaced = Builder.CreateSExt(comp, ReplacedType);
+          break;
+        }
+        case 1:{
+          // x + y = x^y + 2*(x&y)
+          replaced = Builder.CreateAdd(x,y);
+          temp = Builder.CreateXor(x,y);
+          replaced = Builder.CreateSub(replaced, temp);
+          temp = Builder.CreateAnd(x,y);
+          temp = Builder.CreateShl(temp, ConstantInt::get(i32, 1));
+          replaced = Builder.CreateXor(replaced, temp);
+          replaced = Builder.CreateCast(
+            CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+          break;
+        }
+        case 2:{
+          // x ^ y == (x|~y) - 3*(~(x|y)) + 2*(~x) - y
+          Value *a = Builder.CreateNot(y);
+          a = Builder.CreateOr(x, a);
+          Value *b = Builder.CreateOr(x,y);
+          b = Builder.CreateNot(b);
+          b = Builder.CreateMul(b, ConstantInt::get(i32, -3));
+          Value *c = Builder.CreateNot(x);
+          c = Builder.CreateMul(c, ConstantInt::get(i32, 2));
+          c = Builder.CreateSub(c, y);
+          replaced = Builder.CreateXor(x,y);
+          replaced = Builder.CreateSub(replaced, a);
+          replaced = Builder.CreateSub(replaced, b);
+          replaced = Builder.CreateXor(replaced, c);
+          replaced = Builder.CreateCast(
+            CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+          break;
+        }
+        default:
+          errs() << "Impossible\n";
+      }
     }
-    case 3:{
-      // x ^ y == (x|~y) - 3*(~(x|y)) + 2*(~x) - y
-      Value *a = Builder.CreateNot(y);
-      a = Builder.CreateOr(x, a);
-      Value *b = Builder.CreateOr(x,y);
-      b = Builder.CreateNot(b);
-      b = Builder.CreateMul(b, ConstantInt::get(i32, -3));
-      Value *c = Builder.CreateNot(x);
-      c = Builder.CreateMul(c, ConstantInt::get(i32, 2));
-      c = Builder.CreateSub(c, y);
-      replaced = Builder.CreateXor(x,y);
-      replaced = Builder.CreateSub(replaced, a);
-      replaced = Builder.CreateSub(replaced, b);
-      replaced = Builder.CreateXor(replaced, c);
-      replaced = Builder.CreateCast(
-        CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
-      break;
-    }
-    default:
-      errs() << "Impossible\n";
+    registerInteger(*replaced);
   }
-  registerInteger(*replaced);
 
   return replaced;
 }
