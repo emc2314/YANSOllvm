@@ -23,9 +23,9 @@ YANSOllvm operates on the IR level (and also X86 backend for obfCall). So first 
 
 Then you can apply passes to the bytecode:
 
-```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -merge -flattening -connect -bb2func -obfZero -obfCall main.bc -o main.obf.bc```
+```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -flattening -connect -bb2func -obfZero -obfCall main.bc -o main.obf.bc```
 
-Notice that **the order of passes matters**. You can add llvm's own passes or apply the same obfuscate pass twice, e.g. ```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -merge -O3 -flattening -obfZero -connect -bb2func -obfZero -obfCall --view-callgraph main.bc -o main.obf.bc```.
+Notice that **the order of passes matters**. You can add llvm's own passes or apply the same obfuscate pass twice, e.g. ```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -O3 -flattening -obfZero -connect -bb2func -obfZero -obfCall --view-callgraph main.bc -o main.obf.bc```.
 
 After that, compile the output bytecode to assembly using llc:
 
@@ -36,6 +36,8 @@ Finally, assemble and link the output assembly:
 ```clang main.obf.s -o main```
 
 # Passes
+## VM
+Substitute some basic binary operators (e.g. xor, add) with functions.
 ## Merge
 This pass merges all internal linkage functions (e.g. static function) to a single function.
 ## Flattening
