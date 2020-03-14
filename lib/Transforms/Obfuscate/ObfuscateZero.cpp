@@ -116,7 +116,7 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
     std::uniform_int_distribution<uint32_t> randswitch(0, 2);
     size_t ix = Rand(Generator);
     Value *temp = IntegerVect[ix];
-    Value *x = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
+    Value *x = Builder.CreateIntCast(temp, i32, false);
     if(IntegerVect.size() == 1){
       // ((~x | 0x7AFAFA69) & 0xA061440) + ((x & 0x1050504) | 0x1010104) == 185013572
       temp = Builder.CreateNot(x);
@@ -126,14 +126,13 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
       replaced = Builder.CreateOr(replaced, ConstantInt::get(i32, 0x1010104));
       replaced = Builder.CreateAdd(replaced, temp);
       replaced = Builder.CreateXor(replaced, ConstantInt::get(i32, 185013572));
-      replaced = Builder.CreateCast(
-        CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+      replaced = Builder.CreateIntCast(replaced, ReplacedType, false);
     }else{
       size_t iy = Rand(Generator);
       while(ix == iy)
         iy = Rand(Generator);
       temp = IntegerVect[iy];
-      Value *y = Builder.CreateCast(CastInst::getCastOpcode(temp, false, i32, false), temp, i32);
+      Value *y = Builder.CreateIntCast(temp, i32, false);
 
       switch(randswitch(Generator)){
         case 0:{
@@ -157,8 +156,7 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
           temp = Builder.CreateAnd(x,y);
           temp = Builder.CreateShl(temp, ConstantInt::get(i32, 1));
           replaced = Builder.CreateXor(replaced, temp);
-          replaced = Builder.CreateCast(
-            CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+          replaced = Builder.CreateIntCast(replaced, ReplacedType, false);
           break;
         }
         case 2:{
@@ -175,8 +173,7 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
           replaced = Builder.CreateSub(replaced, a);
           replaced = Builder.CreateSub(replaced, b);
           replaced = Builder.CreateXor(replaced, c);
-          replaced = Builder.CreateCast(
-            CastInst::getCastOpcode(replaced, false, ReplacedType, false), replaced, ReplacedType);
+          replaced = Builder.CreateIntCast(replaced, ReplacedType, false);
           break;
         }
         default:
