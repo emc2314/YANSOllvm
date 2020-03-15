@@ -1,11 +1,11 @@
 import random
 
-r32_8 =  [ "AL",  "SIL",  "DIL",  "BL",  "BPL"]
-r32_16 = [ "AX",  "SI" ,  "DI" ,  "BX",  "BP" ]
-r32_32 = ["EAX", "ESI" , "EDI" , "EBX", "EBP" ]
+r32_8 =  [ "AL",  "SIL",  "DIL",  "BL",  "DL"]
+r32_16 = [ "AX",  "SI" ,  "DI" ,  "BX",  "DX"]
+r32_32 = ["EAX", "ESI" , "EDI" , "EBX", "EDX"]
 
-r64_32 = ["EAX", "ESI" , "EDI" , "R8D", "R9D", "EBX", "EBP" , "R10D", "R11D", "R12D", "R13D", "R14D", "R15D"]
-r64_64 = ["RAX", "RSI" , "RDI" , "R8" , "R9" , "RBX", "RBP" , "R10" , "R11" , "R12" , "R13" , "R14" , "R15" ]
+r64_32 = ["EAX", "ESI" , "EDI" , "R8D", "R9D", "EBX", "EDX" , "R10D", "R11D", "R12D", "R13D", "R14D", "R15D"]
+r64_64 = ["RAX", "RSI" , "RDI" , "R8" , "R9" , "RBX", "RDX" , "R10" , "R11" , "R12" , "R13" , "R14" , "R15" ]
 
 retcc = []
 cc32_32 = []
@@ -119,8 +119,8 @@ obftd += """
 """
 
 text = """
-def CSR_32_OBF%d : CalleeSavedRegs<(add ECX, EDX)>;
-def CSR_64_OBF%d : CalleeSavedRegs<(add %s RCX, RDX)>;
+def CSR_32_OBF%d : CalleeSavedRegs<(add ECX, EBP)>;
+def CSR_64_OBF%d : CalleeSavedRegs<(add %s RCX, RBP)>;
 """
 
 for i in range(10):
