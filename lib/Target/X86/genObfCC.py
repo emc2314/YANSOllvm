@@ -1,6 +1,6 @@
 import random
 
-r32_8 =  [ "AH",  "SIL",  "DIL",  "BH",  "BPL"]
+r32_8 =  [ "AL",  "SIL",  "DIL",  "BL",  "BPL"]
 r32_16 = [ "AX",  "SI" ,  "DI" ,  "BX",  "BP" ]
 r32_32 = ["EAX", "ESI" , "EDI" , "EBX", "EBP" ]
 
