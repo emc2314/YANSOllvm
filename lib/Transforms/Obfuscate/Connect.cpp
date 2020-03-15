@@ -83,11 +83,12 @@ bool Connect::runOnFunction(Function &F) {
     ConstantInt *c0 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 0);
     ConstantInt *c1 = ConstantInt::get(IntegerType::get(i->getContext(), 32), 1);
     SwitchInst *switchII = SwitchInst::Create(c0, defaultBB, 0, i);
+    int garbageCap = downBB.size()/4;
+    garbageCap = garbageCap > 1 ? garbageCap : 1;
     for (BasicBlock *j: downBB) {
       ConstantInt *numCase = cast<ConstantInt>(ConstantInt::get(
           switchII->getCondition()->getType(),
           rand(g)));
-      switchII->addCase(numCase, j);
       if(j == destBB){
         BinaryOperator *tempVal = nullptr;
         std::vector<Instruction::BinaryOps> vecBin{BinaryOperator::Xor, BinaryOperator::Add, BinaryOperator::Or};
@@ -101,6 +102,9 @@ bool Connect::runOnFunction(Function &F) {
           tempVal->setOperand(rand(g)%2, numCase);
         }
         switchII->setCondition(tempVal);
+        switchII->addCase(numCase, j);
+      }else if(rand(g)%garbageCap){
+        switchII->addCase(numCase, j);
       }
     }
   }
