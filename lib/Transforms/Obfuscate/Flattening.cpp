@@ -80,7 +80,7 @@ bool Flattening::flatten(Function *f) {
   }
 
   // Nothing to flatten
-  if (origBB.size() <= 2) {
+  if (origBB.size() <= 4) {
     return false;
   }
 
