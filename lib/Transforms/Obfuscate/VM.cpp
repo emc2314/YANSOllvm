@@ -5,6 +5,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/IRBuilder.h"
 
 #include <vector>
 #include <random>
@@ -20,87 +21,143 @@ namespace {
 
     private:
     Function *Add;
+    Function *CreateAdd(FunctionType *funcTy, Module &M);
     Function *Sub;
+    Function *CreateSub(FunctionType *funcTy, Module &M);
     Function *Shl;
+    Function *CreateShl(FunctionType *funcTy, Module &M);
     Function *AShr;
+    Function *CreateAShr(FunctionType *funcTy, Module &M);
     Function *LShr;
+    Function *CreateLShr(FunctionType *funcTy, Module &M);
     Function *And;
+    Function *CreateAnd(FunctionType *funcTy, Module &M);
     Function *Or;
+    Function *CreateOr(FunctionType *funcTy, Module &M);
     Function *Xor;
+    Function *CreateXor(FunctionType *funcTy, Module &M);
   };
 }
 
 char Virtualize::ID = 0;
 static RegisterPass<Virtualize> X("vm", "Use functions to do simple arithmetic");
 
-Function *CreateAdd(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateAdd(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_Add", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Add, op0, op1, "", entry);
+  IRBuilder<> Builder(entry);
+  //BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Add, x, y, "", entry);
+  //x + y == (x|~y) + (~x&y) - (~(x&y)) + (x|y)
+  Value *a = Builder.CreateNot(y);
+  a = Builder.CreateOr(a,x);
+  Value *b = Builder.CreateNot(x);
+  b = Builder.CreateAnd(b,y);
+  Value *c = Builder.CreateAnd(x,y);
+  c = Builder.CreateNot(c);
+  Value *d = Builder.CreateOr(x,y);
+  Value *binOp = Builder.CreateAdd(a,b);
+  binOp = Builder.CreateSub(binOp, c);
+  binOp = Builder.CreateAdd(binOp, d);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateSub(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateSub(FunctionType *funcTy, Module &M){
+  if(!Virtualize::Add)
+    Virtualize::Add = CreateAdd(funcTy, M);
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_Sub", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Sub, op0, op1, "", entry);
+  IRBuilder<> Builder(entry);
+  //BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Sub, x, y, "", entry);
+  // x - y == x + ~y + 1
+  Value *ny = Builder.CreateNot(y);
+  std::vector<Value *> callArgs;
+  callArgs.push_back(x);
+  callArgs.push_back(ny);
+  Value *binOp = CallInst::Create(Virtualize::Add, callArgs, "", entry);
+  binOp = Builder.CreateAdd(binOp, ConstantInt::get(
+                            cast<IntegerType>(x->getType()), 1));
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateShl(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateShl(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_Shl", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Shl, op0, op1, "", entry);
+  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Shl, x, y, "", entry);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateAShr(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateAShr(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_AShr", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::AShr, op0, op1, "", entry);
+  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::AShr, x, y, "", entry);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateLShr(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateLShr(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_LShr", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::LShr, op0, op1, "", entry);
+  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::LShr, x, y, "", entry);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateAnd(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateAnd(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_And", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::And, op0, op1, "", entry);
+  IRBuilder<> Builder(entry);
+  //BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::And, x, y, "", entry);
+  //x & y == -(~(x&y)) + (~x|y) + (x&~y)
+  Value *a = Builder.CreateAnd(x,y);
+  a = Builder.CreateNot(a);
+  Value *b = Builder.CreateNot(x);
+  b = Builder.CreateOr(b,y);
+  Value *c = Builder.CreateNot(y);
+  c = Builder.CreateAnd(x,c);
+  Value *binOp = Builder.CreateAdd(b,c);
+  binOp = Builder.CreateSub(binOp, a);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateOr(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateOr(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_Or", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Or, op0, op1, "", entry);
+  IRBuilder<> Builder(entry);
+  //BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Or, x, y, "", entry);
+  //x | y == (x^y) + y - (~x&y)
+  Value *a = Builder.CreateXor(x,y);
+  Value *b = Builder.CreateNot(x);
+  b = Builder.CreateAnd(b,y);
+  Value *binOp = Builder.CreateAdd(a,y);
+  binOp = Builder.CreateSub(binOp, b);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
 
-Function *CreateXor(FunctionType *funcTy, Module &M){
+Function *Virtualize::CreateXor(FunctionType *funcTy, Module &M){
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_Xor", M);
-  Function::arg_iterator itArgs = f->arg_begin(); Value *op0 = itArgs; Value *op1 = ++itArgs;
+  Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
-  BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Xor, op0, op1, "", entry);
+  IRBuilder<> Builder(entry);
+  //BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Xor, x, y, "", entry);
+  //x ^ y == -(x|~y) + ~y + (x&~y) + y
+  Value *ny = Builder.CreateNot(y);
+  Value *a = Builder.CreateOr(x,ny);
+  Value *b = Builder.CreateAnd(x,ny);
+  Value *binOp = Builder.CreateSub(ny, a);
+  binOp = Builder.CreateAdd(binOp, b);
+  binOp = Builder.CreateAdd(binOp, y);
   ReturnInst::Create(M.getContext(), binOp, entry);
   return f;
 }
@@ -114,7 +171,7 @@ bool Virtualize::runOnModule(Module &M){
   for(Function &F: M){
     for(inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I){
       if(BinaryOperator *II = dyn_cast<BinaryOperator>(&*I)){
-        IntegerType *opType = dyn_cast<IntegerType>(II->getOperand(0)->getType());
+        IntegerType *opType = cast<IntegerType>(II->getOperand(0)->getType());
         if(opType->getBitWidth() > 64)
           continue; 
         switch(II->getOpcode()){
@@ -135,7 +192,7 @@ bool Virtualize::runOnModule(Module &M){
     }
   }
   for(BinaryOperator *II: binOpIns){
-    IntegerType *opType = dyn_cast<IntegerType>(II->getOperand(0)->getType());
+    IntegerType *opType = cast<IntegerType>(II->getOperand(0)->getType());
     Value *replaced = nullptr;
     std::vector<Value*> callArgs;
     switch(II->getOpcode()){
