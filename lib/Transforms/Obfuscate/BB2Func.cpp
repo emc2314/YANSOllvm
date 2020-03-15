@@ -45,7 +45,7 @@ bool BB2Func::runOnFunction(Function &F) {
   size_t sizeLimit = 32;
   if(bblist.size() > sizeLimit){
     std::sort(bblist.begin(), bblist.end(), [](const BasicBlock *a, const BasicBlock *b){
-              return a->getInstList().size() < b->getInstList().size();});
+              return a->getInstList().size() > b->getInstList().size();});
     bblist.erase(bblist.begin()+sizeLimit, bblist.end());
   }
 
