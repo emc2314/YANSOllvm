@@ -60,6 +60,8 @@ Function *Virtualize::CreateAdd(FunctionType *funcTy, Module &M){
   binOp = Builder.CreateSub(binOp, c);
   binOp = Builder.CreateAdd(binOp, d);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
@@ -80,6 +82,8 @@ Function *Virtualize::CreateSub(FunctionType *funcTy, Module &M){
   binOp = Builder.CreateAdd(binOp, ConstantInt::get(
                             cast<IntegerType>(x->getType()), 1));
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
@@ -89,6 +93,8 @@ Function *Virtualize::CreateShl(FunctionType *funcTy, Module &M){
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
   BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Shl, x, y, "", entry);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
@@ -98,6 +104,8 @@ Function *Virtualize::CreateAShr(FunctionType *funcTy, Module &M){
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
   BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::AShr, x, y, "", entry);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
@@ -107,6 +115,8 @@ Function *Virtualize::CreateLShr(FunctionType *funcTy, Module &M){
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
   BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::LShr, x, y, "", entry);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
@@ -126,6 +136,8 @@ Function *Virtualize::CreateAnd(FunctionType *funcTy, Module &M){
   Value *binOp = Builder.CreateAdd(b,c);
   binOp = Builder.CreateSub(binOp, a);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
@@ -142,23 +154,30 @@ Function *Virtualize::CreateOr(FunctionType *funcTy, Module &M){
   Value *binOp = Builder.CreateAdd(a,y);
   binOp = Builder.CreateSub(binOp, b);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 
 Function *Virtualize::CreateXor(FunctionType *funcTy, Module &M){
+  if(!Virtualize::Shl)
+    Virtualize::Shl = CreateShl(funcTy, M);
   Function *f = Function::Create(funcTy, GlobalValue::InternalLinkage, "__YANSOLLVM_VM_Xor", M);
   Function::arg_iterator itArgs = f->arg_begin(); Value *x = itArgs; Value *y = ++itArgs;
   BasicBlock *entry = BasicBlock::Create(M.getContext(), "entry", f);
   IRBuilder<> Builder(entry);
   //BinaryOperator *binOp = BinaryOperator::Create(BinaryOperator::Xor, x, y, "", entry);
-  //x ^ y == -(x|~y) + ~y + (x&~y) + y
-  Value *ny = Builder.CreateNot(y);
-  Value *a = Builder.CreateOr(x,ny);
-  Value *b = Builder.CreateAnd(x,ny);
-  Value *binOp = Builder.CreateSub(ny, a);
-  binOp = Builder.CreateAdd(binOp, b);
-  binOp = Builder.CreateAdd(binOp, y);
+  //x ^ y == x + y - ((x&y)<<1)
+  Value *a = Builder.CreateAdd(x,y);
+  Value *b = Builder.CreateAnd(x,y);
+  std::vector<Value *> callArgs;
+  callArgs.push_back(b);
+  callArgs.push_back(ConstantInt::get(cast<IntegerType>(x->getType()), 1));
+  Value *binOp = CallInst::Create(Virtualize::Shl, callArgs, "", entry);
+  binOp = Builder.CreateSub(a, binOp);
   ReturnInst::Create(M.getContext(), binOp, entry);
+  f->addFnAttr(Attribute::NoInline);
+  f->addFnAttr(Attribute::OptimizeNone);
   return f;
 }
 

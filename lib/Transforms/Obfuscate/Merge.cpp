@@ -58,6 +58,7 @@ bool Merge::runOnModule(Module &M){
   IntegerType *retTy = IntegerType::get(M.getContext(), retBitLen);
   FunctionType *funcTy = FunctionType::get(retTy, paramTy, false);
   Function *newFunction = Function::Create(funcTy, GlobalValue::InternalLinkage, funcName + "merge", M);
+  newFunction->addFnAttr(Attribute::NoInline);
 
   for(size_t i = 0; i < mergeList.size(); i++){
     std::vector<CallInst*> vecCall;
