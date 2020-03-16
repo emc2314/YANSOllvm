@@ -110,12 +110,12 @@ bool Flattening::flatten(Function *f) {
     origBB.insert(origBB.begin(), tmpBB);
   }
 
-  std::uniform_int_distribution<uint32_t> randomUInt32(0, UINT32_MAX);
+  std::uniform_int_distribution<uint32_t> rand(0, UINT32_MAX);
   for (size_t i = 0; i < origBB.size(); i++){
-    uint32_t bbi = randomUInt32(g);
+    uint32_t bbi = rand(g);
     bbIndex.push_back(bbi);
     uint32_t bbh = fnvHash(bbi, fnvBasis);
-    for (size_t j = 0; j < 10+randomUInt32(g)%100; j++){
+    for (size_t j = 0; j < 2+rand(g)%10; j++){
       assert(std::count(bbHash.begin(), bbHash.end(), bbh) == 0);
       bbh = fnvHash(bbi, bbh);
     }
@@ -205,11 +205,11 @@ bool Flattening::flatten(Function *f) {
 
     std::vector<size_t> bbTemp = bbSeq;
     std::shuffle(bbTemp.begin(), bbTemp.end(), g);
-    uint32_t randomXor = randomUInt32(g);
+    uint32_t randomXor = rand(g);
     BinaryOperator *tempVal= BinaryOperator::Create(BinaryOperator::Xor,
                  ConstantInt::get(i32, randomXor),
                  load, "", i->getTerminator());
-    int garbageCap = bbTemp.size()/4;
+    int garbageCap = bbTemp.size()/2;
     garbageCap = garbageCap > 1 ? garbageCap : 1;
     for(size_t d: bbTemp){
       if(d == succIndexFalse){
@@ -221,10 +221,10 @@ bool Flattening::flatten(Function *f) {
                  new SExtInst(cond, i32, "", i->getTerminator()),
                  ConstantInt::get(i32, bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]), "", i->getTerminator());
         tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
-      }else if(randomUInt32(g)%garbageCap == 0){
+      }else if(rand(g)%garbageCap == 0){
         BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And,
                  ConstantInt::get(i32, 0),
-                 ConstantInt::get(i32, randomUInt32(g)), "", i->getTerminator());
+                 ConstantInt::get(i32, rand(g)), "", i->getTerminator());
         tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
       }
     }
