@@ -23,9 +23,9 @@ YANSOllvm operates on the IR level (and also X86 backend for obfCall). So first 
 
 Then you can apply passes to the bytecode:
 
-```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -flattening -connect -bb2func -obfZero -obfCall main.bc -o main.obf.bc```
+```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -bb2func -flattening -connect -obfZero -obfCall main.bc -o main.obf.bc```
 
-Notice that **the order of passes matters**. You can add llvm's own passes or apply the same obfuscate pass twice, e.g. ```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -O3 -flattening -obfZero -connect -bb2func -obfZero -obfCall --view-callgraph main.bc -o main.obf.bc```.
+Notice that **the order of passes matters**. You can use llvm's own passes or apply the same obfuscate pass twice, e.g. ```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -O3 -bb2func -flattening -obfZero -connect -obfZero -obfCall main.bc -o main.obf.bc```.
 
 After that, compile the output bytecode to assembly using llc:
 
@@ -47,12 +47,12 @@ Similar to OLLVM's bogus control flow, but totally different. It splits basic bl
 ## ObfZero
 Obfuscate zero constants using opaque predicts. The Flattening and Connect passes need this otherwise the almighty compiler optimizer will optimize away all false branches.
 ## BB2func
-Extract some basic blocks from functions and make them new functions.
+Split & extract some basic blocks and make them new functions.
 ## ObfCall
 Obfuscate all internal linkage functions calls by using randomly generated calling conventions.
 
 # Warrant
-No warrant. Only bugs. Do not use.
+No warrant. Only bugs. Use at your own risk.
 
 # License
 **Partial** code of ```Flattening.cpp``` comes from the original [OLLVM](https://github.com/obfuscator-llvm/obfuscator/tree/llvm-4.0) project, which is released under the University of Illinois/NCSA Open Source License.
