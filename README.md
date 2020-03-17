@@ -45,7 +45,7 @@ Based on OLLVM's CFG flattening, but it seperates the internal state transfer an
 ## Connect
 Similar to OLLVM's bogus control flow, but totally different. It splits basic blocks and use switch to add false branches among them.
 ## ObfZero
-Obfuscate zero constants using opaque predicts. The Flattening and Connect passes need this otherwise the almighty compiler optimizer will optimize away all false branches.
+Obfuscate zero constants using opaque predicates. The Flattening and Connect passes need this otherwise the almighty compiler optimizer will optimize away all false branches.
 ## BB2func
 Split & extract some basic blocks and make them new functions.
 ## ObfCall
