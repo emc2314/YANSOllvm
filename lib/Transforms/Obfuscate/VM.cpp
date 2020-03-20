@@ -20,21 +20,21 @@ namespace {
     bool runOnModule(Module &M) override;
 
     private:
-    Function *Add;
+    Function *Add = nullptr;
     Function *CreateAdd(FunctionType *funcTy, Module &M);
-    Function *Sub;
+    Function *Sub = nullptr;
     Function *CreateSub(FunctionType *funcTy, Module &M);
-    Function *Shl;
+    Function *Shl = nullptr;
     Function *CreateShl(FunctionType *funcTy, Module &M);
-    Function *AShr;
+    Function *AShr = nullptr;
     Function *CreateAShr(FunctionType *funcTy, Module &M);
-    Function *LShr;
+    Function *LShr = nullptr;
     Function *CreateLShr(FunctionType *funcTy, Module &M);
-    Function *And;
+    Function *And = nullptr;
     Function *CreateAnd(FunctionType *funcTy, Module &M);
-    Function *Or;
+    Function *Or = nullptr;
     Function *CreateOr(FunctionType *funcTy, Module &M);
-    Function *Xor;
+    Function *Xor = nullptr;
     Function *CreateXor(FunctionType *funcTy, Module &M);
   };
 }
