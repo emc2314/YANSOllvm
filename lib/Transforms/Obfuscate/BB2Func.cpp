@@ -69,7 +69,6 @@ bool BB2Func::runOnFunction(Function &F) {
     assert(CE.isEligible());
     Function *F = CE.extractCodeRegion();
     F->addFnAttr(Attribute::NoInline);
-    F->addFnAttr(Attribute::OptimizeNone);
     modified = true;
   }
   return modified;
