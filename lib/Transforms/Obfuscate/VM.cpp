@@ -212,97 +212,72 @@ bool Virtualize::runOnModule(Module &M){
   }
   for(BinaryOperator *II: binOpIns){
     IntegerType *opType = cast<IntegerType>(II->getOperand(0)->getType());
-    Value *replaced = nullptr;
-    std::vector<Value*> callArgs;
+    Function *func = nullptr;
+    bool isSigned = false;
     switch(II->getOpcode()){
       case BinaryOperator::Add:{
         if(!Virtualize::Add)
           Virtualize::Add = CreateAdd(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::Add, callArgs, "", II);
+        func = Virtualize::Add;
         break;
       }
       case BinaryOperator::Sub:{
         if(!Virtualize::Sub)
           Virtualize::Sub = CreateSub(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::Sub, callArgs, "", II);
+        func = Virtualize::Sub;
         break;
       }
       case BinaryOperator::Shl:{
         if(!Virtualize::Shl)
           Virtualize::Shl = CreateShl(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::Shl, callArgs, "", II);
+        func = Virtualize::Shl;
         break;
       }
       case BinaryOperator::AShr:{
         if(!Virtualize::AShr)
           Virtualize::AShr = CreateAShr(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, true, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, true, "", II));
-        replaced = CallInst::Create(Virtualize::AShr, callArgs, "", II);
+        func = Virtualize::AShr;
+        isSigned  = true;
         break;
       }
       case BinaryOperator::LShr:{
         if(!Virtualize::LShr)
           Virtualize::LShr = CreateLShr(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::LShr, callArgs, "", II);
+        func = Virtualize::LShr;
         break;
       }
       case BinaryOperator::And:{
         if(!Virtualize::And)
           Virtualize::And = CreateAnd(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::And, callArgs, "", II);
+        func = Virtualize::And;
         break;
       }
       case BinaryOperator::Or:{
         if(!Virtualize::Or)
           Virtualize::Or = CreateOr(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::Or, callArgs, "", II);
+        func = Virtualize::Or;
         break;
       }
       case BinaryOperator::Xor:{
         if(!Virtualize::Xor)
           Virtualize::Xor = CreateXor(funcTy, M);
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(0), i64, false, "", II));
-        callArgs.push_back(CastInst::CreateIntegerCast(
-                           II->getOperand(1), i64, false, "", II));
-        replaced = CallInst::Create(Virtualize::Xor, callArgs, "", II);
+        func = Virtualize::Xor;
         break;
       }
       default:
         break;
     }
-    if(replaced){
-      modified = true;
+    if(func){
+      std::vector<Value*> callArgs;
+      callArgs.push_back(CastInst::CreateIntegerCast(
+                         II->getOperand(0), i64, isSigned, "", II));
+      callArgs.push_back(CastInst::CreateIntegerCast(
+                         II->getOperand(1), i64, isSigned, "", II));
+      Value *replaced = CallInst::Create(func, callArgs, "", II);
       replaced = CastInst::CreateIntegerCast(replaced, opType, false, "", II);
       II->replaceAllUsesWith(replaced);
       II->eraseFromParent();
+      modified = true;
     }
   }
   return modified;
