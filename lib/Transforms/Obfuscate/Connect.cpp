@@ -103,7 +103,7 @@ bool Connect::runOnFunction(Function &F) {
         }
         switchII->setCondition(tempVal);
         switchII->addCase(numCase, j);
-      }else if(rand(g)%garbageCap){
+      }else if(rand(g)%garbageCap == 0){
         switchII->addCase(numCase, j);
       }
     }
