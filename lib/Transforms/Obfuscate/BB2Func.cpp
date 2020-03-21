@@ -57,7 +57,7 @@ bool BB2Func::runOnFunction(Function &F) {
     BasicBlock::iterator itb = BB->getFirstInsertionPt();
     size_t bbSize = std::distance(itb, BB->end());
     if(bbSize >= 4){
-      std::advance(itb, bbSize / 2);
+      std::advance(itb, bbSize/2 > 8 ? 8 : bbSize/2);
       bblist.push_back(BB->splitBasicBlock(itb));
     }
   }
