@@ -23,9 +23,9 @@ YANSOllvm operates on the IR level (and also X86 backend for obfCall). So first 
 
 Then you can apply passes to the bytecode:
 
-```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -bb2func -flattening -connect -obfZero -obfCall main.bc -o main.obf.bc```
+```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -bb2func -flattening -connect -obfCon -obfCall main.bc -o main.obf.bc```
 
-Notice that **the order of passes matters**. You can use llvm's own passes or apply the same obfuscate pass twice, e.g. ```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -O3 -bb2func -flattening -obfZero -connect -obfZero -obfCall main.bc -o main.obf.bc```.
+Notice that **the order of passes matters**. You can use llvm's own passes or apply the same obfuscate pass twice, e.g. ```{PATH_TO_BUILD_DIR}/bin/opt -load {PATH_TO_BUILD_DIR}/lib/LLVMObf.so -vm -merge -O3 -bb2func -flattening -obfCon -connect -obfCon -obfCall main.bc -o main.obf.bc```.
 
 After that, compile the output bytecode to assembly using llc:
 
@@ -44,8 +44,8 @@ This pass merges all internal linkage functions (e.g. static function) to a sing
 Based on OLLVM's CFG flattening, but it seperates the internal state transfer and the switch variable using a simple hash function.
 ## Connect
 Similar to OLLVM's bogus control flow, but totally different. It splits basic blocks and use switch to add false branches among them.
-## ObfZero
-Obfuscate zero constants using opaque predicates. The Flattening and Connect passes need this otherwise the almighty compiler optimizer will optimize away all false branches.
+## ObfCon
+Obfuscate constants using MBA. The Flattening and Connect passes need this otherwise the almighty compiler optimizer will optimize away all false branches.
 ## BB2func
 Split & extract some basic blocks and make them new functions.
 ## ObfCall
@@ -57,7 +57,7 @@ No warrant. Only bugs. Use at your own risk.
 # License
 **Partial** code of ```Flattening.cpp``` comes from the original [OLLVM](https://github.com/obfuscator-llvm/obfuscator/tree/llvm-4.0) project, which is released under the University of Illinois/NCSA Open Source License.
 
-**Partial** code of ```ObfuscateZero.cpp``` comes from the [Quarkslab/llvm-passes](https://github.com/quarkslab/llvm-passes), which is released under the MIT License.
+**Partial** code of ```ObfuscateConstant.cpp``` comes from the [Quarkslab/llvm-passes](https://github.com/quarkslab/llvm-passes), which is released under the MIT License.
 
 Besides, the X86 related code is modified directly from the [LLVM](https://github.com/llvm/llvm-project/releases/tag/llvmorg-9.0.1), which is released under the Apache-2.0 WITH LLVM-exception License.
 

@@ -4,7 +4,7 @@ endif()
 
 add_llvm_library( LLVMObf MODULE BUILDTREE_ONLY
   Util.cpp
-  ObfuscateZero.cpp
+  ObfuscateConstant.cpp
   Flattening.cpp
   Connect.cpp
   Merge.cpp

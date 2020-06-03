@@ -155,3 +155,11 @@ uint32_t randPrime(uint32_t min, uint32_t max){
   }
   return p;
 }
+
+uint64_t modinv(uint64_t a){
+  uint64_t x = a;
+  for (int k = 2; k < 64; k*=2) {
+    x = (x * (2 - a * x)) % (1ULL << k);
+  }
+  return x * (2 - a * x);
+}

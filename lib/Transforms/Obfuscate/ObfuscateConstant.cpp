@@ -1,6 +1,8 @@
-#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/Pass.h"
 
 #include "Util.h"
 
@@ -10,53 +12,81 @@
 using namespace llvm;
 
 namespace {
-  class ObfuscateZero : public BasicBlockPass {
+  class ObfuscateConstant : public FunctionPass {
     private:
     std::vector<Value *> IntegerVect;
     std::default_random_engine Generator;
 
     public:
     static char ID;
-    ObfuscateZero() : BasicBlockPass(ID) {}
-    bool runOnBasicBlock(BasicBlock &BB) override;
+    ObfuscateConstant() : FunctionPass(ID) {}
+    bool runOnFunction(Function &F) override;
 
     private:
     bool isValidCandidateInstruction(Instruction &Inst) const;
-    ConstantInt *isValidCandidateOperand(Value *V) const;
+    ConstantInt *isSplitCandidateOperand(Value *V) const;
+    ConstantInt *isObfCandidateOperand(Value *V) const;
     void registerInteger(Value &V);
     Value *replaceZero(Instruction &Inst, ConstantInt *VReplace);
     Value *createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder);
+    Value *splitConst(Instruction &Inst, ConstantInt *VReplace);
   };
 }
 
-bool ObfuscateZero::runOnBasicBlock(BasicBlock &BB) {
-  IntegerVect.clear();
+char ObfuscateConstant::ID = 0;
+static RegisterPass<ObfuscateConstant> X("obfCon", "Split and obfuscate constants");
+Pass *createObfuscateConstantPass() { return new ObfuscateConstant(); }
+
+bool ObfuscateConstant::runOnFunction(Function &F) {
   bool modified = false;
 
-  for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
-      end = BB.end();
-      I != end; ++I) {
-    Instruction &Inst = *I;
-    if (isValidCandidateInstruction(Inst)) {
-      size_t opSize = Inst.getNumOperands();
-      //Do not obfuscate switch cases
-      if (isa<SwitchInst>(&Inst))
-        opSize = 1;
-      for (size_t i = 0; i < opSize; ++i) {
-        if (ConstantInt *C = isValidCandidateOperand(Inst.getOperand(i))) {
-          if (Value *New_val = replaceZero(Inst, C)) {
-            Inst.setOperand(i, New_val);
-            modified = true;
+  for (auto &BB:F.getBasicBlockList()){
+    for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
+        end = BB.end();
+        I != end; ++I) {
+      Instruction &Inst = *I;
+      if (isValidCandidateInstruction(Inst)) {
+        size_t opSize = Inst.getNumOperands();
+        //Do not obfuscate switch cases
+        if (isa<SwitchInst>(&Inst))
+          opSize = 1;
+        for (size_t i = 0; i < opSize; ++i) {
+          if (ConstantInt *C = isSplitCandidateOperand(Inst.getOperand(i))) {
+            if (Value *New_val = splitConst(Inst, C)) {
+              Inst.setOperand(i, New_val);
+              modified = true;
+            }
           }
         }
       }
     }
-    registerInteger(Inst);
+
+    IntegerVect.clear();
+    for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
+        end = BB.end();
+        I != end; ++I) {
+      Instruction &Inst = *I;
+      if (isValidCandidateInstruction(Inst)) {
+        size_t opSize = Inst.getNumOperands();
+        //Do not obfuscate switch cases
+        if (isa<SwitchInst>(&Inst))
+          opSize = 1;
+        for (size_t i = 0; i < opSize; ++i) {
+          if (ConstantInt *C = isObfCandidateOperand(Inst.getOperand(i))) {
+            if (Value *New_val = replaceZero(Inst, C)) {
+              Inst.setOperand(i, New_val);
+              modified = true;
+            }
+          }
+        }
+      }
+      registerInteger(Inst);
+    }
   }
   return modified;
 }
 
-bool ObfuscateZero::isValidCandidateInstruction(Instruction &Inst) const {
+bool ObfuscateConstant::isValidCandidateInstruction(Instruction &Inst) const {
   if (isa<GetElementPtrInst>(&Inst)) {
     return false;
   //} else if (isa<SwitchInst>(&Inst)) {
@@ -70,7 +100,20 @@ bool ObfuscateZero::isValidCandidateInstruction(Instruction &Inst) const {
   }
 }
 
-ConstantInt* ObfuscateZero::isValidCandidateOperand(Value *V) const {
+ConstantInt* ObfuscateConstant::isSplitCandidateOperand(Value *V) const {
+  if (ConstantInt *C = dyn_cast<ConstantInt>(V)) {
+    uint64_t v = C->getValue().getLimitedValue();
+    if (v && v != UINT64_MAX) {
+      return C;
+    } else {
+      return nullptr;
+    }
+  } else {
+    return nullptr;
+  }
+}
+
+ConstantInt* ObfuscateConstant::isObfCandidateOperand(Value *V) const {
   if (ConstantInt *C = dyn_cast<ConstantInt>(V)) {
     if (C->isZero()) {
       return C;
@@ -82,12 +125,30 @@ ConstantInt* ObfuscateZero::isValidCandidateOperand(Value *V) const {
   }
 }
 
-void ObfuscateZero::registerInteger(Value &V) {
+Value* ObfuscateConstant::splitConst(Instruction &Inst, ConstantInt *VReplace) {
+  IntegerType *ReplacedType = VReplace->getType(),
+       *i64 = IntegerType::get(Inst.getParent()->getContext(),
+           sizeof(uint64_t) * 8);
+
+  std::uniform_int_distribution<uint64_t> urand64(0, (UINT64_MAX >> 1) - 1);
+  IRBuilder<> Builder(&Inst);
+  Value *replaced = Builder.CreateIntCast(VReplace, i64, true);
+  uint64_t v = VReplace->getValue().getLimitedValue();
+  uint64_t randv = urand64(Generator)*2 + 1;
+  BinaryOperator *rv1 = BinaryOperator::Create(BinaryOperator::Add, ConstantInt::get(i64, randv), ConstantInt::get(i64, 0), "", &Inst);
+  BinaryOperator *rv2 = BinaryOperator::Create(BinaryOperator::Xor, ConstantInt::get(i64, modinv(randv)*v), ConstantInt::get(i64, 0), "", &Inst);
+  replaced = Builder.CreateMul(rv1, rv2);
+  replaced = Builder.CreateIntCast(replaced, ReplacedType, true);
+
+  return replaced;
+}
+
+void ObfuscateConstant::registerInteger(Value &V) {
   if (V.getType()->isIntegerTy() && !dyn_cast<llvm::ConstantInt>(&V))
     IntegerVect.push_back(&V);
 }
 
-Value *ObfuscateZero::createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder) {
+Value *ObfuscateConstant::createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder) {
   Type *IntermediaryType = x->getType();
   std::uniform_int_distribution<size_t> RandAny(1, 255);
   Constant *any = ConstantInt::get(IntermediaryType, RandAny(Generator)),
@@ -103,7 +164,7 @@ Value *ObfuscateZero::createExpression(Value* x, const uint32_t p, IRBuilder<>& 
   return temp;
 }
 
-Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
+Value* ObfuscateConstant::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
   IntegerType *ReplacedType = VReplace->getType(),
        *i32 = IntegerType::get(Inst.getParent()->getContext(),
            sizeof(uint32_t) * 8);
@@ -185,17 +246,3 @@ Value* ObfuscateZero::replaceZero(Instruction &Inst, ConstantInt *VReplace) {
 
   return replaced;
 }
-
-char ObfuscateZero::ID = 0;
-static RegisterPass<ObfuscateZero> X("obfZero", "Obfuscates zeroes",
-    false, false);
-
-// register pass for clang use
-static void registerObfuscateZeroPass(const PassManagerBuilder &,
-    legacy::PassManagerBase &PM) {
-  PM.add(new ObfuscateZero());
-}
-
-static RegisterStandardPasses
-RegisterMBAPass(PassManagerBuilder::EP_EarlyAsPossible,
-    registerObfuscateZeroPass);
