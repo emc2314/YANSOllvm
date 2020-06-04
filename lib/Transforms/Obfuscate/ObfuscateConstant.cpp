@@ -15,6 +15,7 @@ namespace {
   class ObfuscateConstant : public FunctionPass {
     private:
     std::vector<Value *> IntegerVect;
+    std::vector<Value *> OriginalInst;
     std::default_random_engine Generator;
 
     public:
@@ -26,7 +27,7 @@ namespace {
     bool isValidCandidateInstruction(Instruction &Inst) const;
     ConstantInt *isSplitCandidateOperand(Value *V) const;
     ConstantInt *isObfCandidateOperand(Value *V) const;
-    void registerInteger(Value &V);
+    void registerInteger(Value &V, bool original=false);
     Value *replaceZero(Instruction &Inst, ConstantInt *VReplace);
     Value *createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder);
     Value *splitConst(Instruction &Inst, ConstantInt *VReplace);
@@ -41,6 +42,7 @@ bool ObfuscateConstant::runOnFunction(Function &F) {
   bool modified = false;
 
   for (auto &BB:F.getBasicBlockList()){
+    OriginalInst.clear();
     for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
         end = BB.end();
         I != end; ++I) {
@@ -59,9 +61,14 @@ bool ObfuscateConstant::runOnFunction(Function &F) {
           }
         }
       }
+      registerInteger(Inst, true);
     }
 
     IntegerVect.clear();
+    for(Argument &argument: F.args()){
+      Value *arg = &argument;
+      registerInteger(*arg);
+    }
     for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
         end = BB.end();
         I != end; ++I) {
@@ -80,7 +87,8 @@ bool ObfuscateConstant::runOnFunction(Function &F) {
           }
         }
       }
-      registerInteger(Inst);
+      if(std::count(OriginalInst.begin(), OriginalInst.end(), &Inst))
+        registerInteger(Inst);
     }
   }
   return modified;
@@ -143,9 +151,13 @@ Value* ObfuscateConstant::splitConst(Instruction &Inst, ConstantInt *VReplace) {
   return replaced;
 }
 
-void ObfuscateConstant::registerInteger(Value &V) {
-  if (V.getType()->isIntegerTy() && !dyn_cast<llvm::ConstantInt>(&V))
-    IntegerVect.push_back(&V);
+void ObfuscateConstant::registerInteger(Value &V, bool original) {
+  if (V.getType()->isIntegerTy() && !dyn_cast<llvm::ConstantInt>(&V)){
+    if(original)
+      OriginalInst.push_back(&V);
+    else
+      IntegerVect.push_back(&V);
+  }
 }
 
 Value *ObfuscateConstant::createExpression(Value* x, const uint32_t p, IRBuilder<>& Builder) {
