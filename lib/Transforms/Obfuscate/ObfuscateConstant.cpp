@@ -54,6 +54,9 @@ bool ObfuscateConstant::runOnFunction(Function &F) {
           opSize = 1;
         for (size_t i = 0; i < opSize; ++i) {
           if (ConstantInt *C = isSplitCandidateOperand(Inst.getOperand(i))) {
+            if (CallInst *CI = dyn_cast<CallInst>(&Inst))
+              if(CI->paramHasAttr(i, Attribute::ImmArg))
+                break;
             if (Value *New_val = splitConst(Inst, C)) {
               Inst.setOperand(i, New_val);
               modified = true;
@@ -78,6 +81,9 @@ bool ObfuscateConstant::runOnFunction(Function &F) {
         //Do not obfuscate switch cases
         if (isa<SwitchInst>(&Inst))
           opSize = 1;
+        //Do not obfzero function args
+        if (isa<CallInst>(&Inst))
+          opSize = 0;
         for (size_t i = 0; i < opSize; ++i) {
           if (ConstantInt *C = isObfCandidateOperand(Inst.getOperand(i))) {
             if (Value *New_val = replaceZero(Inst, C)) {
@@ -101,8 +107,8 @@ bool ObfuscateConstant::isValidCandidateInstruction(Instruction &Inst) const {
   //  return false;
   } else if (isa<ReturnInst>(&Inst)) {
     return false;
-  } else if (isa<CallInst>(&Inst)) {
-    return false;
+  //} else if (isa<CallInst>(&Inst)) {
+  //  return false;
   } else {
     return true;
   }
