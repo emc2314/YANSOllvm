@@ -7,6 +7,7 @@
 #include "Util.h"
 
 #include <vector>
+#include <unordered_set>
 #include <random>
 
 using namespace llvm;
@@ -15,7 +16,7 @@ namespace {
   class ObfuscateConstant : public FunctionPass {
     private:
     std::vector<Value *> IntegerVect;
-    std::vector<Value *> OriginalInst;
+    std::unordered_set<Value *> OriginalInst;
     std::default_random_engine Generator;
 
     public:
@@ -41,8 +42,17 @@ Pass *createObfuscateConstantPass() { return new ObfuscateConstant(); }
 bool ObfuscateConstant::runOnFunction(Function &F) {
   bool modified = false;
 
+  OriginalInst.clear();
   for (auto &BB:F.getBasicBlockList()){
-    OriginalInst.clear();
+    for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
+        end = BB.end();
+        I != end; ++I) {
+      Instruction &Inst = *I;
+      registerInteger(Inst, true);
+    }
+  }
+
+  for (auto &BB:F.getBasicBlockList()){
     for (BasicBlock::iterator I = BB.getFirstInsertionPt(),
         end = BB.end();
         I != end; ++I) {
@@ -64,10 +74,20 @@ bool ObfuscateConstant::runOnFunction(Function &F) {
           }
         }
       }
-      registerInteger(Inst, true);
     }
 
     IntegerVect.clear();
+    BasicBlock *PBB = BB.getSinglePredecessor();
+    while(PBB){
+      for (BasicBlock::iterator I = PBB->getFirstInsertionPt(),
+          end = PBB->end();
+          I != end; ++I) {
+        Instruction &Inst = *I;
+        if(std::count(OriginalInst.begin(), OriginalInst.end(), &Inst))
+          registerInteger(Inst);
+      }
+      PBB = PBB->getSinglePredecessor();
+    }
     for(Argument &argument: F.args()){
       Value *arg = &argument;
       registerInteger(*arg);
@@ -160,7 +180,7 @@ Value* ObfuscateConstant::splitConst(Instruction &Inst, ConstantInt *VReplace) {
 void ObfuscateConstant::registerInteger(Value &V, bool original) {
   if (V.getType()->isIntegerTy() && !dyn_cast<llvm::ConstantInt>(&V)){
     if(original)
-      OriginalInst.push_back(&V);
+      OriginalInst.insert(&V);
     else
       IntegerVect.push_back(&V);
   }
