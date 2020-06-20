@@ -168,10 +168,28 @@ Value* ObfuscateConstant::splitConst(Instruction &Inst, ConstantInt *VReplace) {
   IRBuilder<> Builder(&Inst);
   Value *replaced = Builder.CreateIntCast(VReplace, i64, true);
   uint64_t v = VReplace->getValue().getLimitedValue();
-  uint64_t randv = urand64(Generator)*2 + 1;
-  BinaryOperator *rv1 = BinaryOperator::Create(BinaryOperator::Add, ConstantInt::get(i64, randv), ConstantInt::get(i64, 0), "", &Inst);
-  BinaryOperator *rv2 = BinaryOperator::Create(BinaryOperator::Xor, ConstantInt::get(i64, modinv(randv)*v), ConstantInt::get(i64, 0), "", &Inst);
-  replaced = Builder.CreateMul(rv1, rv2);
+  switch(urand64(Generator)%3){
+    case 0: {
+      uint64_t randv = urand64(Generator)*2 + 1;
+      BinaryOperator *rv1 = BinaryOperator::Create((urand64(Generator)%2 ? BinaryOperator::Add : BinaryOperator::Xor), ConstantInt::get(i64, randv), ConstantInt::get(i64, 0), "", &Inst);
+      BinaryOperator *rv2 = BinaryOperator::Create((urand64(Generator)%2 ? BinaryOperator::Add : BinaryOperator::Xor), ConstantInt::get(i64, modinv(randv)*v), ConstantInt::get(i64, 0), "", &Inst);
+      replaced = Builder.CreateMul(rv1, rv2);
+      break;
+    }
+    case 1: {
+      uint64_t randv = urand64(Generator);
+      BinaryOperator *rv1 = BinaryOperator::Create((urand64(Generator)%2 ? BinaryOperator::Add : BinaryOperator::Xor), ConstantInt::get(i64, randv), ConstantInt::get(i64, 0), "", &Inst);
+      BinaryOperator *rv2 = BinaryOperator::Create((urand64(Generator)%2 ? BinaryOperator::Add : BinaryOperator::Xor), ConstantInt::get(i64, randv^v), ConstantInt::get(i64, 0), "", &Inst);
+      replaced = Builder.CreateXor(rv1, rv2);
+      break;
+    }
+    default: {
+      uint64_t randv = urand64(Generator);
+      BinaryOperator *rv1 = BinaryOperator::Create((urand64(Generator)%2 ? BinaryOperator::Add : BinaryOperator::Xor), ConstantInt::get(i64, randv), ConstantInt::get(i64, 0), "", &Inst);
+      BinaryOperator *rv2 = BinaryOperator::Create((urand64(Generator)%2 ? BinaryOperator::Add : BinaryOperator::Xor), ConstantInt::get(i64, v-randv), ConstantInt::get(i64, 0), "", &Inst);
+      replaced = Builder.CreateAdd(rv1, rv2);
+    }
+  }
   replaced = Builder.CreateIntCast(replaced, ReplacedType, true);
 
   return replaced;
