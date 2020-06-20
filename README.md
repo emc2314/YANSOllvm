@@ -29,27 +29,77 @@ Notice that **the order of passes matters**. You can use llvm's own passes or ap
 
 After that, compile the output bytecode to assembly using llc:
 
-```{PATH_TO_BUILD_DIR}/bin/llc -O3 main.obf.bc```
+```{PATH_TO_BUILD_DIR}/bin/llc -O3 --disable-block-placement main.obf.bc```
 
 Finally, assemble and link the output assembly:
 
 ```clang main.obf.s -o main```
 
 # Passes
+Let's use the following source code as an example to obfuscate:
+```c
+#include <stdio.h>
+ 
+short zero[2] = {0,1};
+static short *d(void){
+  return zero;
+}
+static short c(int x){
+  if(x == 0)
+    return (*(d()+1) ^ 12);
+  return c(x-1)+1;
+}
+ 
+static int b(int x){
+  int sum = 0;
+  for(int i = 0; i < x; i++){
+    sum += c(i);
+  }
+  return sum;
+}
+ 
+static void a(unsigned long long x){
+  for(int i = 0; i < x; i++){
+    int temp = b(i) + 1;
+    printf("%d ", temp);
+  }
+}
+ 
+int main(int argc, char *argv[]){
+  int i;
+  if(argc > 1){
+    sscanf(argv[1], "%d", &i);
+    a(i);
+  }
+  return 0;
+}
+```
 ## VM
 Substitute some basic binary operators (e.g. xor, add) with functions.
+![vm](https://user-images.githubusercontent.com/14357110/85194064-a7826780-b2fe-11ea-9430-6e0ccd5e584a.png)
 ## Merge
 This pass merges all internal linkage functions (e.g. static function) to a single function.
+![merge](https://user-images.githubusercontent.com/14357110/85194050-a3eee080-b2fe-11ea-94c4-fec41fbf01bf.png)
 ## Flattening
 Based on OLLVM's CFG flattening, but it seperates the internal state transfer and the switch variable using a simple hash function.
+![flattening](https://user-images.githubusercontent.com/14357110/85194036-9fc2c300-b2fe-11ea-9870-242f2d369d42.png)
 ## Connect
-Similar to OLLVM's bogus control flow, but totally different. It splits basic blocks and use switch to add false branches among them.
+Similar to OLLVM's bogus control flow, but totally different. It splits basic blocks and uses switch to add false branches among them.
+![connect](https://user-images.githubusercontent.com/14357110/85194034-9d606900-b2fe-11ea-99bb-a829531bd6d6.png)
+IDA cannot show CFG due to some garbage code. After patching them:
+![connect_patched](https://user-images.githubusercontent.com/14357110/85194035-9e919600-b2fe-11ea-8c8f-1095657c3bf7.png)
 ## ObfCon
-Obfuscate constants using MBA. The Flattening and Connect passes need this otherwise the almighty compiler optimizer will optimize away all false branches.
+Obfuscate constants using MBA. The Flattening and Connect passes will need this otherwise the almighty compiler optimizer will optimize away all false branches.
+![obfCon](https://user-images.githubusercontent.com/14357110/85194058-a5b8a400-b2fe-11ea-8d8f-02ec65beeed9.png)
 ## BB2func
 Split & extract some basic blocks and make them new functions.
+![bb2func](https://user-images.githubusercontent.com/14357110/85194031-9b96a580-b2fe-11ea-942e-3dc65dc1c0b8.png)
 ## ObfCall
 Obfuscate all internal linkage functions calls by using randomly generated calling conventions.
+![obfCall](https://user-images.githubusercontent.com/14357110/85194054-a5200d80-b2fe-11ea-9ae0-634ea945ac42.png)
+## Full protect
+The CFG after enabling all above passes:
+![full_protect](https://user-images.githubusercontent.com/14357110/85194043-a2bdb380-b2fe-11ea-9986-d8b0b6a3d363.png)
 
 # Warrant
 No warrant. Only bugs. Use at your own risk.
