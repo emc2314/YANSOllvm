@@ -16,14 +16,14 @@
 #include "llvm/Pass.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 #include "Util.h"
 
 #include <algorithm>
-#include <random>
 #include <numeric>
+#include <random>
 
 using namespace llvm;
 
@@ -37,7 +37,7 @@ struct Flattening : public FunctionPass {
     initializeLowerSwitchPass(*PassRegistry::getPassRegistry());
   }
 
-  void getAnalysisUsage(AnalysisUsage &AU) const override{
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequiredID(LowerSwitchID);
   }
 
@@ -111,16 +111,15 @@ bool Flattening::flatten(Function *f) {
   }
 
   std::uniform_int_distribution<uint32_t> rand(0, UINT32_MAX);
-  for (size_t i = 0; i < origBB.size(); i++){
+  for (size_t i = 0; i < origBB.size(); i++) {
     uint32_t bbi = rand(g);
     bbIndex.push_back(bbi);
     uint32_t bbh = fnvHash(bbi, fnvBasis);
-    for (size_t j = 0; j < 2+rand(g)%10; j++){
+    for (size_t j = 0; j < 2 + rand(g) % 10; j++) {
       assert(std::count(bbHash.begin(), bbHash.end(), bbh) == 0);
       bbh = fnvHash(bbi, bbh);
     }
     bbHash.push_back(bbh);
-
   }
 
   std::vector<size_t> bbSeq(origBB.size());
@@ -128,9 +127,9 @@ bool Flattening::flatten(Function *f) {
   std::shuffle(bbSeq.begin(), bbSeq.end(), g);
 
   // Remove jump
-  std::ptrdiff_t entryBlock = std::distance(origBB.begin(),
-                          std::find(origBB.begin(),origBB.end(),
-                          insert->getTerminator()->getSuccessor(0)));
+  std::ptrdiff_t entryBlock = std::distance(
+      origBB.begin(), std::find(origBB.begin(), origBB.end(),
+                                insert->getTerminator()->getSuccessor(0)));
   insert->getTerminator()->eraseFromParent();
 
   // Create switch variable and set as it
@@ -146,25 +145,30 @@ bool Flattening::flatten(Function *f) {
   insert->moveBefore(loopEntry);
   BranchInst::Create(loopEntry, insert);
 
-  //Calculate hash
+  // Calculate hash
   load = new LoadInst(switchVar, "switchVar", loopEntry);
-  BinaryOperator *dataVal = BinaryOperator::Create(BinaryOperator::And, load,
-                          ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
-  BinaryOperator *hashVal = BinaryOperator::Create(BinaryOperator::And, new LoadInst(hashVar, "hashVar", loopEntry),
-                          ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
-  for(int i = 0; i < 4; i++){
-    BinaryOperator *t = BinaryOperator::Create(BinaryOperator::And, dataVal, byteConst, "", loopEntry);
-    hashVal = BinaryOperator::Create(BinaryOperator::Xor, hashVal, t, "", loopEntry);
-    hashVal = BinaryOperator::Create(BinaryOperator::Mul, hashVal, primeConst, "", loopEntry);
+  BinaryOperator *dataVal =
+      BinaryOperator::Create(BinaryOperator::And, load,
+                             ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
+  BinaryOperator *hashVal = BinaryOperator::Create(
+      BinaryOperator::And, new LoadInst(hashVar, "hashVar", loopEntry),
+      ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
+  for (int i = 0; i < 4; i++) {
+    BinaryOperator *t = BinaryOperator::Create(BinaryOperator::And, dataVal,
+                                               byteConst, "", loopEntry);
+    hashVal =
+        BinaryOperator::Create(BinaryOperator::Xor, hashVal, t, "", loopEntry);
+    hashVal = BinaryOperator::Create(BinaryOperator::Mul, hashVal, primeConst,
+                                     "", loopEntry);
     dataVal = BinaryOperator::Create(BinaryOperator::AShr, dataVal,
-              ConstantInt::get(i32, 8), "", loopEntry);
+                                     ConstantInt::get(i32, 8), "", loopEntry);
   }
   new StoreInst(hashVal, hashVar, loopEntry);
 
   switchI = SwitchInst::Create(hashVal, loopEntry, 0, loopEntry);
 
   // Put all BB in the switch
-  for (size_t b: bbSeq) {
+  for (size_t b : bbSeq) {
     BasicBlock *i = origBB[b];
     ConstantInt *numCase = NULL;
 
@@ -172,14 +176,13 @@ bool Flattening::flatten(Function *f) {
     i->moveBefore(loopEntry);
 
     // Add case to switch
-    numCase = cast<ConstantInt>(ConstantInt::get(
-        switchI->getCondition()->getType(),
-        bbHash[b]));
+    numCase = cast<ConstantInt>(
+        ConstantInt::get(switchI->getCondition()->getType(), bbHash[b]));
     switchI->addCase(numCase, i);
   }
 
   // Recalculate switchVar
-  for (size_t b: bbSeq) {
+  for (size_t b : bbSeq) {
     BasicBlock *i = origBB[b];
     size_t succIndexTrue, succIndexFalse;
     Value *cond = nullptr;
@@ -192,40 +195,54 @@ bool Flattening::flatten(Function *f) {
     // If it's a non-conditional jump
     if (i->getTerminator()->getNumSuccessors() == 1) {
       cond = ConstantInt::get(Type::getInt1Ty(f->getContext()), 0);
-      succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
-      succIndexTrue = std::distance(bbSeq.begin(), std::find(bbSeq.begin(), bbSeq.end(), b));
+      succIndexFalse = std::distance(
+          origBB.begin(), std::find(origBB.begin(), origBB.end(),
+                                    i->getTerminator()->getSuccessor(0)));
+      succIndexTrue = std::distance(bbSeq.begin(),
+                                    std::find(bbSeq.begin(), bbSeq.end(), b));
 
     } else {
       // If it's a conditional jump
-      assert (i->getTerminator()->getNumSuccessors() == 2);
+      assert(i->getTerminator()->getNumSuccessors() == 2);
       cond = cast<BranchInst>(i->getTerminator())->getCondition();
-      succIndexFalse = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(1)));
-      succIndexTrue = std::distance(origBB.begin(), std::find(origBB.begin(), origBB.end(), i->getTerminator()->getSuccessor(0)));
+      succIndexFalse = std::distance(
+          origBB.begin(), std::find(origBB.begin(), origBB.end(),
+                                    i->getTerminator()->getSuccessor(1)));
+      succIndexTrue = std::distance(
+          origBB.begin(), std::find(origBB.begin(), origBB.end(),
+                                    i->getTerminator()->getSuccessor(0)));
     }
 
     std::vector<size_t> bbTemp = bbSeq;
     std::shuffle(bbTemp.begin(), bbTemp.end(), g);
     uint32_t randomXor = rand(g);
-    BinaryOperator *tempVal= BinaryOperator::Create(BinaryOperator::Xor,
-                 ConstantInt::get(i32, randomXor),
-                 load, "", i->getTerminator());
-    int garbageCap = bbTemp.size()/2;
+    BinaryOperator *tempVal = BinaryOperator::Create(
+        BinaryOperator::Xor, ConstantInt::get(i32, randomXor), load, "",
+        i->getTerminator());
+    int garbageCap = bbTemp.size() / 2;
     garbageCap = garbageCap > 1 ? garbageCap : 1;
-    for(size_t d: bbTemp){
-      if(d == succIndexFalse){
-        tempVal= BinaryOperator::Create(BinaryOperator::Xor,
-                 ConstantInt::get(i32, bbIndex[b] ^ bbIndex[succIndexFalse] ^ randomXor),
-                 tempVal, "", i->getTerminator());
-      }else if(d == succIndexTrue){
-        BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And,
-                 new SExtInst(cond, i32, "", i->getTerminator()),
-                 ConstantInt::get(i32, bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]), "", i->getTerminator());
-        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
-      }else if(rand(g)%garbageCap == 0){
-        BinaryOperator *maskVal = BinaryOperator::Create(BinaryOperator::And,
-                 ConstantInt::get(i32, 0),
-                 ConstantInt::get(i32, rand(g)), "", i->getTerminator());
-        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal, "", i->getTerminator());
+    for (size_t d : bbTemp) {
+      if (d == succIndexFalse) {
+        tempVal = BinaryOperator::Create(
+            BinaryOperator::Xor,
+            ConstantInt::get(i32,
+                             bbIndex[b] ^ bbIndex[succIndexFalse] ^ randomXor),
+            tempVal, "", i->getTerminator());
+      } else if (d == succIndexTrue) {
+        BinaryOperator *maskVal = BinaryOperator::Create(
+            BinaryOperator::And,
+            new SExtInst(cond, i32, "", i->getTerminator()),
+            ConstantInt::get(i32,
+                             bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]),
+            "", i->getTerminator());
+        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal,
+                                         "", i->getTerminator());
+      } else if (rand(g) % garbageCap == 0) {
+        BinaryOperator *maskVal = BinaryOperator::Create(
+            BinaryOperator::And, ConstantInt::get(i32, 0),
+            ConstantInt::get(i32, rand(g)), "", i->getTerminator());
+        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal,
+                                         "", i->getTerminator());
       }
     }
 

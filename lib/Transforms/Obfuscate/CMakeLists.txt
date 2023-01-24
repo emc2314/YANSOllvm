@@ -9,6 +9,7 @@ add_llvm_library( LLVMObf MODULE BUILDTREE_ONLY
   Connect.cpp
   Merge.cpp
   BB2Func.cpp
+  Func2Mod.cpp
   ObfCall.cpp
   VM.cpp
 

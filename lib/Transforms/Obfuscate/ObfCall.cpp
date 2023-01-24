@@ -17,8 +17,6 @@ namespace {
     ObfCall() : ModulePass(ID) {}
 
     bool runOnModule(Module &M) override;
-
-    std::vector<Function *> mergeList;
   };
 }
 
