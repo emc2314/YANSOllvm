@@ -1,24 +1,31 @@
-/*
-!lib/
-lib/*
-!lib/Transforms/
-lib/Transforms/*
-!lib/Transforms/CMakeLists.txt
-!lib/Transforms/Obfuscate
-!lib/Target/
-lib/Target/*
-!lib/Target/X86/
-lib/Target/X86/*
-!lib/Target/X86/CMakeLists.txt
-!lib/Target/X86/genObfCC.py
-!lib/Target/X86/X86CallingConv.td
-!lib/Target/X86/X86RegisterInfo.cpp
-!lib/Target/X86/X86Subtarget.h
-!include/
-include/*
-!include/llvm/
-include/llvm/*
-!include/llvm/IR/
-include/llvm/IR/*
-!include/llvm/IR/CallingConv.h
-!.gitignore
+# Build outputs
+build*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+
+# Test outputs
+tests/Output/
+tests/.lit_test_times.txt
+*.bc
+*.ll.tmp
+*.exe
+*.out
+*.log
+
+# LLVM source/build trees are intentionally external to this branch.
+llvm-project*/
+llvm-*.src/
+llvm-*.src.tar.*
+work/
+
+# Editor/system noise
+.DS_Store
+.vscode/
+.idea/

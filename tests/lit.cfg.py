@@ -1,0 +1,21 @@
+import os
+
+import lit.formats
+
+config.name = 'yansollvm'
+config.test_format = lit.formats.ShTest(True)
+config.suffixes = ['.c', '.ll']
+config.test_source_root = os.path.dirname(__file__)
+config.test_exec_root = config.test_source_root
+
+llvm_build = os.environ.get('LLVM_BUILD')
+if not llvm_build:
+    lit_config.fatal('LLVM_BUILD must point to an LLVM 21 build directory')
+plugin = os.environ.get(
+    'YANSOLLVM_PLUGIN',
+    os.path.abspath(os.path.join(config.test_source_root, '..', 'build', 'yansollvm.so')),
+)
+
+config.substitutions.append(('%clang', os.path.join(llvm_build, 'bin', 'clang')))
+config.substitutions.append(('%opt', os.path.join(llvm_build, 'bin', 'opt')))
+config.substitutions.append(('%plugin', plugin))

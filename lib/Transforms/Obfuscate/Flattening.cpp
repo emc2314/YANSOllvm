@@ -1,262 +1,398 @@
-//===- Flattening.cpp - Flattening Obfuscation pass------------------------===//
-//
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
-//
-//===----------------------------------------------------------------------===//
-//
-// This file implements the flattening pass
-//
-//===----------------------------------------------------------------------===//
-
-#include "llvm/IR/Function.h"
-#include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
-#include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Utils.h"
-#include "llvm/Transforms/Utils/Local.h"
-
-#include "Util.h"
+#include "Flattening.h"
+#include "CryptoUtils.h"
+#include "SplitBasicBlock.h"
+#include "Utils.h"
+#include "YANSOllvmSeed.h"
 
 #include <algorithm>
 #include <numeric>
 #include <random>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace llvm;
 
-// Stats
+#define DEBUG_TYPE "flattening"
+STATISTIC(Flattened, "Functions flattened");
 
-namespace {
-struct Flattening : public FunctionPass {
-  static char ID;
-
-  Flattening() : FunctionPass(ID) {
-    initializeLowerSwitchPass(*PassRegistry::getPassRegistry());
+PreservedAnalyses FlatteningPass::run(Function &F,
+                                      FunctionAnalysisManager &AM) {
+  Function *Fn = &F;
+  if (toObfuscate(flag, Fn, "fla")) {
+    INIT_CONTEXT(F);
+    if (flatten(*Fn)) {
+      ++Flattened;
+      return PreservedAnalyses::none();
+    }
   }
-
-  void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.addRequiredID(LowerSwitchID);
-  }
-
-  bool runOnFunction(Function &F) override;
-  bool flatten(Function *f);
-};
-} // namespace
-
-char Flattening::ID = 0;
-static RegisterPass<Flattening> X("flattening", "Call graph flattening");
-Pass *createFlatteningPass() { return new Flattening(); }
-
-bool Flattening::runOnFunction(Function &F) {
-  Function *tmp = &F;
-  return flatten(tmp);
+  return PreservedAnalyses::all();
 }
 
-bool Flattening::flatten(Function *f) {
-  std::vector<BasicBlock *> origBB;
-  std::vector<uint32_t> bbIndex, bbHash;
-  BasicBlock *loopEntry;
-  LoadInst *load;
-  SwitchInst *switchI;
-  AllocaInst *switchVar, *hashVar;
-  std::random_device rd;
-  std::mt19937 g(rd());
-  IntegerType *i32 = Type::getInt32Ty(f->getContext());
-  ConstantInt *byteConst = ConstantInt::get(i32, 0xFF);
-  ConstantInt *primeConst = ConstantInt::get(i32, fnvPrime);
-  ConstantInt *basisConst = ConstantInt::get(i32, fnvBasis);
-
-  // Save all original BB
-  for (Function::iterator i = f->begin(); i != f->end(); ++i) {
-    BasicBlock *tmp = &*i;
-
-    if (isa<InvokeInst>(tmp->getTerminator())) {
-      return false;
-    }
-    origBB.push_back(tmp);
-  }
-
-  // Nothing to flatten
-  if (origBB.size() <= 4) {
+bool FlatteningPass::flatten(Function &F) {
+  if (F.isVarArg()) {
     return false;
   }
 
-  // Remove first BB
-  origBB.erase(origBB.begin());
-
-  // Get a pointer on the first BB
-  Function::iterator tmp = f->begin();
-  BasicBlock *insert = &*tmp;
-
-  // If main begin with an if
-  BranchInst *br = NULL;
-  if (isa<BranchInst>(insert->getTerminator())) {
-    br = cast<BranchInst>(insert->getTerminator());
+  if (F.size() <= 2) {
+    return false;
   }
 
-  if ((br != NULL && br->isConditional()) ||
-      insert->getTerminator()->getNumSuccessors() > 1) {
-    BasicBlock::iterator i = insert->end();
-    --i;
-
-    if (insert->size() > 1) {
-      --i;
+  vector<BasicBlock *> TrivialBlocks;
+  for (BasicBlock &BB : F) {
+    if (BB.size() == 1 && isa<BranchInst>(BB.getTerminator()) &&
+        BB.getTerminator()->getNumSuccessors() == 1 && !BB.hasAddressTaken())
+      TrivialBlocks.push_back(&BB);
+  }
+  for (BasicBlock *BB : TrivialBlocks) {
+    if (BB->hasNPredecessors(1))
+      BB->replaceSuccessorsPhiUsesWith(BB->getSinglePredecessor());
+    vector<BasicBlock *> TrivialPreds;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      TrivialPreds.push_back(Pred);
     }
-
-    BasicBlock *tmpBB = insert->splitBasicBlock(i, "first");
-    origBB.insert(origBB.begin(), tmpBB);
-  }
-
-  std::uniform_int_distribution<uint32_t> rand(0, UINT32_MAX);
-  for (size_t i = 0; i < origBB.size(); i++) {
-    uint32_t bbi = rand(g);
-    bbIndex.push_back(bbi);
-    uint32_t bbh = fnvHash(bbi, fnvBasis);
-    for (size_t j = 0; j < 2 + rand(g) % 10; j++) {
-      assert(std::count(bbHash.begin(), bbHash.end(), bbh) == 0);
-      bbh = fnvHash(bbi, bbh);
-    }
-    bbHash.push_back(bbh);
-  }
-
-  std::vector<size_t> bbSeq(origBB.size());
-  std::iota(bbSeq.begin(), bbSeq.end(), 0);
-  std::shuffle(bbSeq.begin(), bbSeq.end(), g);
-
-  // Remove jump
-  std::ptrdiff_t entryBlock = std::distance(
-      origBB.begin(), std::find(origBB.begin(), origBB.end(),
-                                insert->getTerminator()->getSuccessor(0)));
-  insert->getTerminator()->eraseFromParent();
-
-  // Create switch variable and set as it
-  hashVar = new AllocaInst(i32, 0, "hashVar", insert);
-  new StoreInst(basisConst, hashVar, insert);
-  switchVar = new AllocaInst(i32, 0, "switchVar", insert);
-  new StoreInst(ConstantInt::get(i32, bbIndex[entryBlock]), switchVar, insert);
-
-  // Create main loop
-  loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
-
-  // Move first BB on top
-  insert->moveBefore(loopEntry);
-  BranchInst::Create(loopEntry, insert);
-
-  // Calculate hash
-  load = new LoadInst(switchVar, "switchVar", loopEntry);
-  BinaryOperator *dataVal =
-      BinaryOperator::Create(BinaryOperator::And, load,
-                             ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
-  BinaryOperator *hashVal = BinaryOperator::Create(
-      BinaryOperator::And, new LoadInst(hashVar, "hashVar", loopEntry),
-      ConstantInt::get(i32, 0xFFFFFFFF), "", loopEntry);
-  for (int i = 0; i < 4; i++) {
-    BinaryOperator *t = BinaryOperator::Create(BinaryOperator::And, dataVal,
-                                               byteConst, "", loopEntry);
-    hashVal =
-        BinaryOperator::Create(BinaryOperator::Xor, hashVal, t, "", loopEntry);
-    hashVal = BinaryOperator::Create(BinaryOperator::Mul, hashVal, primeConst,
-                                     "", loopEntry);
-    dataVal = BinaryOperator::Create(BinaryOperator::AShr, dataVal,
-                                     ConstantInt::get(i32, 8), "", loopEntry);
-  }
-  new StoreInst(hashVal, hashVar, loopEntry);
-
-  switchI = SwitchInst::Create(hashVal, loopEntry, 0, loopEntry);
-
-  // Put all BB in the switch
-  for (size_t b : bbSeq) {
-    BasicBlock *i = origBB[b];
-    ConstantInt *numCase = NULL;
-
-    // Move the BB inside the switch (only visual, no code logic)
-    i->moveBefore(loopEntry);
-
-    // Add case to switch
-    numCase = cast<ConstantInt>(
-        ConstantInt::get(switchI->getCondition()->getType(), bbHash[b]));
-    switchI->addCase(numCase, i);
-  }
-
-  // Recalculate switchVar
-  for (size_t b : bbSeq) {
-    BasicBlock *i = origBB[b];
-    size_t succIndexTrue, succIndexFalse;
-    Value *cond = nullptr;
-
-    // Ret BB
-    if (i->getTerminator()->getNumSuccessors() == 0) {
-      continue;
-    }
-
-    // If it's a non-conditional jump
-    if (i->getTerminator()->getNumSuccessors() == 1) {
-      cond = ConstantInt::get(Type::getInt1Ty(f->getContext()), 0);
-      succIndexFalse = std::distance(
-          origBB.begin(), std::find(origBB.begin(), origBB.end(),
-                                    i->getTerminator()->getSuccessor(0)));
-      succIndexTrue = std::distance(bbSeq.begin(),
-                                    std::find(bbSeq.begin(), bbSeq.end(), b));
-
-    } else {
-      // If it's a conditional jump
-      assert(i->getTerminator()->getNumSuccessors() == 2);
-      cond = cast<BranchInst>(i->getTerminator())->getCondition();
-      succIndexFalse = std::distance(
-          origBB.begin(), std::find(origBB.begin(), origBB.end(),
-                                    i->getTerminator()->getSuccessor(1)));
-      succIndexTrue = std::distance(
-          origBB.begin(), std::find(origBB.begin(), origBB.end(),
-                                    i->getTerminator()->getSuccessor(0)));
-    }
-
-    std::vector<size_t> bbTemp = bbSeq;
-    std::shuffle(bbTemp.begin(), bbTemp.end(), g);
-    uint32_t randomXor = rand(g);
-    BinaryOperator *tempVal = BinaryOperator::Create(
-        BinaryOperator::Xor, ConstantInt::get(i32, randomXor), load, "",
-        i->getTerminator());
-    int garbageCap = bbTemp.size() / 2;
-    garbageCap = garbageCap > 1 ? garbageCap : 1;
-    for (size_t d : bbTemp) {
-      if (d == succIndexFalse) {
-        tempVal = BinaryOperator::Create(
-            BinaryOperator::Xor,
-            ConstantInt::get(i32,
-                             bbIndex[b] ^ bbIndex[succIndexFalse] ^ randomXor),
-            tempVal, "", i->getTerminator());
-      } else if (d == succIndexTrue) {
-        BinaryOperator *maskVal = BinaryOperator::Create(
-            BinaryOperator::And,
-            new SExtInst(cond, i32, "", i->getTerminator()),
-            ConstantInt::get(i32,
-                             bbIndex[succIndexTrue] ^ bbIndex[succIndexFalse]),
-            "", i->getTerminator());
-        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal,
-                                         "", i->getTerminator());
-      } else if (rand(g) % garbageCap == 0) {
-        BinaryOperator *maskVal = BinaryOperator::Create(
-            BinaryOperator::And, ConstantInt::get(i32, 0),
-            ConstantInt::get(i32, rand(g)), "", i->getTerminator());
-        tempVal = BinaryOperator::Create(BinaryOperator::Xor, maskVal, tempVal,
-                                         "", i->getTerminator());
+    for (BasicBlock *Pred : TrivialPreds) {
+      auto OI = Pred->getTerminator()->op_begin();
+      auto OE = Pred->getTerminator()->op_end();
+      for (; OI != OE; OI++) {
+        if (*OI == BB) {
+          *OI = BB->getTerminator()->getSuccessor(0);
+          break;
+        }
       }
     }
-
-    // Erase terminator
-    i->getTerminator()->eraseFromParent();
-
-    // Update switchVar and jump to the end of loop
-    new StoreInst(tempVal, load->getPointerOperand(), i);
-    new StoreInst(basisConst, hashVar, i);
-
-    BranchInst::Create(loopEntry, i);
+    BB->eraseFromParent();
   }
 
-  fixStack(f);
+  // Keep all original blocks except the entry block.
+  vector<BasicBlock *> FlattenBlocks;
+  for (BasicBlock &BB : F) {
+    FlattenBlocks.push_back(&BB);
+  }
+  FlattenBlocks.erase(FlattenBlocks.begin());
+  BasicBlock &EntryBB = F.getEntryBlock();
+  // Split a multi-successor entry so the dispatcher can own the entry edge.
+  Instruction *EntryTerminator = EntryBB.getTerminator();
+  if (EntryTerminator->getNumSuccessors() > 1) {
+    BasicBlock *EntryRegion =
+        EntryBB.splitBasicBlock(EntryTerminator, "entry.region");
+    FlattenBlocks.insert(FlattenBlocks.begin(), EntryRegion);
+  }
 
+  set<BasicBlock *> LocalOnlyBlocks;
+  DominatorTree DT(F);
+  for (BasicBlock *BB : FlattenBlocks) {
+    Instruction *Term = BB->getTerminator();
+    if (isa<IndirectBrInst>(Term))
+      return false;
+    if (BB->hasAddressTaken())
+      LocalOnlyBlocks.insert(BB);
+    for (Instruction &I : *BB) {
+      if (PHINode *P = dyn_cast<PHINode>(&I)) {
+        for (unsigned i = 0, e = P->getNumIncomingValues(); i < e; ++i) {
+          if (InvokeInst *II = dyn_cast<InvokeInst>(P->getIncomingValue(i))) {
+            if (II->getParent() == P->getIncomingBlock(i)) {
+              LocalOnlyBlocks.insert(BB);
+            }
+          }
+        }
+      } else if (I.isUsedOutsideOfBlock(BB) && !I.getType()->isSized()) {
+        for (Use &U : I.uses()) {
+          if (Instruction *II = dyn_cast<Instruction>(U.getUser())) {
+            BasicBlock *UseBB = nullptr;
+            if (PHINode *PN = dyn_cast<PHINode>(II))
+              UseBB = PN->getIncomingBlock(U);
+            else
+              UseBB = II->getParent();
+            if (UseBB != BB) {
+              LocalOnlyBlocks.insert(UseBB);
+              for (BasicBlock *midBB : FlattenBlocks) {
+                if (midBB != BB && midBB != UseBB &&
+                    DT.dominates(midBB, UseBB) && DT.dominates(BB, midBB)) {
+                  LocalOnlyBlocks.insert(midBB);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    Instruction *term = BB->getTerminator();
+    if (auto *II = dyn_cast<InvokeInst>(term)) {
+      LocalOnlyBlocks.insert(II->getUnwindDest());
+    } else if (auto *CRI = dyn_cast<CleanupReturnInst>(term)) {
+      LocalOnlyBlocks.insert(CRI->getUnwindDest());
+    } else if (auto *CSI = dyn_cast<CatchSwitchInst>(term)) {
+      LocalOnlyBlocks.insert(CSI->getUnwindDest());
+    }
+  }
+
+  BasicBlock *EntryTarget = EntryBB.getTerminator()->getNumSuccessors() > 0
+                                ? EntryBB.getTerminator()->getSuccessor(0)
+                                : nullptr;
+
+  // Create dispatcher block.
+  BasicBlock *DispatcherBB =
+      BasicBlock::Create(*CONTEXT, "DispatcherBB", &F, &EntryBB);
+  // Replace the entry terminator with a branch to the dispatcher.
+  EntryBB.moveBefore(DispatcherBB);
+  EntryBB.getTerminator()->eraseFromParent();
+  BranchInst *EntryToDispatcher = BranchInst::Create(DispatcherBB, &EntryBB);
+
+  // Dual-state dispatcher: keep CFG safety handling, but dispatch on
+  // mix(index, hash-state) instead of the raw switch state. Successor state is
+  // encoded branchlessly with xor/mask where both successors are flattenable.
+  auto Before = [](Instruction *I) { return I->getIterator(); };
+
+  YansoRNG RNG(yanso_function_seed(F, "fla"));
+  vector<uint64_t> StateIds(FlattenBlocks.size());
+  vector<uint64_t> DispatchHashes(FlattenBlocks.size());
+  unordered_set<uint64_t> UsedIndex;
+  unordered_set<uint64_t> UsedHash;
+  unordered_map<BasicBlock *, size_t> BlockToIndex;
+  for (size_t I = 0; I < FlattenBlocks.size(); ++I) {
+    BlockToIndex[FlattenBlocks[I]] = I;
+
+    bool Accepted = false;
+    for (unsigned Attempt = 0; Attempt < 1024 && !Accepted; ++Attempt) {
+      uint64_t Index = 0;
+      do {
+        Index = RNG.next64();
+      } while (!Index || UsedIndex.count(Index));
+
+      SmallVector<uint64_t, 4> RoundHashes;
+      uint64_t CaseHash = yanso_mix64(Index, YansoMixBasis);
+      RoundHashes.push_back(CaseHash);
+      size_t ExtraRounds = RNG.range(4);
+      for (size_t R = 0; R < ExtraRounds; ++R) {
+        CaseHash = yanso_mix64(Index, CaseHash);
+        RoundHashes.push_back(CaseHash);
+      }
+
+      bool Collides = false;
+      for (uint64_t H : RoundHashes) {
+        if (UsedHash.count(H)) {
+          Collides = true;
+          break;
+        }
+      }
+      if (Collides)
+        continue;
+
+      UsedIndex.insert(Index);
+      for (uint64_t H : RoundHashes)
+        UsedHash.insert(H);
+      StateIds[I] = Index;
+      DispatchHashes[I] = RoundHashes.back();
+      Accepted = true;
+    }
+    if (!Accepted)
+      report_fatal_error("failed to allocate unique flattening dispatch hash");
+  }
+
+  size_t EntryIndex = 0;
+  if (EntryTarget) {
+    auto It = BlockToIndex.find(EntryTarget);
+    if (It != BlockToIndex.end())
+      EntryIndex = It->second;
+  }
+
+  AllocaInst *HashStatePtr =
+      new AllocaInst(TYPE_I64, 0, "hashState.ptr", Before(EntryToDispatcher));
+  new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
+                Before(EntryToDispatcher));
+  AllocaInst *StatePtr =
+      new AllocaInst(TYPE_I64, 0, "state.ptr", Before(EntryToDispatcher));
+  new StoreInst(CONST_I64(StateIds[EntryIndex]), StatePtr, false, Align(8),
+                Before(EntryToDispatcher));
+
+  // Load state, hash it, and switch on the hash value.
+  LoadInst *StateLoad =
+      new LoadInst(TYPE_I64, StatePtr, "state", false, Align(8), DispatcherBB);
+  LoadInst *HashStateLoad = new LoadInst(TYPE_I64, HashStatePtr, "hashState",
+                                         false, Align(8), DispatcherBB);
+  Value *DispatchHash = yanso_create_mix64_ir(StateLoad, HashStateLoad,
+                                              DispatcherBB, *F.getParent());
+  new StoreInst(DispatchHash, HashStatePtr, false, Align(8), DispatcherBB);
+  BasicBlock *HashMissBB =
+      BasicBlock::Create(*CONTEXT, "hashMissBB", &F, DispatcherBB);
+  BranchInst::Create(DispatcherBB, HashMissBB);
+  SwitchInst *DispatcherSwitch =
+      SwitchInst::Create(DispatchHash, HashMissBB, 0, DispatcherBB);
+
+  vector<size_t> BlockOrder(FlattenBlocks.size());
+  iota(BlockOrder.begin(), BlockOrder.end(), 0);
+  RNG.shuffle(BlockOrder);
+  for (size_t SeqIdx : BlockOrder) {
+    BasicBlock *BB = FlattenBlocks[SeqIdx];
+    BB->moveBefore(DispatcherBB);
+    if (LocalOnlyBlocks.find(BB) == LocalOnlyBlocks.end())
+      DispatcherSwitch->addCase(CONST_I64(DispatchHashes[SeqIdx]), BB);
+  }
+
+  // Rewrite original terminators to update state and return to dispatcher.
+  for (size_t CurIndex = 0; CurIndex < FlattenBlocks.size(); ++CurIndex) {
+    BasicBlock *BB = FlattenBlocks[CurIndex];
+    Instruction *term = BB->getTerminator();
+    if (term->getNumSuccessors() == 0)
+      continue;
+
+    auto FindDispatcherTarget = [&](BasicBlock *Succ,
+                                    size_t &OutIndex) -> bool {
+      auto It = BlockToIndex.find(Succ);
+      if (It == BlockToIndex.end())
+        return false;
+      if (LocalOnlyBlocks.find(Succ) != LocalOnlyBlocks.end())
+        return false;
+      OutIndex = It->second;
+      return true;
+    };
+    auto CreateEncodedState = [&](size_t FalseIndex, size_t TrueIndex,
+                                  Value *Cond,
+                                  Instruction *InsertBefore) -> Value * {
+      uint64_t RandomXor = RNG.next64();
+      LoadInst *CurState = new LoadInst(TYPE_I64, StatePtr, "state.cur", false,
+                                        Align(8), Before(InsertBefore));
+      Value *TempVal = BinaryOperator::CreateXor(CONST_I64(RandomXor), CurState,
+                                                 "", Before(InsertBefore));
+      vector<size_t> ShuffledBlocks = BlockOrder;
+      RNG.shuffle(ShuffledBlocks);
+      int GarbageInterval = ShuffledBlocks.size() / 2;
+      GarbageInterval = GarbageInterval > 1 ? GarbageInterval : 1;
+      for (size_t D : ShuffledBlocks) {
+        if (D == FalseIndex) {
+          TempVal = BinaryOperator::CreateXor(
+              CONST_I64(StateIds[CurIndex] ^ StateIds[FalseIndex] ^ RandomXor),
+              TempVal, "", Before(InsertBefore));
+        } else if (D == TrueIndex) {
+          Value *MaskVal = BinaryOperator::CreateAnd(
+              new SExtInst(Cond, TYPE_I64, "", Before(InsertBefore)),
+              CONST_I64(StateIds[TrueIndex] ^ StateIds[FalseIndex]), "",
+              Before(InsertBefore));
+          TempVal = BinaryOperator::CreateXor(MaskVal, TempVal, "",
+                                              Before(InsertBefore));
+        } else if (RNG.range(GarbageInterval) == 0) {
+          Value *MaskVal = BinaryOperator::CreateAnd(
+              CONST_I64(0), CONST_I64(RNG.next64()), "", Before(InsertBefore));
+          TempVal = BinaryOperator::CreateXor(MaskVal, TempVal, "",
+                                              Before(InsertBefore));
+        }
+      }
+      return TempVal;
+    };
+
+    auto StoreStateTransition = [&](size_t SuccIndex,
+                                    Instruction *InsertBefore) {
+      Value *Next = CreateEncodedState(SuccIndex, CurIndex,
+                                       ConstantInt::getFalse(F.getContext()),
+                                       InsertBefore);
+      new StoreInst(Next, StatePtr, false, Align(8), Before(InsertBefore));
+      new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
+                    Before(InsertBefore));
+    };
+
+    if (term->getNumSuccessors() == 1 && isa<BranchInst>(term)) {
+      BasicBlock *Succ = term->getSuccessor(0);
+      size_t FalseIndex = 0;
+      if (!FindDispatcherTarget(Succ, FalseIndex))
+        continue;
+      StoreStateTransition(FalseIndex, term);
+      term->eraseFromParent();
+      BranchInst::Create(DispatcherBB, BB);
+    } else if (term->getNumSuccessors() == 2 && isa<BranchInst>(term)) {
+      BranchInst *BR = cast<BranchInst>(term);
+      BasicBlock *TrueSucc = BR->getSuccessor(0);
+      BasicBlock *FalseSucc = BR->getSuccessor(1);
+      size_t TrueIndex = 0, FalseIndex = 0;
+      bool TrueFlat = FindDispatcherTarget(TrueSucc, TrueIndex);
+      bool FalseFlat = FindDispatcherTarget(FalseSucc, FalseIndex);
+      if (TrueFlat && FalseFlat) {
+        Value *Next =
+            CreateEncodedState(FalseIndex, TrueIndex, BR->getCondition(), BR);
+        new StoreInst(Next, StatePtr, false, Align(8), Before(BR));
+        new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
+                      Before(BR));
+        BR->eraseFromParent();
+        BranchInst::Create(DispatcherBB, BB);
+      } else if (TrueFlat || FalseFlat) {
+        size_t FlatIndex = TrueFlat ? TrueIndex : FalseIndex;
+        BasicBlock *DirectDest = TrueFlat ? FalseSucc : TrueSucc;
+        Value *FlatCond =
+            TrueFlat
+                ? BR->getCondition()
+                : BinaryOperator::CreateNot(BR->getCondition(), "", Before(BR));
+        StoreStateTransition(FlatIndex, BR);
+        BR->eraseFromParent();
+        BranchInst::Create(DispatcherBB, DirectDest, FlatCond, BB);
+      }
+    } else if (SwitchInst *SI = dyn_cast<SwitchInst>(term)) {
+      unordered_map<BasicBlock *, BasicBlock *> TransitionForTarget;
+      auto GetSwitchSuccessor = [&](BasicBlock *Succ) -> BasicBlock * {
+        size_t SuccIndex = 0;
+        if (!FindDispatcherTarget(Succ, SuccIndex))
+          return Succ;
+        auto It = TransitionForTarget.find(Succ);
+        if (It != TransitionForTarget.end())
+          return It->second;
+
+        // Preserve address-taken labels: blockaddress constants must still land
+        // on the original label body, not on the dispatcher. Rewriting their
+        // terminators makes an indirect goto jump into the flattened state
+        // machine with a stale state value and can loop in hashMissBB.
+        if (BB->hasAddressTaken())
+          return Succ;
+
+        BasicBlock *TransitionBB =
+            BasicBlock::Create(*CONTEXT, "switch.trans", &F, DispatcherBB);
+        BranchInst *ToDispatch = BranchInst::Create(DispatcherBB, TransitionBB);
+        StoreStateTransition(SuccIndex, ToDispatch);
+        if (!isa<PHINode>(Succ->begin()))
+          Succ->replacePhiUsesWith(BB, TransitionBB);
+        TransitionForTarget[Succ] = TransitionBB;
+        return TransitionBB;
+      };
+
+      BasicBlock *NewDefault = GetSwitchSuccessor(SI->getDefaultDest());
+      SwitchInst *NewSwitch = SwitchInst::Create(SI->getCondition(), NewDefault,
+                                                 SI->getNumCases(), Before(SI));
+      for (auto Case : SI->cases())
+        NewSwitch->addCase(Case.getCaseValue(),
+                           GetSwitchSuccessor(Case.getCaseSuccessor()));
+      SI->eraseFromParent();
+    }
+  }
+  // Repair PHI nodes and escaped values invalidated by CFG rewriting.
+  vector<PHINode *> fixPHI;
+  vector<Instruction *> fixReg;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (PHINode *PN = dyn_cast<PHINode>(&I)) {
+        if (LocalOnlyBlocks.find(&BB) == LocalOnlyBlocks.end()) {
+          fixPHI.push_back(PN);
+        }
+      }
+    }
+  }
+  for (PHINode *PN : fixPHI) {
+    DemotePHIToStack(PN);
+  }
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (&I == StateLoad || &I == HashStateLoad ||
+          I.getName().starts_with("state.cur") || I.getParent() == DispatcherBB)
+        continue;
+      if (!(isa<AllocaInst>(&I) && I.getParent() == &EntryBB) &&
+          I.isUsedOutsideOfBlock(&BB) && I.getType()->isSized()) {
+        fixReg.push_back(&I);
+      }
+    }
+  }
+  for (Instruction *I : fixReg) {
+    DemoteRegToStack(*I);
+  }
   return true;
+}
+
+FlatteningPass *llvm::createFlattening(bool flag) {
+  return new FlatteningPass(flag);
 }

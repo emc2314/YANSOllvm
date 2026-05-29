@@ -1,0 +1,3 @@
+BasedOnStyle: LLVM
+# Preserve LLVM lit command comments such as "// RUN:" and "; RUN:".
+CommentPragmas: '^( RUN:| CHECK:| CHECK-[A-Z0-9-]+:)'
