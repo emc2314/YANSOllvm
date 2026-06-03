@@ -34,9 +34,17 @@ bool FlatteningPass::flatten(Function &F) {
     return false;
   }
 
+  if (F.hasPersonalityFn()) {
+    YANSO_WARN_FUNCTION("fla", F,
+                        "personality/EH function until EH regions are modeled");
+    return false;
+  }
+
   if (F.size() <= 2) {
     return false;
   }
+
+  yansollvm_fix_stack(&F);
 
   vector<BasicBlock *> TrivialBlocks;
   BasicBlock *OriginalEntry = &F.getEntryBlock();
@@ -83,6 +91,7 @@ bool FlatteningPass::flatten(Function &F) {
     BasicBlock *EntryRegion =
         EntryBB.splitBasicBlock(EntryTerminator, "entry.region");
     FlattenBlocks.insert(FlattenBlocks.begin(), EntryRegion);
+    EntryTarget = EntryRegion;
   }
 
   set<BasicBlock *> LocalOnlyBlocks;
@@ -376,8 +385,6 @@ bool FlatteningPass::flatten(Function &F) {
             BasicBlock::Create(*CONTEXT, "switch.trans", &F, DispatcherBB);
         BranchInst *ToDispatch = BranchInst::Create(DispatcherBB, TransitionBB);
         StoreStateTransition(SuccIndex, ToDispatch);
-        if (!isa<PHINode>(Succ->begin()))
-          Succ->replacePhiUsesWith(BB, TransitionBB);
         TransitionForTarget[Succ] = TransitionBB;
         return TransitionBB;
       };
@@ -391,15 +398,5 @@ bool FlatteningPass::flatten(Function &F) {
       SI->eraseFromParent();
     }
   }
-  std::set<Instruction *> SkipRegs{StateLoad, HashStateLoad};
-  for (BasicBlock &BB : F) {
-    if (&BB == DispatcherBB)
-      for (Instruction &I : BB)
-        SkipRegs.insert(&I);
-    for (Instruction &I : BB)
-      if (I.getName().starts_with("state.cur"))
-        SkipRegs.insert(&I);
-  }
-  yansollvm_fix_stack(&F, &LocalOnlyBlocks, &SkipRegs);
   return true;
 }
