@@ -90,7 +90,6 @@ public:
 
   static bool isRequired() { return true; } // ֱ�ӷ���true����
 };
-SubstitutionPass *createSubstitutionPass(bool flag); // ����������ָ�
 } // namespace llvm
 
 #endif

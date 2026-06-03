@@ -37,7 +37,5 @@ public:
   GlobalVariable *getIndirectGlobalVariables(Function &F, ConstantInt *EncKey);
   static bool isRequired() { return true; } // 直接返回true即可
 };
-IndirectGlobalVariablePass *
-createIndirectGlobalVariable(bool flag); // 创建间接跳转
 } // namespace llvm
 #endif // LLVM_INDIRECTGLOBALVARIABLE_H

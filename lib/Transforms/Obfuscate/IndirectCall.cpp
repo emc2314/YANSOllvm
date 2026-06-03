@@ -167,6 +167,3 @@ void IndirectCallPass::NumberCallees(Function &F) {
  * @param flag
  * @return IndirectCallPass*
  */
-IndirectCallPass *llvm::createIndirectCall(bool flag) {
-  return new IndirectCallPass(flag);
-}

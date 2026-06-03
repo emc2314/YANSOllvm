@@ -1,4 +1,4 @@
-#include "YANSOllvmCommon.h"
+#include "VMPass.h"
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"

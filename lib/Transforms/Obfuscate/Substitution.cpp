@@ -526,7 +526,3 @@ void SubstitutionPass::xorSubstitutionRand(BinaryOperator *bo) {
   op = BinaryOperator::Create(Instruction::Xor, op, op1, "", bo->getIterator());
   bo->replaceAllUsesWith(op);
 }
-
-SubstitutionPass *llvm::createSubstitutionPass(bool flag) {
-  return new SubstitutionPass(flag);
-}

@@ -1,9 +1,9 @@
 #ifndef LLVM_FLATTENING_H
 #define LLVM_FLATTENING_H
 // LLVM libs
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
@@ -23,6 +23,5 @@ public:
   bool flatten(Function &F);
   static bool isRequired() { return true; }
 };
-FlatteningPass *createFlattening(bool flag);
 } // namespace llvm
 #endif // LLVM_FLATTENING_H

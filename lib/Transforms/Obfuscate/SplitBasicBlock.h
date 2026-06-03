@@ -26,6 +26,5 @@ public:
   bool containsPHI(BasicBlock *BB); // 判断一个基本块中是否包含 PHI指令(PHINode)
   static bool isRequired() { return true; } // 直接返回true即可
 };
-SplitBasicBlockPass *createSplitBasicBlock(bool flag); // 创建基本块分割
 } // namespace llvm
 #endif // LLVM_SPLIT_BASIC_BLOCK_H

@@ -1,3 +1,4 @@
+; REQUIRES: func2mod
 ; RUN: rm -rf %t && mkdir -p %t
 ; RUN: mkdir -p %t/in %t/run
 ; RUN: cp %s %t/in/func2mod.ll

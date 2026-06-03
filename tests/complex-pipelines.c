@@ -3,10 +3,10 @@
 // RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -sobf -icall -igv -ibr -S %t/complex.ll -o %t/complex.indirect.ll
 // RUN: %clang %t/complex.indirect.ll -o %t/complex.indirect
 // RUN: %t/complex.indirect | grep '^alpha:37$'
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -connect -obfCon -S %t/complex.ll -o %t/complex.mixed.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -connect -obfcon -S %t/complex.ll -o %t/complex.mixed.ll
 // RUN: %clang %t/complex.mixed.ll -o %t/complex.mixed
 // RUN: %t/complex.mixed | grep '^alpha:37$'
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -fla -connect -obfCon -sub -bcf -S %t/complex.ll -o %t/complex.aggressive.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -fla -connect -obfcon -sub -bcf -S %t/complex.ll -o %t/complex.aggressive.ll
 // RUN: %clang %t/complex.aggressive.ll -o %t/complex.aggressive
 // RUN: %t/complex.aggressive | grep '^alpha:37$'
 

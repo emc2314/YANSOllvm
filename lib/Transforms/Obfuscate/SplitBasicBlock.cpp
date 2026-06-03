@@ -141,6 +141,3 @@ bool SplitBasicBlockPass::containsPHI(BasicBlock *BB) {
  * @param flag
  * @return FunctionPass*
  */
-SplitBasicBlockPass *llvm::createSplitBasicBlock(bool flag) {
-  return new SplitBasicBlockPass(flag);
-}

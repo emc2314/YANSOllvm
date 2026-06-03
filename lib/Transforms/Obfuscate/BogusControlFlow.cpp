@@ -707,6 +707,3 @@ bool BogusControlFlowPass::doF(Module &M, Function &F) {
  * @param flag
  * @return FunctionPass*
  */
-BogusControlFlowPass *llvm::createBogusControlFlow(bool flag) {
-  return new BogusControlFlowPass(flag);
-}

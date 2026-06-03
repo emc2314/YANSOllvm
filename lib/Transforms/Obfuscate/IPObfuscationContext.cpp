@@ -1,5 +1,3 @@
-// #include "llvm/Transforms/Obfuscation/ObfuscationPassManager.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
@@ -20,7 +18,7 @@ using namespace llvm;
 
 namespace llvm {
 
-bool IPObfuscationContext::runOnModule(llvm::Module &M) {
+bool IPObfuscationContext::run(llvm::Module &M) {
   for (auto &F : M) {
     SurveyFunction(F);
   }
@@ -261,13 +259,10 @@ IPObfuscationContext::AllocaSecretSlot(Function &F) {
   return Info;
 }
 
-char IPObfuscationContext::ID = 0;
-
-bool IPObfuscationContext::doFinalization(Module &) {
+IPObfuscationContext::~IPObfuscationContext() {
   for (auto *Info : IPOInfoList) {
     delete (Info);
   }
-  return false;
 }
 
 const IPObfuscationContext::IPOInfo *
@@ -297,10 +292,3 @@ void IPObfuscationContext::computeCallSiteSecretArgument(Function *F) {
   }
 }
 } // namespace llvm
-
-IPObfuscationContext *llvm::createIPObfuscationContextPass(bool flag) {
-  return new IPObfuscationContext(flag);
-}
-
-INITIALIZE_PASS(IPObfuscationContext, "ipobf", "IPObfuscationContext", false,
-                false)

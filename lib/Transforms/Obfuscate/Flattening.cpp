@@ -1,7 +1,6 @@
 #include "Flattening.h"
 #include "YANSOllvmCommon.h"
 #include "CryptoUtils.h"
-#include "SplitBasicBlock.h"
 #include "Utils.h"
 #include "YANSOllvmSeed.h"
 
@@ -40,7 +39,10 @@ bool FlatteningPass::flatten(Function &F) {
   }
 
   vector<BasicBlock *> TrivialBlocks;
+  BasicBlock *OriginalEntry = &F.getEntryBlock();
   for (BasicBlock &BB : F) {
+    if (&BB == OriginalEntry)
+      continue;
     if (BB.size() == 1 && isa<BranchInst>(BB.getTerminator()) &&
         BB.getTerminator()->getNumSuccessors() == 1 && !BB.hasAddressTaken())
       TrivialBlocks.push_back(&BB);
@@ -67,11 +69,14 @@ bool FlatteningPass::flatten(Function &F) {
 
   // Keep all original blocks except the entry block.
   vector<BasicBlock *> FlattenBlocks;
-  for (BasicBlock &BB : F) {
-    FlattenBlocks.push_back(&BB);
-  }
-  FlattenBlocks.erase(FlattenBlocks.begin());
   BasicBlock &EntryBB = F.getEntryBlock();
+  BasicBlock *EntryTarget = EntryBB.getTerminator()->getNumSuccessors() > 0
+                                ? EntryBB.getTerminator()->getSuccessor(0)
+                                : nullptr;
+  for (BasicBlock &BB : F) {
+    if (&BB != &EntryBB)
+      FlattenBlocks.push_back(&BB);
+  }
   // Split a multi-successor entry so the dispatcher can own the entry edge.
   Instruction *EntryTerminator = EntryBB.getTerminator();
   if (EntryTerminator->getNumSuccessors() > 1) {
@@ -112,11 +117,12 @@ bool FlatteningPass::flatten(Function &F) {
             else
               UseBB = II->getParent();
             if (UseBB != BB) {
-              LocalOnlyBlocks.insert(UseBB);
-              YANSO_ERROR_BLOCK("fla", F, *UseBB,
-                               "unsized value used across block boundary");
+              if (UseBB)
+                LocalOnlyBlocks.insert(UseBB);
+              YANSO_ERROR_BLOCK("fla", F, *BB,
+                                "unsized value used across block boundary");
               for (BasicBlock *midBB : FlattenBlocks) {
-                if (midBB != BB && midBB != UseBB &&
+                if (UseBB && midBB != BB && midBB != UseBB &&
                     DT.dominates(midBB, UseBB) && DT.dominates(BB, midBB)) {
                   LocalOnlyBlocks.insert(midBB);
                   YANSO_ERROR_BLOCK(
@@ -143,10 +149,6 @@ bool FlatteningPass::flatten(Function &F) {
                        "catchswitch unwind destination");
     }
   }
-
-  BasicBlock *EntryTarget = EntryBB.getTerminator()->getNumSuccessors() > 0
-                                ? EntryBB.getTerminator()->getSuccessor(0)
-                                : nullptr;
 
   // Create dispatcher block.
   BasicBlock *DispatcherBB =
@@ -255,8 +257,11 @@ bool FlatteningPass::flatten(Function &F) {
     auto FindDispatcherTarget = [&](BasicBlock *Succ,
                                     size_t &OutIndex) -> bool {
       auto It = BlockToIndex.find(Succ);
-      if (It == BlockToIndex.end())
+      if (It == BlockToIndex.end()) {
+        YANSO_ERROR_EDGE("fla", F, *BB, *Succ,
+                         "successor is outside flatten block set");
         return false;
+      }
       if (LocalOnlyBlocks.find(Succ) != LocalOnlyBlocks.end())
         return false;
       OutIndex = It->second;
@@ -397,8 +402,4 @@ bool FlatteningPass::flatten(Function &F) {
   }
   yansollvm_fix_stack(&F, &LocalOnlyBlocks, &SkipRegs);
   return true;
-}
-
-FlatteningPass *llvm::createFlattening(bool flag) {
-  return new FlatteningPass(flag);
 }

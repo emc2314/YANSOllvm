@@ -149,7 +149,3 @@ GlobalVariable *IndirectBranchPass::getIndirectTargets(Function &F,
   appendToCompilerUsed(*F.getParent(), {GV});
   return GV;
 }
-
-IndirectBranchPass *llvm::createIndirectBranch(bool flag) {
-  return new IndirectBranchPass(flag);
-}

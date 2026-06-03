@@ -36,7 +36,7 @@ DEFAULT_PASSES = [
     "merge",
     "bb2func",
     "connect",
-    "obfCon",
+    "obfcon",
 ]
 
 # Keep this first wave deterministic and single-file: C tests with checked runtime

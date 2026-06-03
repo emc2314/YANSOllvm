@@ -93,7 +93,7 @@ inline Function::iterator it(BasicBlock *BB) { return BB->getIterator(); }
 inline Function::iterator it(BasicBlock &BB) { return BB.getIterator(); }
 
 inline BasicBlock::iterator firstNonAlloca(BasicBlock &Entry) {
-  BasicBlock::iterator It = Entry.begin();
+  BasicBlock::iterator It = Entry.getFirstInsertionPt();
   while (It != Entry.end() && isa<AllocaInst>(&*It))
     ++It;
   return It;

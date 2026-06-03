@@ -18,7 +18,7 @@ CASES = [
     ("tests/shape.ll", "-vm"),
     ("tests/shape.ll", "-connect"),
     ("tests/basic-pipeline.c", "-sobf -icall -ibr -igv"),
-    ("tests/complex-pipelines.c", "-split -fla -sub -bcf -ibr -icall -igv -vm -merge -bb2func -connect -obfCon"),
+    ("tests/complex-pipelines.c", "-split -fla -sub -bcf -ibr -icall -igv -vm -merge -bb2func -connect -obfcon"),
 ]
 
 

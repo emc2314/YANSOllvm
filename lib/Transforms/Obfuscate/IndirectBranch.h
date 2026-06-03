@@ -34,6 +34,5 @@ public:
   GlobalVariable *getIndirectTargets(Function &F, ConstantInt *EncKey);
   static bool isRequired() { return true; } // 直接返回true即可
 };
-IndirectBranchPass *createIndirectBranch(bool flag); // 创建间接跳转
 } // namespace llvm
 #endif // LLVM_INDIRECTBRANCH_H

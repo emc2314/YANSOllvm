@@ -1,6 +1,5 @@
 #include "ObfuscationOptions.h"
 
-#include "ObfuscationOptions.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"

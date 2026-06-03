@@ -467,7 +467,3 @@ void StringEncryptionPass::deleteUnusedGlobalVariable() {
     }
   }
 }
-
-StringEncryptionPass *llvm::createStringEncryption(bool flag) {
-  return new StringEncryptionPass(flag);
-}

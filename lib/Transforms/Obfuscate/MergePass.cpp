@@ -1,5 +1,5 @@
 #include "CryptoUtils.h"
-#include "YANSOllvmCommon.h"
+#include "MergePass.h"
 #include "Utils.h"
 
 #include "YANSOllvmSeed.h"

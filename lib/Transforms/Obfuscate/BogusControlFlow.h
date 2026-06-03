@@ -44,7 +44,6 @@ public:
   bool doF(Module &M, Function &F);
   static bool isRequired() { return true; } // 直接返回true即可
 };
-BogusControlFlowPass *createBogusControlFlow(bool flag); // 创建基本块分割
 } // namespace llvm
 
 #endif

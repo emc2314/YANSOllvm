@@ -93,7 +93,7 @@ separate `opt -load LLVMObf.so -vm -merge ...` pass names.
 | `-func2mod` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass and writes side-effect bitcode outputs. | Original YANSOllvm pass. | updated / experimental | Module partitioning tool, not a normal protection pass. LLVM 9 had a direct legacy-PM `RegisterPass("func2mod")`. |
 | `-bb2func` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Extracts eligible basic blocks into new functions. LLVM 9 used direct legacy-PM `RegisterPass("bb2func")`. |
 | `-connect` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Splits/connects basic blocks and adds trap-backed default paths. LLVM 9 used direct legacy-PM `RegisterPass("connect")`. |
-| `-obfCon` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Splits and obfuscates integer constants. LLVM 9 used direct legacy-PM `RegisterPass("obfCon")`. |
+| `-obfcon` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Splits and obfuscates integer constants. |
 | `-fla` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm flattening pass, updated for the LLVM 21 pipeline. | updated | Replaces the old user spelling `-flattening`; now handles native `switch` terminators without requiring a `LowerSwitch` pre-pass. |
 | `-split` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Imported obfuscation pass family; comments/header lineage point to Naville/OLLVM-style code. | ported | Basic-block splitting. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
 | `-sub` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Imported OLLVM-style operator substitution pass. | ported | Instruction substitution. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
@@ -109,6 +109,18 @@ pipelines unless the downstream multi-module link/package flow is explicit. Its
 output partition count is controlled by the `-func2mod-outputs=N` option, which
 is not a pass.
 
+Current status: `func2mod` is disabled in the default lit test set with
+`REQUIRES: func2mod`. The implementation calls LLVM's `SplitModule()` helper,
+whose definition lives in the `TransformUtils` component. In this out-of-tree
+pass-plugin build, `opt` does not export that symbol to the plugin, so running
+`-func2mod` currently fails at load/run time with an undefined
+`llvm::SplitModule(...)` symbol. Do not fix this by statically linking
+`TransformUtils` into `yansollvm.so`: that pulls duplicate LLVM static globals
+into the plugin and causes duplicate command-line option registration inside
+`opt`. Treat `func2mod` as a separate follow-up: either implement splitting
+without `SplitModule`, build it as a standalone tool, or use an LLVM shared
+library setup where the symbol is exported by the host.
+
 ### Difference from the LLVM 9 main branch
 
 The LLVM 9 main branch was an in-tree LLVM overlay. Its original YANSOllvm pass
@@ -119,7 +131,7 @@ set was registered directly into the legacy pass manager:
 - `RegisterPass("bb2func")`
 - `RegisterPass("flattening")`
 - `RegisterPass("connect")`
-- `RegisterPass("obfCon")`
+- `RegisterPass("obfcon")`
 - `RegisterPass("obfCall")`
 - `RegisterPass("func2mod")`
 
@@ -131,7 +143,7 @@ This LLVM 21 branch changes the call surface:
   -passes=yanso`, then enables features with `cl::opt` flags.
 - Original YANSOllvm passes are treated as updated implementations, not merely
   external ports: `-vm`, `-merge`, `-func2mod`, `-bb2func`, `-connect`,
-  `-obfCon`, and `-fla`.
+  `-obfcon`, and `-fla`.
 - `-fla` is the updated LLVM 21 spelling/implementation for the old flattening
   pass. The old user-facing name was `-flattening`.
 - `-split`, `-sub`, `-bcf`, `-icall`, `-sobf`, `-ibr`, `-igv`, and `-fncmd` are
@@ -154,7 +166,7 @@ Conservative CFG/data obfuscation:
 Call graph + CFG + constants:
 
 ```bash
--passes=yanso -vm -merge -bb2func -fla -connect -obfCon -sub -bcf
+-passes=yanso -vm -merge -bb2func -fla -connect -obfcon -sub -bcf
 ```
 
 ## Determinism smoke test

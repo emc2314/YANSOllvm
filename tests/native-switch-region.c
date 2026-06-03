@@ -5,7 +5,7 @@
 // RUN: grep 'switch i64' %t/native-switch-region.fla.ll
 // RUN: %clang %t/native-switch-region.fla.ll -o %t/native-switch-region.fla
 // RUN: %t/native-switch-region.fla | grep '^native-switch:240$'
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -fla -connect -obfCon -sub -bcf -S %t/native-switch-region.ll -o %t/native-switch-region.aggressive.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -fla -connect -obfcon -sub -bcf -S %t/native-switch-region.ll -o %t/native-switch-region.aggressive.ll
 // RUN: %clang %t/native-switch-region.aggressive.ll -o %t/native-switch-region.aggressive
 // RUN: %t/native-switch-region.aggressive | grep '^native-switch:240$'
 

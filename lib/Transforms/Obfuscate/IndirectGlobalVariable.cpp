@@ -164,7 +164,3 @@ IndirectGlobalVariablePass::getIndirectGlobalVariables(Function &F,
   appendToCompilerUsed(*F.getParent(), {GV});
   return GV;
 }
-
-IndirectGlobalVariablePass *llvm::createIndirectGlobalVariable(bool flag) {
-  return new IndirectGlobalVariablePass(flag);
-}

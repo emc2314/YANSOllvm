@@ -104,6 +104,5 @@ public:
                                 Type *Ty);
   static bool isRequired() { return true; } // 直接返回true即可
 };
-StringEncryptionPass *createStringEncryption(bool flag); // 创建字符串加密
 } // namespace llvm
 #endif

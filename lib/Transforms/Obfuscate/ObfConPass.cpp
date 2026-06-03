@@ -1,4 +1,4 @@
-#include "CryptoUtils.h"
+#include "ObfConPass.h"
 #include "YANSOllvmCommon.h"
 #include "Utils.h"
 
@@ -177,7 +177,7 @@ class ObfConImpl {
 
 public:
   bool run(Function &F) {
-    YansoRNG LocalRNG(yanso_function_seed(F, "obfCon"));
+    YansoRNG LocalRNG(yanso_function_seed(F, "obfcon"));
     RNG = &LocalRNG;
     bool Modified = false;
     OriginalInst.clear();

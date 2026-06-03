@@ -5,19 +5,13 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
-#include "llvm/Pass.h"
 #include <map>
 #include <set>
 #include <vector>
 
-// Namespace
 namespace llvm {
-class ModulePass;
-class FunctionPass;
-class PassRegistry;
 
-struct IPObfuscationContext : public ModulePass {
-  static char ID;
+struct IPObfuscationContext {
   bool flag;
 
   /* Inter-procedural obfuscation secret info of a function */
@@ -42,8 +36,9 @@ struct IPObfuscationContext : public ModulePass {
   std::map<Function *, IPOInfo *> IPOInfoMap;
   std::vector<AllocaInst *> DeadSlots;
 
-  IPObfuscationContext() : ModulePass(ID) { this->flag = false; }
-  IPObfuscationContext(bool flag) : ModulePass(ID) { this->flag = flag; }
+  IPObfuscationContext() : flag(false) {}
+  explicit IPObfuscationContext(bool flag) : flag(flag) {}
+  ~IPObfuscationContext();
 
   void SurveyFunction(Function &F);
   Function *InsertSecretArgument(Function *F);
@@ -51,12 +46,9 @@ struct IPObfuscationContext : public ModulePass {
   IPOInfo *AllocaSecretSlot(Function &F);
   const IPOInfo *getIPOInfo(Function *F);
 
-  bool runOnModule(Module &M) override;
-  bool doFinalization(Module &) override;
+  bool run(Module &M);
 };
 
-IPObfuscationContext *createIPObfuscationContextPass(bool flag);
-void initializeIPObfuscationContextPass(PassRegistry &Registry);
 } // namespace llvm
 
 #endif

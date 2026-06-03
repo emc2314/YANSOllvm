@@ -1,5 +1,8 @@
-#include "YANSOllvmCommon.h"
+#include "BB2FuncPass.h"
 
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Function.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 
 #include <algorithm>
