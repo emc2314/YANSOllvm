@@ -4,6 +4,8 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/PassManager.h"
 
+#include <set>
+
 namespace llvm {
 
 struct VMPass : PassInfoMixin<VMPass> {
@@ -44,7 +46,9 @@ struct ObfConPass : PassInfoMixin<ObfConPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
-void yansollvm_fix_stack(Function *F);
+// Repair PHI nodes and escaped values invalidated by CFG rewriting.
+void yansollvm_fix_stack(Function *F, const std::set<BasicBlock *> *SkipPhiBlocks = nullptr,
+                         const std::set<Instruction *> *SkipRegs = nullptr);
 void yansollvm_create_trap_block(Function *F, BasicBlock *BB);
 uint32_t yansollvm_rand_prime(uint32_t Min, uint32_t Max, YansoRNG &RNG);
 uint64_t yansollvm_mod_inv(uint64_t A);

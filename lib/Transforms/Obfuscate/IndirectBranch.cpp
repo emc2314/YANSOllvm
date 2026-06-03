@@ -24,11 +24,13 @@ PreservedAnalyses IndirectBranchPass::run(Module &M,
     if (toObfuscate(flag, &Fn, "ibr")) {
 
       if (Options && Options->skipFunction(Fn.getName())) {
+        YANSO_WARN_FUNCTION("ibr", Fn, "filtered/internal yansollvm function");
         continue;
       }
 
       if (Fn.empty() || Fn.hasLinkOnceLinkage() ||
           Fn.getSection() == ".text.startup") {
+        YANSO_WARN_FUNCTION("ibr", Fn, "unsupported linkage/section or empty function");
         continue;
       }
 
@@ -44,6 +46,7 @@ PreservedAnalyses IndirectBranchPass::run(Module &M,
       NumberBasicBlock(Fn, RNG);
 
       if (BBNumbering.empty()) {
+        YANSO_WARN_FUNCTION("ibr", Fn, "no conditional branch targets");
         continue;
       }
 

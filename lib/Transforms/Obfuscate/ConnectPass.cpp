@@ -1,5 +1,6 @@
 #include "CryptoUtils.h"
 #include "YANSOllvmCommon.h"
+#include "Utils.h"
 
 #include "YANSOllvmSeed.h"
 #include "llvm/IR/Constants.h"
@@ -77,14 +78,14 @@ PreservedAnalyses ConnectPass::run(Function &F, FunctionAnalysisManager &) {
           std::vector<Instruction::BinaryOps> Vec1Bin{
               BinaryOperator::UDiv, BinaryOperator::Mul, BinaryOperator::SDiv};
           TempVal = BinaryOperator::Create(VecBin[RNG.range(VecBin.size())], C0,
-                                           C0, "", SwitchII->getIterator());
+                                           C0, "", it(SwitchII));
           TempVal->setOperand(RNG.range(2), C1);
           TempVal = BinaryOperator::Create(Vec1Bin[RNG.range(Vec1Bin.size())],
                                            NumCase, TempVal, "",
-                                           SwitchII->getIterator());
+                                           it(SwitchII));
         } else {
           TempVal = BinaryOperator::Create(VecBin[RNG.range(VecBin.size())], C0,
-                                           C0, "", SwitchII->getIterator());
+                                           C0, "", it(SwitchII));
           TempVal->setOperand(RNG.range(2), NumCase);
         }
         SwitchII->setCondition(TempVal);

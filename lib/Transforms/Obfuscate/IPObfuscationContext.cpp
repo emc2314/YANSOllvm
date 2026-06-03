@@ -179,7 +179,7 @@ Function *IPObfuscationContext::InsertSecretArgument(Function *F) {
 #endif
 
     Instruction *New;
-    auto InsertBefore = Call->getIterator();
+    auto InsertBefore = it(Call);
     if (InvokeInst *II = dyn_cast<InvokeInst>(Call)) {
       New = InvokeInst::Create(NF, II->getNormalDest(), II->getUnwindDest(),
                                Args, "", InsertBefore);

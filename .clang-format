@@ -1,3 +1,4 @@
 BasedOnStyle: LLVM
-# Preserve LLVM lit command comments such as "// RUN:" and "; RUN:".
-CommentPragmas: '^( RUN:| CHECK:| CHECK-[A-Z0-9-]+:)'
+# Do not reflow comments. Several obfuscation pass files contain ASCII CFG
+# diagrams and explanatory block comments whose alignment is meaningful.
+ReflowComments: false

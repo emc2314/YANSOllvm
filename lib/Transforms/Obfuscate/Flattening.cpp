@@ -1,4 +1,5 @@
 #include "Flattening.h"
+#include "YANSOllvmCommon.h"
 #include "CryptoUtils.h"
 #include "SplitBasicBlock.h"
 #include "Utils.h"
@@ -30,6 +31,7 @@ PreservedAnalyses FlatteningPass::run(Function &F,
 
 bool FlatteningPass::flatten(Function &F) {
   if (F.isVarArg()) {
+    YANSO_WARN_FUNCTION("fla", F, "vararg function");
     return false;
   }
 
@@ -82,16 +84,22 @@ bool FlatteningPass::flatten(Function &F) {
   DominatorTree DT(F);
   for (BasicBlock *BB : FlattenBlocks) {
     Instruction *Term = BB->getTerminator();
-    if (isa<IndirectBrInst>(Term))
+    if (isa<IndirectBrInst>(Term)) {
+      YANSO_ERROR_FUNCTION("fla", F, "contains indirectbr");
       return false;
-    if (BB->hasAddressTaken())
+    }
+    if (BB->hasAddressTaken()) {
       LocalOnlyBlocks.insert(BB);
+      YANSO_WARN_BLOCK("fla", F, *BB, "address-taken block");
+    }
     for (Instruction &I : *BB) {
       if (PHINode *P = dyn_cast<PHINode>(&I)) {
         for (unsigned i = 0, e = P->getNumIncomingValues(); i < e; ++i) {
           if (InvokeInst *II = dyn_cast<InvokeInst>(P->getIncomingValue(i))) {
             if (II->getParent() == P->getIncomingBlock(i)) {
               LocalOnlyBlocks.insert(BB);
+              YANSO_ERROR_BLOCK("fla", F, *BB,
+                               "PHI incoming value is invoke result");
             }
           }
         }
@@ -105,10 +113,15 @@ bool FlatteningPass::flatten(Function &F) {
               UseBB = II->getParent();
             if (UseBB != BB) {
               LocalOnlyBlocks.insert(UseBB);
+              YANSO_ERROR_BLOCK("fla", F, *UseBB,
+                               "unsized value used across block boundary");
               for (BasicBlock *midBB : FlattenBlocks) {
                 if (midBB != BB && midBB != UseBB &&
                     DT.dominates(midBB, UseBB) && DT.dominates(BB, midBB)) {
                   LocalOnlyBlocks.insert(midBB);
+                  YANSO_ERROR_BLOCK(
+                      "fla", F, *midBB,
+                      "dominates local-only block using unsized cross-block value");
                 }
               }
             }
@@ -119,10 +132,15 @@ bool FlatteningPass::flatten(Function &F) {
     Instruction *term = BB->getTerminator();
     if (auto *II = dyn_cast<InvokeInst>(term)) {
       LocalOnlyBlocks.insert(II->getUnwindDest());
+      YANSO_WARN_BLOCK("fla", F, *II->getUnwindDest(), "invoke unwind destination");
     } else if (auto *CRI = dyn_cast<CleanupReturnInst>(term)) {
       LocalOnlyBlocks.insert(CRI->getUnwindDest());
+      YANSO_WARN_BLOCK("fla", F, *CRI->getUnwindDest(),
+                       "cleanupret unwind destination");
     } else if (auto *CSI = dyn_cast<CatchSwitchInst>(term)) {
       LocalOnlyBlocks.insert(CSI->getUnwindDest());
+      YANSO_WARN_BLOCK("fla", F, *CSI->getUnwindDest(),
+                       "catchswitch unwind destination");
     }
   }
 
@@ -141,8 +159,6 @@ bool FlatteningPass::flatten(Function &F) {
   // Dual-state dispatcher: keep CFG safety handling, but dispatch on
   // mix(index, hash-state) instead of the raw switch state. Successor state is
   // encoded branchlessly with xor/mask where both successors are flattenable.
-  auto Before = [](Instruction *I) { return I->getIterator(); };
-
   YansoRNG RNG(yanso_function_seed(F, "fla"));
   vector<uint64_t> StateIds(FlattenBlocks.size());
   vector<uint64_t> DispatchHashes(FlattenBlocks.size());
@@ -197,13 +213,13 @@ bool FlatteningPass::flatten(Function &F) {
   }
 
   AllocaInst *HashStatePtr =
-      new AllocaInst(TYPE_I64, 0, "hashState.ptr", Before(EntryToDispatcher));
+      new AllocaInst(TYPE_I64, 0, "hashState.ptr", it(EntryToDispatcher));
   new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
-                Before(EntryToDispatcher));
+                it(EntryToDispatcher));
   AllocaInst *StatePtr =
-      new AllocaInst(TYPE_I64, 0, "state.ptr", Before(EntryToDispatcher));
+      new AllocaInst(TYPE_I64, 0, "state.ptr", it(EntryToDispatcher));
   new StoreInst(CONST_I64(StateIds[EntryIndex]), StatePtr, false, Align(8),
-                Before(EntryToDispatcher));
+                it(EntryToDispatcher));
 
   // Load state, hash it, and switch on the hash value.
   LoadInst *StateLoad =
@@ -251,9 +267,9 @@ bool FlatteningPass::flatten(Function &F) {
                                   Instruction *InsertBefore) -> Value * {
       uint64_t RandomXor = RNG.next64();
       LoadInst *CurState = new LoadInst(TYPE_I64, StatePtr, "state.cur", false,
-                                        Align(8), Before(InsertBefore));
+                                        Align(8), it(InsertBefore));
       Value *TempVal = BinaryOperator::CreateXor(CONST_I64(RandomXor), CurState,
-                                                 "", Before(InsertBefore));
+                                                 "", it(InsertBefore));
       vector<size_t> ShuffledBlocks = BlockOrder;
       RNG.shuffle(ShuffledBlocks);
       int GarbageInterval = ShuffledBlocks.size() / 2;
@@ -262,19 +278,19 @@ bool FlatteningPass::flatten(Function &F) {
         if (D == FalseIndex) {
           TempVal = BinaryOperator::CreateXor(
               CONST_I64(StateIds[CurIndex] ^ StateIds[FalseIndex] ^ RandomXor),
-              TempVal, "", Before(InsertBefore));
+              TempVal, "", it(InsertBefore));
         } else if (D == TrueIndex) {
           Value *MaskVal = BinaryOperator::CreateAnd(
-              new SExtInst(Cond, TYPE_I64, "", Before(InsertBefore)),
+              new SExtInst(Cond, TYPE_I64, "", it(InsertBefore)),
               CONST_I64(StateIds[TrueIndex] ^ StateIds[FalseIndex]), "",
-              Before(InsertBefore));
+              it(InsertBefore));
           TempVal = BinaryOperator::CreateXor(MaskVal, TempVal, "",
-                                              Before(InsertBefore));
+                                              it(InsertBefore));
         } else if (RNG.range(GarbageInterval) == 0) {
           Value *MaskVal = BinaryOperator::CreateAnd(
-              CONST_I64(0), CONST_I64(RNG.next64()), "", Before(InsertBefore));
+              CONST_I64(0), CONST_I64(RNG.next64()), "", it(InsertBefore));
           TempVal = BinaryOperator::CreateXor(MaskVal, TempVal, "",
-                                              Before(InsertBefore));
+                                              it(InsertBefore));
         }
       }
       return TempVal;
@@ -285,16 +301,20 @@ bool FlatteningPass::flatten(Function &F) {
       Value *Next = CreateEncodedState(SuccIndex, CurIndex,
                                        ConstantInt::getFalse(F.getContext()),
                                        InsertBefore);
-      new StoreInst(Next, StatePtr, false, Align(8), Before(InsertBefore));
+      new StoreInst(Next, StatePtr, false, Align(8), it(InsertBefore));
       new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
-                    Before(InsertBefore));
+                    it(InsertBefore));
     };
 
     if (term->getNumSuccessors() == 1 && isa<BranchInst>(term)) {
       BasicBlock *Succ = term->getSuccessor(0);
       size_t FalseIndex = 0;
-      if (!FindDispatcherTarget(Succ, FalseIndex))
+      if (!FindDispatcherTarget(Succ, FalseIndex)) {
+        if (LocalOnlyBlocks.find(Succ) != LocalOnlyBlocks.end())
+          YANSO_ERROR_EDGE("fla", F, *BB, *Succ,
+                          "successor is local-only, leaving direct branch");
         continue;
+      }
       StoreStateTransition(FalseIndex, term);
       term->eraseFromParent();
       BranchInst::Create(DispatcherBB, BB);
@@ -308,18 +328,21 @@ bool FlatteningPass::flatten(Function &F) {
       if (TrueFlat && FalseFlat) {
         Value *Next =
             CreateEncodedState(FalseIndex, TrueIndex, BR->getCondition(), BR);
-        new StoreInst(Next, StatePtr, false, Align(8), Before(BR));
+        new StoreInst(Next, StatePtr, false, Align(8), it(BR));
         new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
-                      Before(BR));
+                      it(BR));
         BR->eraseFromParent();
         BranchInst::Create(DispatcherBB, BB);
       } else if (TrueFlat || FalseFlat) {
-        size_t FlatIndex = TrueFlat ? TrueIndex : FalseIndex;
         BasicBlock *DirectDest = TrueFlat ? FalseSucc : TrueSucc;
+        YANSO_ERROR_EDGE(
+            "fla", F, *BB, *DirectDest,
+            "one conditional successor is local-only/direct; keeping mixed branch");
+        size_t FlatIndex = TrueFlat ? TrueIndex : FalseIndex;
         Value *FlatCond =
             TrueFlat
                 ? BR->getCondition()
-                : BinaryOperator::CreateNot(BR->getCondition(), "", Before(BR));
+                : BinaryOperator::CreateNot(BR->getCondition(), "", it(BR));
         StoreStateTransition(FlatIndex, BR);
         BR->eraseFromParent();
         BranchInst::Create(DispatcherBB, DirectDest, FlatCond, BB);
@@ -338,8 +361,11 @@ bool FlatteningPass::flatten(Function &F) {
         // on the original label body, not on the dispatcher. Rewriting their
         // terminators makes an indirect goto jump into the flattened state
         // machine with a stale state value and can loop in hashMissBB.
-        if (BB->hasAddressTaken())
+        if (BB->hasAddressTaken()) {
+          YANSO_WARN_EDGE("fla", F, *BB, *Succ,
+                          "switch source is address-taken; preserving successor");
           return Succ;
+        }
 
         BasicBlock *TransitionBB =
             BasicBlock::Create(*CONTEXT, "switch.trans", &F, DispatcherBB);
@@ -353,43 +379,23 @@ bool FlatteningPass::flatten(Function &F) {
 
       BasicBlock *NewDefault = GetSwitchSuccessor(SI->getDefaultDest());
       SwitchInst *NewSwitch = SwitchInst::Create(SI->getCondition(), NewDefault,
-                                                 SI->getNumCases(), Before(SI));
+                                                 SI->getNumCases(), it(SI));
       for (auto Case : SI->cases())
         NewSwitch->addCase(Case.getCaseValue(),
                            GetSwitchSuccessor(Case.getCaseSuccessor()));
       SI->eraseFromParent();
     }
   }
-  // Repair PHI nodes and escaped values invalidated by CFG rewriting.
-  vector<PHINode *> fixPHI;
-  vector<Instruction *> fixReg;
+  std::set<Instruction *> SkipRegs{StateLoad, HashStateLoad};
   for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (PHINode *PN = dyn_cast<PHINode>(&I)) {
-        if (LocalOnlyBlocks.find(&BB) == LocalOnlyBlocks.end()) {
-          fixPHI.push_back(PN);
-        }
-      }
-    }
+    if (&BB == DispatcherBB)
+      for (Instruction &I : BB)
+        SkipRegs.insert(&I);
+    for (Instruction &I : BB)
+      if (I.getName().starts_with("state.cur"))
+        SkipRegs.insert(&I);
   }
-  for (PHINode *PN : fixPHI) {
-    DemotePHIToStack(PN);
-  }
-
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (&I == StateLoad || &I == HashStateLoad ||
-          I.getName().starts_with("state.cur") || I.getParent() == DispatcherBB)
-        continue;
-      if (!(isa<AllocaInst>(&I) && I.getParent() == &EntryBB) &&
-          I.isUsedOutsideOfBlock(&BB) && I.getType()->isSized()) {
-        fixReg.push_back(&I);
-      }
-    }
-  }
-  for (Instruction *I : fixReg) {
-    DemoteRegToStack(*I);
-  }
+  yansollvm_fix_stack(&F, &LocalOnlyBlocks, &SkipRegs);
   return true;
 }
 

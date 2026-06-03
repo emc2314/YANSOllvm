@@ -1,4 +1,5 @@
 #include "YANSOllvmCommon.h"
+#include "Utils.h"
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
@@ -10,6 +11,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -83,7 +85,9 @@ bool isPrime(uint32_t Number) {
 }
 } // namespace
 
-void llvm::yansollvm_fix_stack(Function *F) {
+void llvm::yansollvm_fix_stack(Function *F,
+                               const std::set<BasicBlock *> *SkipPhiBlocks,
+                               const std::set<Instruction *> *SkipRegs) {
   std::vector<PHINode *> TmpPhi;
   std::vector<Instruction *> TmpReg;
   BasicBlock *Entry = &F->getEntryBlock();
@@ -93,9 +97,12 @@ void llvm::yansollvm_fix_stack(Function *F) {
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
         if (auto *Phi = dyn_cast<PHINode>(&I)) {
-          TmpPhi.push_back(Phi);
+          if (!SkipPhiBlocks || !SkipPhiBlocks->count(&BB))
+            TmpPhi.push_back(Phi);
           continue;
         }
+        if (SkipRegs && SkipRegs->count(&I))
+          continue;
         if (!(isa<AllocaInst>(&I) && I.getParent() == Entry) &&
             (valueEscapes(&I) || I.isUsedOutsideOfBlock(&BB))) {
           TmpReg.push_back(&I);
@@ -103,9 +110,7 @@ void llvm::yansollvm_fix_stack(Function *F) {
         }
       }
     }
-    BasicBlock::iterator AllocaPoint = Entry->begin();
-    while (AllocaPoint != Entry->end() && isa<AllocaInst>(AllocaPoint))
-      ++AllocaPoint;
+    BasicBlock::iterator AllocaPoint = firstNonAlloca(*Entry);
     for (Instruction *I : TmpReg)
       DemoteRegToStack(*I, false, AllocaPoint);
     for (PHINode *Phi : TmpPhi)

@@ -35,32 +35,37 @@
 // This file implements BogusControlFlow's pass, inserting bogus control flow.
 // It adds bogus flow to a given basic block this way:
 //
-// Before :
-// 	         		     entry
-//      			       |
-//  	    	  	 ______v______
-//   	    		|   Original  |
-//   	    		|_____________|
-//             		       |
-// 		        	       v
-//		        	     return
+// Before:
 //
-// After :
-//           		     entry
-//             		       |
-//            		   ____v_____
-//      			  |condition*| (false)
-//           		  |__________|----+
-//           		 (true)|          |
-//             		       |          |
-//           		 ______v______    |
-// 		        +-->|   Original* |   |
-// 		        |   |_____________| (true)
-// 		        |   (false)|    !-----------> return
-// 		        |    ______v______    |
-// 		        |   |   Altered   |<--!
-// 		        |   |_____________|
-// 		        |__________|
+//     entry
+//       |
+//       v
+//   +----------+
+//   | Original |
+//   +----------+
+//       |
+//       v
+//   original successor
+//
+// After addBogusFlow():
+//
+//     entry / first part
+//       |
+//       | condition == true
+//       v
+//   +-------------+   condition2 == true   +-----------------+
+//   | Original    | ---------------------> | Original part 2 |
+//   | body part 1 |                        | old terminator  |
+//   +-------------+                        +-----------------+
+//       |                                      |
+//       | condition2 == false                  v
+//       v                                  original successor
+//   +-------------+
+//   | Altered     |
+//   | clone/junk  |
+//   +-------------+
+//       |
+//       +---------> Original body part 1
 //
 //  * The results of these terminator's branch's conditions are always true, but
 //  these predicates are
@@ -168,6 +173,7 @@ PreservedAnalyses BogusControlFlowPass::run(Function &F,
     return PreservedAnalyses::all();
   }
   if (F.isVarArg()) {
+    YANSO_WARN_FUNCTION("bcf", F, "vararg function");
     return PreservedAnalyses::all();
   }
   // If bcf annotations

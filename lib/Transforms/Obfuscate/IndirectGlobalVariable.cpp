@@ -26,6 +26,7 @@ PreservedAnalyses IndirectGlobalVariablePass::run(Module &M,
     }
 
     if (Options && Options->skipFunction(Fn.getName())) {
+      YANSO_WARN_FUNCTION("igv", Fn, "filtered/internal yansollvm function");
       continue;
     }
 
@@ -38,6 +39,7 @@ PreservedAnalyses IndirectGlobalVariablePass::run(Module &M,
     NumberGlobalVariable(Fn);
 
     if (GlobalVariables.empty()) {
+      YANSO_WARN_FUNCTION("igv", Fn, "no eligible global variable operands");
       continue;
     }
 

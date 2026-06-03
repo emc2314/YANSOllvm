@@ -302,6 +302,7 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
     return false;
   }
   if (Options && Options->skipFunction(F->getName())) {
+    YANSO_WARN_FUNCTION("sobf", *F, "filtered/internal yansollvm function");
     return false;
   }
   LowerConstantExpr(*F);

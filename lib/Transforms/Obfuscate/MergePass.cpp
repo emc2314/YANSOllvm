@@ -1,5 +1,6 @@
 #include "CryptoUtils.h"
 #include "YANSOllvmCommon.h"
+#include "Utils.h"
 
 #include "YANSOllvmSeed.h"
 #include "llvm/IR/Constants.h"
@@ -24,8 +25,12 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
         (F.getReturnType()->isIntOrPtrTy() || F.getReturnType()->isVoidTy()))
       MergeList.push_back(&F);
   }
-  if (MergeList.size() < 2)
+  if (MergeList.size() < 2) {
+    YANSO_WARN_MODULE(
+        "merge", M,
+        "fewer than two eligible internal non-vararg int/pointer/void-return functions");
     return PreservedAnalyses::all();
+  }
 
   size_t RetBitLen = 64;
   std::string FuncName;
@@ -95,7 +100,7 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
             OtherArgs.push_back(Arg);
         } else if (isa<PointerType>(Ty)) {
           I64Args.push_back(
-              new PtrToIntInst(Arg, I64, "", Call->getIterator()));
+              new PtrToIntInst(Arg, I64, "", it(Call)));
         } else {
           OtherArgs.push_back(Arg);
         }
@@ -122,15 +127,15 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
         }
       }
       CallInst *NewCall =
-          CallInst::Create(NewFunction, CallArgs, "", Call->getIterator());
+          CallInst::Create(NewFunction, CallArgs, "", it(Call));
       if (MergeList[I]->getReturnType()->isVoidTy()) {
       } else if (MergeList[I]->getReturnType()->isPointerTy()) {
         Call->replaceAllUsesWith(new IntToPtrInst(
-            NewCall, MergeList[I]->getReturnType(), "", Call->getIterator()));
+            NewCall, MergeList[I]->getReturnType(), "", it(Call)));
       } else if (cast<IntegerType>(MergeList[I]->getReturnType())
                      ->getBitWidth() < RetBitLen) {
         Call->replaceAllUsesWith(new TruncInst(
-            NewCall, MergeList[I]->getReturnType(), "", Call->getIterator()));
+            NewCall, MergeList[I]->getReturnType(), "", it(Call)));
       } else {
         Call->replaceAllUsesWith(NewCall);
       }

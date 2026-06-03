@@ -154,7 +154,7 @@ void llvm::LowerConstantExpr(Function &F) {
         if (ConstantExpr *C =
                 dyn_cast<ConstantExpr>(PHI->getIncomingValue(i))) {
           Instruction *NewInst = C->getAsInstruction();
-          NewInst->insertBefore(TI->getIterator());
+          NewInst->insertBefore(it(TI));
           PHI->setIncomingValue(i, NewInst);
           WorkList.insert(NewInst);
         }
@@ -163,7 +163,7 @@ void llvm::LowerConstantExpr(Function &F) {
       for (unsigned int i = 0; i < I->getNumOperands(); ++i) {
         if (ConstantExpr *C = dyn_cast<ConstantExpr>(I->getOperand(i))) {
           Instruction *NewInst = C->getAsInstruction();
-          NewInst->insertBefore(I->getIterator());
+          NewInst->insertBefore(it(I));
           I->setOperand(i, NewInst);
           WorkList.insert(NewInst);
         }

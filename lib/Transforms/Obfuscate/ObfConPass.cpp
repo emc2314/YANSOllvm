@@ -1,5 +1,6 @@
 #include "CryptoUtils.h"
 #include "YANSOllvmCommon.h"
+#include "Utils.h"
 
 #include "YANSOllvmSeed.h"
 #include "llvm/IR/Constants.h"
@@ -56,11 +57,11 @@ class ObfConImpl {
       BinaryOperator *RV1 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "",
-          Inst.getIterator());
+          it(Inst));
       BinaryOperator *RV2 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, yansollvm_mod_inv(RandV) * V),
-          ConstantInt::get(I64, 0), "", Inst.getIterator());
+          ConstantInt::get(I64, 0), "", it(Inst));
       Replaced = B.CreateMul(RV1, RV2);
       break;
     }
@@ -69,11 +70,11 @@ class ObfConImpl {
       BinaryOperator *RV1 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "",
-          Inst.getIterator());
+          it(Inst));
       BinaryOperator *RV2 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, RandV ^ V), ConstantInt::get(I64, 0), "",
-          Inst.getIterator());
+          it(Inst));
       Replaced = B.CreateXor(RV1, RV2);
       break;
     }
@@ -82,11 +83,11 @@ class ObfConImpl {
       BinaryOperator *RV1 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "",
-          Inst.getIterator());
+          it(Inst));
       BinaryOperator *RV2 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, V - RandV), ConstantInt::get(I64, 0), "",
-          Inst.getIterator());
+          it(Inst));
       Replaced = B.CreateAdd(RV1, RV2);
     }
     }
