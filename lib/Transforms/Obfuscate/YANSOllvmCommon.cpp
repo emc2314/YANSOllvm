@@ -28,6 +28,15 @@ bool valueEscapes(Instruction *Inst) {
   return false;
 }
 
+bool shouldDemoteReg(Instruction *I, BasicBlock *Entry,
+                     const std::set<Instruction *> *SkipRegs) {
+  if (SkipRegs && SkipRegs->count(I))
+    return false;
+  if (isa<AllocaInst>(I) && I->getParent() == Entry)
+    return false;
+  return valueEscapes(I) || I->isUsedOutsideOfBlock(I->getParent());
+}
+
 uint64_t powerMod(uint32_t A, uint32_t N, uint32_t Mod) {
   uint64_t Power = A, Result = 1;
   while (N) {
@@ -101,20 +110,24 @@ void llvm::yansollvm_fix_stack(Function *F,
             TmpPhi.push_back(Phi);
           continue;
         }
-        if (SkipRegs && SkipRegs->count(&I))
-          continue;
-        if (!(isa<AllocaInst>(&I) && I.getParent() == Entry) &&
-            (valueEscapes(&I) || I.isUsedOutsideOfBlock(&BB))) {
+        if (shouldDemoteReg(&I, Entry, SkipRegs)) {
           TmpReg.push_back(&I);
           continue;
         }
       }
     }
     BasicBlock::iterator AllocaPoint = firstNonAlloca(*Entry);
-    for (Instruction *I : TmpReg)
-      DemoteRegToStack(*I, false, AllocaPoint);
-    for (PHINode *Phi : TmpPhi)
-      DemotePHIToStack(Phi, AllocaPoint);
+    if (!TmpReg.empty()) {
+      Instruction *Reg = TmpReg.front();
+      DemoteRegToStack(*Reg, false, AllocaPoint);
+      if (SkipRegs && isa<InvokeInst>(Reg))
+        const_cast<std::set<Instruction *> *>(SkipRegs)->insert(Reg);
+      continue;
+    }
+    if (!TmpPhi.empty()) {
+      DemotePHIToStack(TmpPhi.front(), AllocaPoint);
+      continue;
+    }
   } while (!TmpReg.empty() || !TmpPhi.empty());
 }
 

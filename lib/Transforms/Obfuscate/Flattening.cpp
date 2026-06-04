@@ -34,9 +34,8 @@ bool FlatteningPass::flatten(Function &F) {
     return false;
   }
 
-  if (F.hasPersonalityFn()) {
-    YANSO_WARN_FUNCTION("fla", F,
-                        "personality/EH function until EH regions are modeled");
+  if (F.hasFnAttribute(Attribute::Cold)) {
+    YANSO_WARN_FUNCTION("fla", F, "cold function");
     return false;
   }
 
@@ -44,7 +43,25 @@ bool FlatteningPass::flatten(Function &F) {
     return false;
   }
 
-  yansollvm_fix_stack(&F);
+  // Very large optimized loop nests can make the current flattening state
+  // machine explode enough to look hung under lit/test-suite. Keep them as
+  // explicit, diagnosed coverage skips until region construction is cheaper.
+  if (F.size() > 32) {
+    YANSO_WARN_FUNCTION("fla", F, "function has too many basic blocks");
+    return false;
+  }
+
+  set<Instruction *> PreDemoteSkipRegs;
+  set<BasicBlock *> PreDemoteSkipPhiBlocks;
+  for (BasicBlock &BB : F) {
+    if (BB.isEHPad())
+      PreDemoteSkipPhiBlocks.insert(&BB);
+    for (Instruction &I : BB)
+      if (!I.getType()->isSized() || isa<LandingPadInst>(&I) ||
+          isa<FuncletPadInst>(&I))
+        PreDemoteSkipRegs.insert(&I);
+  }
+  yansollvm_fix_stack(&F, &PreDemoteSkipPhiBlocks, &PreDemoteSkipRegs);
 
   vector<BasicBlock *> TrivialBlocks;
   BasicBlock *OriginalEntry = &F.getEntryBlock();
@@ -56,6 +73,19 @@ bool FlatteningPass::flatten(Function &F) {
       TrivialBlocks.push_back(&BB);
   }
   for (BasicBlock *BB : TrivialBlocks) {
+    if (BB->isEHPad())
+      continue;
+    bool HasEHPred = false;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      Instruction *PredTerm = Pred->getTerminator();
+      if (isa<InvokeInst>(PredTerm) || isa<CatchSwitchInst>(PredTerm) ||
+          isa<CatchReturnInst>(PredTerm) || isa<CleanupReturnInst>(PredTerm)) {
+        HasEHPred = true;
+        break;
+      }
+    }
+    if (HasEHPred)
+      continue;
     if (BB->hasNPredecessors(1))
       BB->replaceSuccessorsPhiUsesWith(BB->getSinglePredecessor());
     vector<BasicBlock *> TrivialPreds;
@@ -94,7 +124,62 @@ bool FlatteningPass::flatten(Function &F) {
     EntryTarget = EntryRegion;
   }
 
-  set<BasicBlock *> LocalOnlyBlocks;
+  unordered_map<BasicBlock *, size_t> BlockToIndex;
+  for (size_t I = 0; I < FlattenBlocks.size(); ++I)
+    BlockToIndex[FlattenBlocks[I]] = I;
+
+  set<pair<BasicBlock *, BasicBlock *>> AtomicEdges;
+  set<BasicBlock *> NoFlattenEntryBlocks;
+  set<BasicBlock *> FlattenEntryBlocks;
+  vector<size_t> RegionParent(FlattenBlocks.size());
+  iota(RegionParent.begin(), RegionParent.end(), 0);
+  auto FindRegion = [&](size_t I) {
+    while (RegionParent[I] != I) {
+      RegionParent[I] = RegionParent[RegionParent[I]];
+      I = RegionParent[I];
+    }
+    return I;
+  };
+  auto UnionRegion = [&](BasicBlock *A, BasicBlock *B) {
+    auto AI = BlockToIndex.find(A);
+    auto BI = BlockToIndex.find(B);
+    if (AI == BlockToIndex.end() || BI == BlockToIndex.end())
+      return;
+    size_t AR = FindRegion(AI->second);
+    size_t BR = FindRegion(BI->second);
+    if (AR != BR)
+      RegionParent[BR] = AR;
+  };
+  auto AddAtomicEdge = [&](BasicBlock *A, BasicBlock *B, StringRef Reason) {
+    if (!A || !B || !is_contained(FlattenBlocks, A) ||
+        !is_contained(FlattenBlocks, B))
+      return;
+    AtomicEdges.insert({A, B});
+    UnionRegion(A, B);
+    YANSO_WARN_EDGE("fla", F, *A, *B, Reason);
+  };
+  auto IsAtomicEdge = [&](BasicBlock *A, BasicBlock *B) {
+    return AtomicEdges.count({A, B}) != 0;
+  };
+  auto HasFuncletPad = [](BasicBlock *BB) {
+    if (!BB)
+      return false;
+    for (Instruction &I : *BB) {
+      if (isa<FuncletPadInst>(&I))
+        return true;
+      if (!isa<PHINode>(&I))
+        break;
+    }
+    return false;
+  };
+  auto HasFuncletOperandBundle = [](BasicBlock *BB) {
+    for (Instruction &I : *BB) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (CB && CB->getOperandBundle(LLVMContext::OB_funclet).has_value())
+        return true;
+    }
+    return false;
+  };
   DominatorTree DT(F);
   for (BasicBlock *BB : FlattenBlocks) {
     Instruction *Term = BB->getTerminator();
@@ -103,15 +188,19 @@ bool FlatteningPass::flatten(Function &F) {
       return false;
     }
     if (BB->hasAddressTaken()) {
-      LocalOnlyBlocks.insert(BB);
+      NoFlattenEntryBlocks.insert(BB);
       YANSO_WARN_BLOCK("fla", F, *BB, "address-taken block");
+    }
+    if (BB->isEHPad()) {
+      NoFlattenEntryBlocks.insert(BB);
+      YANSO_WARN_BLOCK("fla", F, *BB, "EH pad dispatcher entry disabled");
     }
     for (Instruction &I : *BB) {
       if (PHINode *P = dyn_cast<PHINode>(&I)) {
         for (unsigned i = 0, e = P->getNumIncomingValues(); i < e; ++i) {
           if (InvokeInst *II = dyn_cast<InvokeInst>(P->getIncomingValue(i))) {
             if (II->getParent() == P->getIncomingBlock(i)) {
-              LocalOnlyBlocks.insert(BB);
+              NoFlattenEntryBlocks.insert(BB);
               YANSO_ERROR_BLOCK("fla", F, *BB,
                                "PHI incoming value is invoke result");
             }
@@ -127,13 +216,13 @@ bool FlatteningPass::flatten(Function &F) {
               UseBB = II->getParent();
             if (UseBB != BB) {
               if (UseBB)
-                LocalOnlyBlocks.insert(UseBB);
+                NoFlattenEntryBlocks.insert(UseBB);
               YANSO_ERROR_BLOCK("fla", F, *BB,
                                 "unsized value used across block boundary");
               for (BasicBlock *midBB : FlattenBlocks) {
                 if (UseBB && midBB != BB && midBB != UseBB &&
                     DT.dominates(midBB, UseBB) && DT.dominates(BB, midBB)) {
-                  LocalOnlyBlocks.insert(midBB);
+                  NoFlattenEntryBlocks.insert(midBB);
                   YANSO_ERROR_BLOCK(
                       "fla", F, *midBB,
                       "dominates local-only block using unsized cross-block value");
@@ -146,16 +235,98 @@ bool FlatteningPass::flatten(Function &F) {
     }
     Instruction *term = BB->getTerminator();
     if (auto *II = dyn_cast<InvokeInst>(term)) {
-      LocalOnlyBlocks.insert(II->getUnwindDest());
-      YANSO_WARN_BLOCK("fla", F, *II->getUnwindDest(), "invoke unwind destination");
+      if (!II->getType()->isVoidTy())
+        AddAtomicEdge(BB, II->getNormalDest(), "invoke result normal edge");
+      AddAtomicEdge(BB, II->getUnwindDest(), "EH invoke unwind edge");
     } else if (auto *CRI = dyn_cast<CleanupReturnInst>(term)) {
-      LocalOnlyBlocks.insert(CRI->getUnwindDest());
-      YANSO_WARN_BLOCK("fla", F, *CRI->getUnwindDest(),
-                       "cleanupret unwind destination");
+      AddAtomicEdge(BB, CRI->getUnwindDest(), "EH cleanup unwind edge");
     } else if (auto *CSI = dyn_cast<CatchSwitchInst>(term)) {
-      LocalOnlyBlocks.insert(CSI->getUnwindDest());
-      YANSO_WARN_BLOCK("fla", F, *CSI->getUnwindDest(),
-                       "catchswitch unwind destination");
+      for (BasicBlock *Handler : CSI->handlers())
+        AddAtomicEdge(BB, Handler, "EH catchswitch handler edge");
+      if (BasicBlock *UnwindDest = CSI->getUnwindDest())
+        AddAtomicEdge(BB, UnwindDest, "EH catchswitch unwind edge");
+    } else if (auto *CRI = dyn_cast<CatchReturnInst>(term)) {
+      AddAtomicEdge(BB, CRI->getSuccessor(), "EH catchret edge");
+    }
+    if (BB->isEHPad() || HasFuncletPad(BB) || HasFuncletOperandBundle(BB)) {
+      for (BasicBlock *Succ : successors(BB)) {
+        if (!IsAtomicEdge(BB, Succ))
+          AddAtomicEdge(BB, Succ, "EH funclet-internal edge");
+      }
+    }
+  }
+
+  struct RegionInfo {
+    vector<BasicBlock *> Blocks;
+    vector<BasicBlock *> Entries;
+    vector<BasicBlock *> Exits;
+  };
+
+  DenseMap<size_t, RegionInfo> Regions;
+  auto AddUniqueBlock = [](vector<BasicBlock *> &Blocks, BasicBlock *BB) {
+    if (!is_contained(Blocks, BB))
+      Blocks.push_back(BB);
+  };
+  auto RegionOf = [&](BasicBlock *BB) -> size_t {
+    return FindRegion(BlockToIndex[BB]);
+  };
+  for (BasicBlock *BB : FlattenBlocks)
+    AddUniqueBlock(Regions[RegionOf(BB)].Blocks, BB);
+
+  auto AddFlattenEntry = [&](BasicBlock *BB) {
+    auto It = BlockToIndex.find(BB);
+    if (It == BlockToIndex.end() || NoFlattenEntryBlocks.count(BB))
+      return;
+    FlattenEntryBlocks.insert(BB);
+    AddUniqueBlock(Regions[FindRegion(It->second)].Entries, BB);
+  };
+  if (EntryTarget)
+    AddFlattenEntry(EntryTarget);
+  for (BasicBlock *BB : FlattenBlocks) {
+    for (BasicBlock *Succ : successors(BB)) {
+      auto SuccIt = BlockToIndex.find(Succ);
+      if (SuccIt == BlockToIndex.end() || IsAtomicEdge(BB, Succ))
+        continue;
+      size_t SrcRegion = RegionOf(BB);
+      size_t DstRegion = FindRegion(SuccIt->second);
+      if (SrcRegion != DstRegion) {
+        AddUniqueBlock(Regions[SrcRegion].Exits, BB);
+        AddFlattenEntry(Succ);
+      }
+    }
+  }
+
+  vector<size_t> StateSourceIndex(FlattenBlocks.size());
+  iota(StateSourceIndex.begin(), StateSourceIndex.end(), 0);
+  vector<bool> HasKnownStateSource(FlattenBlocks.size(), false);
+  vector<set<size_t>> PossibleStateSources(FlattenBlocks.size());
+  vector<pair<size_t, size_t>> StateWorklist;
+  auto AddPossibleStateSource = [&](BasicBlock *BB, size_t SourceIndex) {
+    auto It = BlockToIndex.find(BB);
+    if (It == BlockToIndex.end())
+      return;
+    size_t BlockIndex = It->second;
+    if (PossibleStateSources[BlockIndex].insert(SourceIndex).second)
+      StateWorklist.push_back({BlockIndex, SourceIndex});
+  };
+  for (BasicBlock *Entry : FlattenEntryBlocks)
+    AddPossibleStateSource(Entry, BlockToIndex[Entry]);
+  while (!StateWorklist.empty()) {
+    auto [BlockIndex, SourceIndex] = StateWorklist.back();
+    StateWorklist.pop_back();
+    BasicBlock *BB = FlattenBlocks[BlockIndex];
+    for (BasicBlock *Succ : successors(BB)) {
+      auto SuccIt = BlockToIndex.find(Succ);
+      if (SuccIt == BlockToIndex.end())
+        continue;
+      if (IsAtomicEdge(BB, Succ) || RegionOf(BB) == FindRegion(SuccIt->second))
+        AddPossibleStateSource(Succ, SourceIndex);
+    }
+  }
+  for (size_t I = 0; I < FlattenBlocks.size(); ++I) {
+    if (PossibleStateSources[I].size() == 1) {
+      StateSourceIndex[I] = *PossibleStateSources[I].begin();
+      HasKnownStateSource[I] = true;
     }
   }
 
@@ -175,10 +346,7 @@ bool FlatteningPass::flatten(Function &F) {
   vector<uint64_t> DispatchHashes(FlattenBlocks.size());
   unordered_set<uint64_t> UsedIndex;
   unordered_set<uint64_t> UsedHash;
-  unordered_map<BasicBlock *, size_t> BlockToIndex;
   for (size_t I = 0; I < FlattenBlocks.size(); ++I) {
-    BlockToIndex[FlattenBlocks[I]] = I;
-
     bool Accepted = false;
     for (unsigned Attempt = 0; Attempt < 1024 && !Accepted; ++Attempt) {
       uint64_t Index = 0;
@@ -252,7 +420,8 @@ bool FlatteningPass::flatten(Function &F) {
   for (size_t SeqIdx : BlockOrder) {
     BasicBlock *BB = FlattenBlocks[SeqIdx];
     BB->moveBefore(DispatcherBB);
-    if (LocalOnlyBlocks.find(BB) == LocalOnlyBlocks.end())
+    if (FlattenEntryBlocks.count(BB) &&
+        NoFlattenEntryBlocks.find(BB) == NoFlattenEntryBlocks.end())
       DispatcherSwitch->addCase(CONST_I64(DispatchHashes[SeqIdx]), BB);
   }
 
@@ -271,7 +440,9 @@ bool FlatteningPass::flatten(Function &F) {
                          "successor is outside flatten block set");
         return false;
       }
-      if (LocalOnlyBlocks.find(Succ) != LocalOnlyBlocks.end())
+      if (NoFlattenEntryBlocks.find(Succ) != NoFlattenEntryBlocks.end())
+        return false;
+      if (!FlattenEntryBlocks.count(Succ))
         return false;
       OutIndex = It->second;
       return true;
@@ -279,6 +450,7 @@ bool FlatteningPass::flatten(Function &F) {
     auto CreateEncodedState = [&](size_t FalseIndex, size_t TrueIndex,
                                   Value *Cond,
                                   Instruction *InsertBefore) -> Value * {
+      size_t FromIndex = StateSourceIndex[CurIndex];
       uint64_t RandomXor = RNG.next64();
       LoadInst *CurState = new LoadInst(TYPE_I64, StatePtr, "state.cur", false,
                                         Align(8), it(InsertBefore));
@@ -291,7 +463,7 @@ bool FlatteningPass::flatten(Function &F) {
       for (size_t D : ShuffledBlocks) {
         if (D == FalseIndex) {
           TempVal = BinaryOperator::CreateXor(
-              CONST_I64(StateIds[CurIndex] ^ StateIds[FalseIndex] ^ RandomXor),
+              CONST_I64(StateIds[FromIndex] ^ StateIds[FalseIndex] ^ RandomXor),
               TempVal, "", it(InsertBefore));
         } else if (D == TrueIndex) {
           Value *MaskVal = BinaryOperator::CreateAnd(
@@ -310,8 +482,20 @@ bool FlatteningPass::flatten(Function &F) {
       return TempVal;
     };
 
+    auto StoreAbsoluteStateTransition = [&](size_t SuccIndex,
+                                            Instruction *InsertBefore) {
+      new StoreInst(CONST_I64(StateIds[SuccIndex]), StatePtr, false, Align(8),
+                    it(InsertBefore));
+      new StoreInst(CONST_I64(YansoMixBasis), HashStatePtr, false, Align(8),
+                    it(InsertBefore));
+    };
+
     auto StoreStateTransition = [&](size_t SuccIndex,
                                     Instruction *InsertBefore) {
+      if (!HasKnownStateSource[CurIndex]) {
+        StoreAbsoluteStateTransition(SuccIndex, InsertBefore);
+        return;
+      }
       Value *Next = CreateEncodedState(SuccIndex, CurIndex,
                                        ConstantInt::getFalse(F.getContext()),
                                        InsertBefore);
@@ -320,13 +504,27 @@ bool FlatteningPass::flatten(Function &F) {
                     it(InsertBefore));
     };
 
+    auto CreateTransitionBlock = [&](BasicBlock *Succ,
+                                     StringRef Name) -> BasicBlock * {
+      size_t SuccIndex = 0;
+      if (!FindDispatcherTarget(Succ, SuccIndex))
+        return Succ;
+      BasicBlock *TransitionBB =
+          BasicBlock::Create(*CONTEXT, Name, &F, DispatcherBB);
+      BranchInst *ToDispatch = BranchInst::Create(DispatcherBB, TransitionBB);
+      StoreStateTransition(SuccIndex, ToDispatch);
+      return TransitionBB;
+    };
+
     if (term->getNumSuccessors() == 1 && isa<BranchInst>(term)) {
       BasicBlock *Succ = term->getSuccessor(0);
+      if (IsAtomicEdge(BB, Succ))
+        continue;
       size_t FalseIndex = 0;
       if (!FindDispatcherTarget(Succ, FalseIndex)) {
-        if (LocalOnlyBlocks.find(Succ) != LocalOnlyBlocks.end())
+        if (NoFlattenEntryBlocks.find(Succ) != NoFlattenEntryBlocks.end())
           YANSO_ERROR_EDGE("fla", F, *BB, *Succ,
-                          "successor is local-only, leaving direct branch");
+                          "successor has no dispatcher entry, leaving direct branch");
         continue;
       }
       StoreStateTransition(FalseIndex, term);
@@ -337,9 +535,12 @@ bool FlatteningPass::flatten(Function &F) {
       BasicBlock *TrueSucc = BR->getSuccessor(0);
       BasicBlock *FalseSucc = BR->getSuccessor(1);
       size_t TrueIndex = 0, FalseIndex = 0;
-      bool TrueFlat = FindDispatcherTarget(TrueSucc, TrueIndex);
-      bool FalseFlat = FindDispatcherTarget(FalseSucc, FalseIndex);
-      if (TrueFlat && FalseFlat) {
+      bool TrueAtomic = IsAtomicEdge(BB, TrueSucc);
+      bool FalseAtomic = IsAtomicEdge(BB, FalseSucc);
+      bool TrueFlat = !TrueAtomic && FindDispatcherTarget(TrueSucc, TrueIndex);
+      bool FalseFlat = !FalseAtomic && FindDispatcherTarget(FalseSucc, FalseIndex);
+      if (TrueFlat && FalseFlat &&
+          HasKnownStateSource[CurIndex]) {
         Value *Next =
             CreateEncodedState(FalseIndex, TrueIndex, BR->getCondition(), BR);
         new StoreInst(Next, StatePtr, false, Align(8), it(BR));
@@ -348,22 +549,27 @@ bool FlatteningPass::flatten(Function &F) {
         BR->eraseFromParent();
         BranchInst::Create(DispatcherBB, BB);
       } else if (TrueFlat || FalseFlat) {
-        BasicBlock *DirectDest = TrueFlat ? FalseSucc : TrueSucc;
-        YANSO_ERROR_EDGE(
-            "fla", F, *BB, *DirectDest,
-            "one conditional successor is local-only/direct; keeping mixed branch");
-        size_t FlatIndex = TrueFlat ? TrueIndex : FalseIndex;
-        Value *FlatCond =
-            TrueFlat
-                ? BR->getCondition()
-                : BinaryOperator::CreateNot(BR->getCondition(), "", it(BR));
-        StoreStateTransition(FlatIndex, BR);
+        BasicBlock *TrueDest = TrueSucc;
+        BasicBlock *FalseDest = FalseSucc;
+        if (TrueFlat)
+          TrueDest = CreateTransitionBlock(TrueSucc, "cond.trans");
+        if (FalseFlat)
+          FalseDest = CreateTransitionBlock(FalseSucc, "cond.trans");
+        Value *Cond = BR->getCondition();
         BR->eraseFromParent();
-        BranchInst::Create(DispatcherBB, DirectDest, FlatCond, BB);
+        BranchInst::Create(TrueDest, FalseDest, Cond, BB);
+      }
+    } else if (InvokeInst *II = dyn_cast<InvokeInst>(term)) {
+      BasicBlock *NormalSucc = II->getNormalDest();
+      if (!IsAtomicEdge(BB, NormalSucc)) {
+        BasicBlock *NormalDest = CreateTransitionBlock(NormalSucc, "invoke.trans");
+        II->setNormalDest(NormalDest);
       }
     } else if (SwitchInst *SI = dyn_cast<SwitchInst>(term)) {
       unordered_map<BasicBlock *, BasicBlock *> TransitionForTarget;
       auto GetSwitchSuccessor = [&](BasicBlock *Succ) -> BasicBlock * {
+        if (IsAtomicEdge(BB, Succ))
+          return Succ;
         size_t SuccIndex = 0;
         if (!FindDispatcherTarget(Succ, SuccIndex))
           return Succ;

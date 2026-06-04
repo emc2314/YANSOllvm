@@ -4,7 +4,7 @@ import lit.formats
 
 config.name = 'yansollvm'
 config.test_format = lit.formats.ShTest(True)
-config.suffixes = ['.c', '.ll']
+config.suffixes = ['.c', '.cpp', '.ll']
 config.test_source_root = os.path.dirname(__file__)
 config.test_exec_root = config.test_source_root
 
@@ -18,4 +18,5 @@ plugin = os.environ.get(
 
 config.substitutions.append(('%clang', os.path.join(llvm_build, 'bin', 'clang')))
 config.substitutions.append(('%opt', os.path.join(llvm_build, 'bin', 'opt')))
+config.substitutions.append(('%lli', os.path.join(llvm_build, 'bin', 'lli')))
 config.substitutions.append(('%plugin', plugin))

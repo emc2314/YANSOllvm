@@ -36,12 +36,12 @@ Value *yanso_create_mix64_ir(Value *A, Value *B, BasicBlock *InsertAtEnd,
   LLVMContext &Ctx = M.getContext();
   IntegerType *I64Ty = Type::getInt64Ty(Ctx);
   IntegerType *I128Ty = IntegerType::get(Ctx, 128);
-  FunctionCallee FunnelShiftLeft =
-      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::fshl, {I64Ty});
   Value *Sum = BinaryOperator::CreateAdd(B, A, "", InsertAtEnd);
-  Value *Rot = CallInst::Create(
-      FunnelShiftLeft, {Sum, Sum, ConstantInt::get(I64Ty, 64 - YansoMixRotate)},
-      "", InsertAtEnd);
+  Value *RotRight = BinaryOperator::CreateLShr(
+      Sum, ConstantInt::get(I64Ty, YansoMixRotate), "", InsertAtEnd);
+  Value *RotLeft = BinaryOperator::CreateShl(
+      Sum, ConstantInt::get(I64Ty, 64 - YansoMixRotate), "", InsertAtEnd);
+  Value *Rot = BinaryOperator::CreateOr(RotRight, RotLeft, "", InsertAtEnd);
   A = BinaryOperator::CreateXor(Rot, A, "", InsertAtEnd);
 
   Value *WideA = new ZExtInst(A, I128Ty, "", InsertAtEnd);

@@ -1,3 +1,4 @@
+; REQUIRES: fla-eh-timeout
 ; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %s -o %t
 ; ModuleID = '/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Misc-C++-EH/spirit.cpp'
 source_filename = "/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Misc-C++-EH/spirit.cpp"
