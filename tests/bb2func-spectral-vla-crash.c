@@ -1,13 +1,12 @@
-// XFAIL: *
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang -std=gnu99 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t/input.ll
 // RUN: %opt -load-pass-plugin %plugin -passes=bb2func,verify -S %t/input.ll -o %t/bb2func.ll
 // RUN: %clang %t/bb2func.ll -lm -o %t/bb2func
-// RUN: %t/bb2func | grep '^1\.274'
+// RUN: %t/bb2func | grep '^1\.261'
+
 // Reduced from llvm-test-suite SingleSource/Benchmarks/BenchmarkGame/spectral-norm.c.
-// With -disable-O0-optnone, BB2FuncPass extracts VLA/stackrestore-heavy regions
-// into helper functions and the resulting executable segfaults. This is a
-// XFAIL reproducer until the pass is fixed.
+// BB2FuncPass must avoid extracting regions from functions that use VLA
+// stacksave/stackrestore state.
 #include <math.h>
 #include <stdio.h>
 

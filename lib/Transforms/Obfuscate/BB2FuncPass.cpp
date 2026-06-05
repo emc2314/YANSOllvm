@@ -2,7 +2,7 @@
 
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/Function.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 
 #include <algorithm>
@@ -11,6 +11,20 @@
 
 using namespace llvm;
 
+static bool hasDynamicStackState(BasicBlock &BB) {
+  for (Instruction &I : BB) {
+    if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+      if (AI->isArrayAllocation())
+        return true;
+    } else if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+      if (II->getIntrinsicID() == Intrinsic::stacksave ||
+          II->getIntrinsicID() == Intrinsic::stackrestore)
+        return true;
+    }
+  }
+  return false;
+}
+
 PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
   if (!Enabled || F.getEntryBlock().getName() == "newFuncRoot")
     return PreservedAnalyses::all();
@@ -18,7 +32,7 @@ PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
   bool Modified = false;
   std::list<BasicBlock *> BBList;
   for (BasicBlock &BB : F) {
-    if (BB.size() > 4) {
+    if (BB.size() > 4 && !hasDynamicStackState(BB)) {
       std::vector<BasicBlock *> Blocks{&BB};
       CodeExtractor CE(Blocks);
       if (CE.isEligible())
@@ -53,6 +67,7 @@ PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
       continue;
     CodeExtractorAnalysisCache CEAC(F);
     if (Function *Extracted = CE.extractCodeRegion(CEAC)) {
+      Extracted->removeFnAttr(Attribute::AlwaysInline);
       Extracted->addFnAttr(Attribute::NoInline);
       Modified = true;
     }

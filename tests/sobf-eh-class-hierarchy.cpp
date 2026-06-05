@@ -1,13 +1,12 @@
-// XFAIL: *
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang++ -std=gnu++14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t/input.ll
 // RUN: %opt -load-pass-plugin %plugin -passes=sobf,verify -S %t/input.ll -o %t/sobf.ll
 // RUN: %clang++ %t/sobf.ll -lm -o %t/sobf
 // RUN: %t/sobf | grep 'derived class'
 
-// XFAIL reproducer from llvm-test-suite
+// Regression from llvm-test-suite
 // SingleSource/Regression/C++/EH/class_hierarchy.cpp. StringEncryptionPass
-// currently changes C++ exception type matching into unknown catches.
+// must preserve C++ exception type matching.
 #include <cassert>
 #include <cstdio>
 #include <cstring>

@@ -82,8 +82,10 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
   for (size_t I = 0; I < MergeList.size(); I++) {
     std::vector<CallInst *> VecCall;
     for (Use &U : MergeList[I]->uses()) {
-      if (auto *Call = dyn_cast<CallInst>(U.getUser()))
-        VecCall.push_back(Call);
+      if (auto *Call = dyn_cast<CallInst>(U.getUser())) {
+        if (Call->getCalledFunction() == MergeList[I])
+          VecCall.push_back(Call);
+      }
     }
     for (CallInst *Call : VecCall) {
       std::vector<Value *> CallArgs;

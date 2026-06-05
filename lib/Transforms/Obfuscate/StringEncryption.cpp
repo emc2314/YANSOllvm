@@ -15,7 +15,7 @@ bool StringEncryptionPass::do_StrEnc(Module &M, ModuleAnalysisManager &AM) {
   LLVMContext &Ctx = M.getContext();
   ConstantInt *Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.isConstant() || !GV.hasInitializer() ||
+    if (!GV.isConstant() || !GV.hasInitializer() || !GV.hasLocalLinkage() ||
         GV.hasDLLExportStorageClass() || GV.isDLLImportDependent()) {
       continue;
     }
@@ -62,7 +62,7 @@ bool StringEncryptionPass::do_StrEnc(Module &M, ModuleAnalysisManager &AM) {
   for (GlobalVariable *GV : ConstantStringUsers) {
     if (isValidToEncrypt(GV)) {
       Type *EltType = GV->getValueType();
-      ConstantAggregateZero *ZeroInit = ConstantAggregateZero::get(EltType);
+      Constant *ZeroInit = Constant::getNullValue(EltType);
       GlobalVariable *DecGV =
           new GlobalVariable(M, EltType, false, GlobalValue::PrivateLinkage,
                              ZeroInit, "dec_" + GV->getName());
@@ -431,7 +431,7 @@ void StringEncryptionPass::collectConstantStringUser(
 }
 
 bool StringEncryptionPass::isValidToEncrypt(GlobalVariable *GV) {
-  if (GV->isConstant() && GV->hasInitializer()) {
+  if (GV->isConstant() && GV->hasInitializer() && GV->hasLocalLinkage()) {
     return GV->getInitializer() != nullptr;
   } else {
     return false;
