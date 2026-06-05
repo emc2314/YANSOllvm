@@ -6,7 +6,10 @@ config.name = 'yansollvm'
 config.test_format = lit.formats.ShTest(True)
 config.suffixes = ['.c', '.cpp', '.ll']
 config.test_source_root = os.path.dirname(__file__)
-config.test_exec_root = config.test_source_root
+# Keep all lit-generated %t/%T files under one ignored tree.  If test_exec_root
+# is the source tree, tests in subdirectories create sibling Output/ directories
+# such as tests/fla-regressions/Output, which are easy to miss in .gitignore.
+config.test_exec_root = os.path.join(config.test_source_root, 'Output')
 
 llvm_build = os.environ.get('LLVM_BUILD')
 if not llvm_build:

@@ -100,6 +100,8 @@ void llvm::yansollvm_fix_stack(Function *F,
   std::vector<PHINode *> TmpPhi;
   std::vector<Instruction *> TmpReg;
   BasicBlock *Entry = &F->getEntryBlock();
+
+  std::set<Instruction *> Demoted;
   do {
     TmpPhi.clear();
     TmpReg.clear();
@@ -110,6 +112,8 @@ void llvm::yansollvm_fix_stack(Function *F,
             TmpPhi.push_back(Phi);
           continue;
         }
+        if (Demoted.count(&I))
+          continue;
         if (shouldDemoteReg(&I, Entry, SkipRegs)) {
           TmpReg.push_back(&I);
           continue;
@@ -117,17 +121,12 @@ void llvm::yansollvm_fix_stack(Function *F,
       }
     }
     BasicBlock::iterator AllocaPoint = firstNonAlloca(*Entry);
-    if (!TmpReg.empty()) {
-      Instruction *Reg = TmpReg.front();
+    for (Instruction *Reg : TmpReg) {
+      Demoted.insert(Reg);
       DemoteRegToStack(*Reg, false, AllocaPoint);
-      if (SkipRegs && isa<InvokeInst>(Reg))
-        const_cast<std::set<Instruction *> *>(SkipRegs)->insert(Reg);
-      continue;
     }
-    if (!TmpPhi.empty()) {
-      DemotePHIToStack(TmpPhi.front(), AllocaPoint);
-      continue;
-    }
+    for (PHINode *Phi : TmpPhi)
+      DemotePHIToStack(Phi, AllocaPoint);
   } while (!TmpReg.empty() || !TmpPhi.empty());
 }
 

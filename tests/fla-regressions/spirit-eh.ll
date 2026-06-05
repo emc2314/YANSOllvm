@@ -1,5 +1,12 @@
-; REQUIRES: fla-eh-timeout
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %s -o %t
+; Large (25k-line, 306-function) Boost.Spirit EH stress module from
+; llvm-test-suite Misc-C++-EH/spirit.cpp.  EH-aware flattening once spun here
+; without bound (it used to be gated off as a known timeout); after the
+; yansollvm_fix_stack convergence fix it flattens in well under a minute, so it
+; now runs by default as a heavyweight regression guard.  Assert both that opt
+; finishes and that the flattened IR is still valid enough to lower to an object.
+; RUN: rm -rf %t && mkdir -p %t
+; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %s -o %t/spirit-eh.fla.ll
+; RUN: %clang -c %t/spirit-eh.fla.ll -o %t/spirit-eh.o
 ; ModuleID = '/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Misc-C++-EH/spirit.cpp'
 source_filename = "/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Misc-C++-EH/spirit.cpp"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"

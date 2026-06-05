@@ -90,6 +90,17 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, timeout: int = 30) -> subpr
     )
 
 
+def timeout_result(pass_name: str, tc: TestCase, phase: str, start: float, cmd: list[str]) -> Result:
+    return Result(
+        pass_name,
+        tc.rel,
+        "TIMEOUT",
+        phase,
+        time.time() - start,
+        f"timeout after command: {quote_cmd(cmd)}",
+    )
+
+
 def decode(data: bytes, limit: int = 4000) -> str:
     text = data.decode("utf-8", errors="replace")
     return text if len(text) <= limit else text[:limit] + "\n...<truncated>"
@@ -120,10 +131,16 @@ def compile_baseline(
 ) -> tuple[str, str | tuple[int, bytes, bytes]]:
     exe = out_dir / "baseline.exe"
     cmd = [str(tools.clang), "-std=gnu89", "-O0", str(tc.source), "-lm", "-o", str(exe)]
-    cp = run_cmd(cmd, timeout=timeout)
+    try:
+        cp = run_cmd(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "baseline_timeout", quote_cmd(cmd)
     if cp.returncode != 0:
         return "baseline_compile", quote_cmd(cmd) + "\n" + decode(cp.stderr)
-    cp = run_cmd([str(exe)], cwd=tc.source.parent, timeout=timeout)
+    try:
+        cp = run_cmd([str(exe)], cwd=tc.source.parent, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "baseline_run_timeout", quote_cmd([str(exe)])
     return "ok", (cp.returncode, cp.stdout, cp.stderr)
 
 
@@ -157,7 +174,10 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
         "-o",
         str(raw_ll),
     ]
-    cp = run_cmd(compile_cmd, timeout=args.timeout)
+    try:
+        cp = run_cmd(compile_cmd, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return timeout_result(pass_name, tc, "emit_ir_timeout", start, compile_cmd)
     if cp.returncode != 0:
         return Result(
             pass_name,
@@ -179,7 +199,10 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
         "-o",
         str(obf_ll),
     ]
-    cp = run_cmd(opt_cmd, timeout=args.timeout)
+    try:
+        cp = run_cmd(opt_cmd, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return timeout_result(pass_name, tc, "opt_timeout", start, opt_cmd)
     if cp.returncode != 0:
         return Result(
             pass_name,
@@ -191,7 +214,10 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
         )
 
     link_cmd = [str(tools.clang), str(obf_ll), "-lm", "-o", str(exe)]
-    cp = run_cmd(link_cmd, timeout=args.timeout)
+    try:
+        cp = run_cmd(link_cmd, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return timeout_result(pass_name, tc, "link_timeout", start, link_cmd)
     if cp.returncode != 0:
         return Result(
             pass_name,
@@ -202,10 +228,11 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
             quote_cmd(link_cmd) + "\n" + decode(cp.stderr),
         )
 
+    run_cmdline = [str(exe)]
     try:
-        cp = run_cmd([str(exe)], cwd=tc.source.parent, timeout=args.timeout)
+        cp = run_cmd(run_cmdline, cwd=tc.source.parent, timeout=args.timeout)
     except subprocess.TimeoutExpired:
-        return Result(pass_name, tc.rel, "FAIL", "run_timeout", time.time() - start, "timeout")
+        return timeout_result(pass_name, tc, "run_timeout", start, run_cmdline)
 
     if (cp.returncode, cp.stdout, cp.stderr) != (
         baseline_exit,
@@ -293,8 +320,10 @@ def main() -> int:
         for i, fut in enumerate(concurrent.futures.as_completed(futs), 1):
             r = fut.result()
             all_results.append(r)
-            if r.status != "PASS":
+            if r.status not in {"PASS", "TIMEOUT"}:
                 print(f"[{i}/{len(futs)}] {r.status} {r.pass_name} {r.test} phase={r.phase}")
+            elif r.status == "TIMEOUT":
+                print(f"[{i}/{len(futs)}] TIMEOUT {r.pass_name} {r.test} phase={r.phase}")
             elif i % 50 == 0 or i == len(futs):
                 print(f"[{i}/{len(futs)}] progress")
 
@@ -316,9 +345,12 @@ def main() -> int:
     print("summary:")
     for p in passes:
         s = summary.get(p, {})
-        print(f"  {p:8s} PASS={s.get('PASS', 0)} FAIL={s.get('FAIL', 0)} SKIP={s.get('SKIP', 0)}")
+        print(
+            f"  {p:8s} PASS={s.get('PASS', 0)} FAIL={s.get('FAIL', 0)} "
+            f"TIMEOUT={s.get('TIMEOUT', 0)} SKIP={s.get('SKIP', 0)}"
+        )
     print(f"report={report_path}")
-    return 1 if any(r.status == "FAIL" for r in all_results) else 0
+    return 1 if any(r.status in {"FAIL", "TIMEOUT"} for r in all_results) else 0
 
 
 if __name__ == "__main__":

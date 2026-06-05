@@ -20,7 +20,7 @@ public:
   bool flag;
   FlatteningPass(bool flag) { this->flag = flag; } // 携带flag的构造函数
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
-  bool flatten(Function &F);
+  bool flattenImpl(Function &F);
   static bool isRequired() { return true; }
 };
 } // namespace llvm
