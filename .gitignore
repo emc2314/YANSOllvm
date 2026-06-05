@@ -18,6 +18,8 @@ tests/.lit_test_times.txt
 *.exe
 *.out
 *.log
+__pycache__/
+*.py[cod]
 
 # LLVM source/build trees are intentionally external to this branch.
 llvm-project*/

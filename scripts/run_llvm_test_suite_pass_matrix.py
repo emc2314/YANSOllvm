@@ -59,6 +59,7 @@ SKIP_BASENAMES = {
 @dataclasses.dataclass(frozen=True)
 class Toolchain:
     clang: Path
+    clangxx: Path
     opt: Path
     plugin: Path
 
@@ -67,6 +68,7 @@ class Toolchain:
 class TestCase:
     source: Path
     rel: str
+    language: str
 
 
 @dataclasses.dataclass
@@ -110,47 +112,70 @@ def quote_cmd(cmd: list[str]) -> str:
     return " ".join(shlex.quote(x) for x in cmd)
 
 
+SOURCE_SUFFIXES = {".c": "c", ".cc": "cxx", ".cpp": "cxx", ".cxx": "cxx", ".C": "cxx"}
+
+
+def compiler_for(tc: TestCase, tools: Toolchain) -> Path:
+    return tools.clangxx if tc.language == "cxx" else tools.clang
+
+
+def compile_flags(tc: TestCase, args: argparse.Namespace, emit_ir: bool) -> list[str]:
+    flags = [args.cxx_standard if tc.language == "cxx" else args.c_standard, "-O0"]
+    if emit_ir:
+        flags += ["-Xclang", "-disable-O0-optnone", "-emit-llvm", "-S"]
+    return flags
+
+
 def discover_tests(test_suite: Path, source_dirs: Iterable[str]) -> list[TestCase]:
     tests: list[TestCase] = []
+    seen: set[Path] = set()
     for rel_dir in source_dirs:
         root = test_suite / rel_dir
-        for src in sorted(root.rglob("*.c")):
-            if src.name in SKIP_BASENAMES:
+        for src in sorted(p for p in root.rglob("*") if p.suffix in SOURCE_SUFFIXES):
+            if src in seen or src.name in SKIP_BASENAMES:
                 continue
+            seen.add(src)
             # Require a test-suite reference_output as a cheap filter for programs
             # intended to be run and checked. We still compare baseline-vs-pass to
             # avoid target-format drift in bundled references.
             if not src.with_suffix(".reference_output").exists():
                 continue
-            tests.append(TestCase(src, src.relative_to(test_suite).as_posix()))
+            tests.append(TestCase(src, src.relative_to(test_suite).as_posix(), SOURCE_SUFFIXES[src.suffix]))
     return tests
 
 
 def compile_baseline(
-    tc: TestCase, out_dir: Path, tools: Toolchain, timeout: int
+    tc: TestCase, out_dir: Path, tools: Toolchain, args: argparse.Namespace
 ) -> tuple[str, str | tuple[int, bytes, bytes]]:
     exe = out_dir / "baseline.exe"
-    cmd = [str(tools.clang), "-std=gnu89", "-O0", str(tc.source), "-lm", "-o", str(exe)]
+    cmd = [str(compiler_for(tc, tools)), *compile_flags(tc, args, emit_ir=False), str(tc.source), "-lm", "-o", str(exe)]
     try:
-        cp = run_cmd(cmd, timeout=timeout)
+        cp = run_cmd(cmd, timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return "baseline_timeout", quote_cmd(cmd)
+    except OSError as e:
+        return "baseline_compile_oserror", quote_cmd(cmd) + "\n" + repr(e)
     if cp.returncode != 0:
         return "baseline_compile", quote_cmd(cmd) + "\n" + decode(cp.stderr)
+    if not exe.is_file() or not os.access(exe, os.X_OK):
+        return "baseline_not_executable", str(exe)
+    run_cmdline = [str(exe.resolve())]
     try:
-        cp = run_cmd([str(exe)], cwd=tc.source.parent, timeout=timeout)
+        cp = run_cmd(run_cmdline, cwd=tc.source.parent, timeout=args.timeout)
     except subprocess.TimeoutExpired:
-        return "baseline_run_timeout", quote_cmd([str(exe)])
+        return "baseline_run_timeout", quote_cmd(run_cmdline)
+    except OSError as e:
+        return "baseline_run_oserror", quote_cmd(run_cmdline) + "\n" + repr(e)
     return "ok", (cp.returncode, cp.stdout, cp.stderr)
 
 
 def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolchain) -> Result:
     start = time.time()
-    safe_rel = tc.rel.replace("/", "__")[:-2]
+    safe_rel = Path(tc.rel).with_suffix("").as_posix().replace("/", "__")
     out_dir = args.out / pass_name / safe_rel
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    phase, baseline_result = compile_baseline(tc, out_dir, tools, args.timeout)
+    phase, baseline_result = compile_baseline(tc, out_dir, tools, args)
     if phase != "ok":
         return Result(
             pass_name, tc.rel, "SKIP", phase, time.time() - start, str(baseline_result)
@@ -163,13 +188,8 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
     exe = out_dir / f"{pass_name}.exe"
 
     compile_cmd = [
-        str(tools.clang),
-        "-std=gnu89",
-        "-O0",
-        "-Xclang",
-        "-disable-O0-optnone",
-        "-emit-llvm",
-        "-S",
+        str(compiler_for(tc, tools)),
+        *compile_flags(tc, args, emit_ir=True),
         str(tc.source),
         "-o",
         str(raw_ll),
@@ -213,7 +233,7 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
             quote_cmd(opt_cmd) + "\n" + decode(cp.stderr),
         )
 
-    link_cmd = [str(tools.clang), str(obf_ll), "-lm", "-o", str(exe)]
+    link_cmd = [str(compiler_for(tc, tools)), str(obf_ll), "-lm", "-o", str(exe)]
     try:
         cp = run_cmd(link_cmd, timeout=args.timeout)
     except subprocess.TimeoutExpired:
@@ -228,11 +248,13 @@ def run_one(pass_name: str, tc: TestCase, args: argparse.Namespace, tools: Toolc
             quote_cmd(link_cmd) + "\n" + decode(cp.stderr),
         )
 
-    run_cmdline = [str(exe)]
+    run_cmdline = [str(exe.resolve())]
     try:
         cp = run_cmd(run_cmdline, cwd=tc.source.parent, timeout=args.timeout)
     except subprocess.TimeoutExpired:
         return timeout_result(pass_name, tc, "run_timeout", start, run_cmdline)
+    except OSError as e:
+        return Result(pass_name, tc.rel, "FAIL", "run_oserror", time.time() - start, quote_cmd(run_cmdline) + "\n" + repr(e))
 
     if (cp.returncode, cp.stdout, cp.stderr) != (
         baseline_exit,
@@ -272,6 +294,8 @@ def main() -> int:
     parser.add_argument("--passes", default=",".join(DEFAULT_PASSES))
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 1) - 4))
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--c-standard", default="-std=gnu89")
+    parser.add_argument("--cxx-standard", default="-std=gnu++14")
     parser.add_argument(
         "--limit", type=int, default=0, help="limit test count after discovery; 0 means all selected tests"
     )
@@ -295,10 +319,11 @@ def main() -> int:
 
     tools = Toolchain(
         clang=args.llvm_build / "bin" / "clang",
+        clangxx=args.llvm_build / "bin" / "clang++",
         opt=args.llvm_build / "bin" / "opt",
         plugin=args.repo / "build" / "yansollvm.so",
     )
-    for tool in [tools.clang, tools.opt, tools.plugin]:
+    for tool in [tools.clang, tools.clangxx, tools.opt, tools.plugin]:
         if not tool.exists():
             raise SystemExit(f"missing tool/artifact: {tool}")
 

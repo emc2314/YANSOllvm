@@ -20,6 +20,9 @@ plugin = os.environ.get(
 )
 
 config.substitutions.append(('%clang', os.path.join(llvm_build, 'bin', 'clang')))
+config.substitutions.append(('%clang\+\+', os.path.join(llvm_build, 'bin', 'clang++')))
 config.substitutions.append(('%opt', os.path.join(llvm_build, 'bin', 'opt')))
 config.substitutions.append(('%lli', os.path.join(llvm_build, 'bin', 'lli')))
+config.substitutions.append(('%FileCheck', os.path.join(llvm_build, 'bin', 'FileCheck')))
+config.substitutions.append(('%not', os.path.join(llvm_build, 'bin', 'not')))
 config.substitutions.append(('%plugin', plugin))
