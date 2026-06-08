@@ -251,9 +251,14 @@ Function *StringEncryptionPass::buildInitFunction(
   IRB.CreateCondBr(IsDecrypted, Exit, InitBlock);
 
   IRB.SetInsertPoint(InitBlock);
+  // Mark the initializer as active before lowering its constant expression tree.
+  // Clang emits relative pointer tables whose initializer references the table
+  // itself (ptrtoint(@str) - ptrtoint(@table)).  After we rewrite @table to its
+  // decrypted copy, that self-reference would otherwise call this initializer
+  // recursively before the status flag is set.
+  IRB.CreateStore(IRB.getInt32(1), User->DecStatus);
   Constant *Init = User->GV->getInitializer();
   lowerGlobalConstant(Init, IRB, User->DecGV, User->Ty);
-  IRB.CreateStore(IRB.getInt32(1), User->DecStatus);
   IRB.CreateBr(Exit);
 
   IRB.SetInsertPoint(Exit);
