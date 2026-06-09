@@ -5,6 +5,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -23,6 +24,13 @@ using namespace llvm;
 
 namespace {
 constexpr StringLiteral PassName = "mfla";
+
+struct StorageRef {
+  Type *Ty = nullptr;
+  uint64_t Offset = 0;
+};
+
+static StorageRef staticRef(Type *Ty, uint64_t Offset) { return {Ty, Offset}; }
 
 struct MFLAArtifacts {
   Function *Mega = nullptr;
@@ -53,17 +61,33 @@ struct MFLAArtifacts {
 struct FunctionLayout {
   unsigned EntryID = 0;
   Function *Owner = nullptr;
-  SmallVector<uint64_t, 4> ArgOffsets;
-  DenseMap<Argument *, uint64_t> ArgOffsetFor;
-  uint64_t RetOffset = 0;
-  DenseMap<PHINode *, uint64_t> PhiOffsets;
-  DenseMap<CallInst *, uint64_t> CallResultOffsets;
-  DenseMap<Instruction *, uint64_t> SpilledValueOffsets;
+  SmallVector<StorageRef, 4> ArgOffsets;
+  DenseMap<Argument *, StorageRef> ArgOffsetFor;
+  StorageRef RetOffset;
+  DenseMap<PHINode *, StorageRef> PhiOffsets;
+  DenseMap<CallInst *, StorageRef> CallResultOffsets;
+  DenseMap<Instruction *, StorageRef> SpilledValueOffsets;
 };
 
 struct FramePlan {
   DenseMap<Function *, FunctionLayout> Layouts;
   uint64_t FrameSize = 0;
+};
+
+struct StaticLocalPlan {
+  Function *F = nullptr;
+  FunctionLayout Layout;
+  uint64_t LocalSize = 0;
+  uint64_t Base = 0;
+};
+
+struct CallGraphInfo {
+  DenseMap<Function *, SmallVector<Function *, 4>> Succs;
+};
+
+struct SCCInfo {
+  SmallVector<Function *, 4> Members;
+  bool Recursive = false;
 };
 
 static bool hasUnsupportedIndirectTerminator(Function &F) {
@@ -203,7 +227,8 @@ static bool supportsCurrentLowering(
               return false;
             }
             if (Call->mayThrow() &&
-                !Callee->hasFnAttribute(Attribute::NoUnwind)) {
+                !Callee->hasFnAttribute(Attribute::NoUnwind) &&
+                !F.hasFnAttribute(Attribute::NoUnwind)) {
               YANSO_WARN_FUNCTION(
                   PassName, F,
                   "current lowering does not support throwing internal calls");
@@ -236,49 +261,93 @@ static bool supportsCurrentLowering(
   return true;
 }
 
-static void markRecursiveDFS(
-    Function *Root, Function *Cur,
-    const DenseMap<Function *, SmallVector<Function *, 4>> &Graph,
-    DenseSet<Function *> &Visiting, DenseSet<Function *> &Recursive) {
-  auto It = Graph.find(Cur);
-  if (It == Graph.end())
-    return;
-  for (Function *Succ : It->second) {
-    if (Succ == Root) {
-      Recursive.insert(Root);
-      continue;
-    }
-    if (!Visiting.insert(Succ).second)
-      continue;
-    markRecursiveDFS(Root, Succ, Graph, Visiting, Recursive);
-    Visiting.erase(Succ);
-  }
-}
-
-static DenseSet<Function *> findRecursiveFunctions(ArrayRef<Function *> Candidates) {
+static CallGraphInfo buildCandidateCallGraph(ArrayRef<Function *> Candidates) {
   DenseSet<Function *> CandidateSet;
   for (Function *F : Candidates)
     CandidateSet.insert(F);
 
-  DenseMap<Function *, SmallVector<Function *, 4>> Graph;
+  CallGraphInfo Graph;
   for (Function *F : Candidates) {
-    SmallVector<Function *, 4> &Succs = Graph[F];
+    SmallVector<Function *, 4> &Succs = Graph.Succs[F];
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
-        auto *Call = dyn_cast<CallInst>(&I);
-        Function *Callee = directCalledFunction(Call);
-        if (Callee && CandidateSet.count(Callee))
+        Function *Callee = directCalledFunction(dyn_cast<CallInst>(&I));
+        if (Callee && CandidateSet.count(Callee) &&
+            llvm::find(Succs, Callee) == Succs.end())
           Succs.push_back(Callee);
       }
     }
   }
+  return Graph;
+}
 
-  DenseSet<Function *> Recursive;
-  for (Function *F : Candidates) {
-    DenseSet<Function *> Visiting;
-    Visiting.insert(F);
-    markRecursiveDFS(F, F, Graph, Visiting, Recursive);
+struct TarjanState {
+  unsigned NextIndex = 0;
+  DenseMap<Function *, unsigned> Index;
+  DenseMap<Function *, unsigned> LowLink;
+  SmallVector<Function *, 16> Stack;
+  DenseSet<Function *> OnStack;
+  SmallVector<SCCInfo, 8> SCCs;
+};
+
+static void tarjanVisit(Function *F, const CallGraphInfo &Graph,
+                        TarjanState &State) {
+  State.Index[F] = State.NextIndex;
+  State.LowLink[F] = State.NextIndex;
+  ++State.NextIndex;
+  State.Stack.push_back(F);
+  State.OnStack.insert(F);
+
+  auto It = Graph.Succs.find(F);
+  if (It != Graph.Succs.end()) {
+    for (Function *Succ : It->second) {
+      if (!State.Index.count(Succ)) {
+        tarjanVisit(Succ, Graph, State);
+        State.LowLink[F] = std::min(State.LowLink[F], State.LowLink[Succ]);
+      } else if (State.OnStack.count(Succ)) {
+        State.LowLink[F] = std::min(State.LowLink[F], State.Index[Succ]);
+      }
+    }
   }
+
+  if (State.LowLink[F] != State.Index[F])
+    return;
+
+  SCCInfo SCC;
+  while (true) {
+    Function *Member = State.Stack.pop_back_val();
+    State.OnStack.erase(Member);
+    SCC.Members.push_back(Member);
+    if (Member == F)
+      break;
+  }
+
+  if (SCC.Members.size() > 1) {
+    SCC.Recursive = true;
+  } else {
+    Function *Only = SCC.Members.front();
+    auto GI = Graph.Succs.find(Only);
+    if (GI != Graph.Succs.end())
+      SCC.Recursive = llvm::find(GI->second, Only) != GI->second.end();
+  }
+  State.SCCs.push_back(std::move(SCC));
+}
+
+static SmallVector<SCCInfo, 8> findCandidateSCCs(ArrayRef<Function *> Candidates,
+                                                 const CallGraphInfo &Graph) {
+  TarjanState State;
+  for (Function *F : Candidates)
+    if (!State.Index.count(F))
+      tarjanVisit(F, Graph, State);
+  return std::move(State.SCCs);
+}
+
+static DenseSet<Function *> recursiveMembers(ArrayRef<SCCInfo> SCCs) {
+  DenseSet<Function *> Recursive;
+  for (const SCCInfo &SCC : SCCs)
+    if (SCC.Recursive)
+      for (Function *F : SCC.Members)
+        Recursive.insert(F);
   return Recursive;
 }
 
@@ -318,28 +387,37 @@ static Value *framePtr(IRBuilder<> &B, GlobalVariable *Frame, uint64_t Offset) {
   return B.CreateInBoundsGEP(FrameTy, Frame, {Zero, Off});
 }
 
+static Value *storagePtr(IRBuilder<> &B, MFLAArtifacts &A, StorageRef Ref) {
+  return framePtr(B, A.Frame, Ref.Offset);
+}
+
 static LoadInst *loadSlot(IRBuilder<> &B, Type *Ty, GlobalVariable *Frame,
                           uint64_t Offset, StringRef Name = "") {
   return B.CreateLoad(Ty, framePtr(B, Frame, Offset), Name);
 }
 
+static LoadInst *loadSlot(IRBuilder<> &B, Type *Ty, MFLAArtifacts &A,
+                          StorageRef Ref, StringRef Name = "") {
+  return B.CreateLoad(Ty, storagePtr(B, A, Ref), Name);
+}
+
 static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
                              const FunctionLayout &Layout,
-                             GlobalVariable *Frame) {
+                             MFLAArtifacts &A) {
   if (auto *Call = dyn_cast<CallInst>(V)) {
     auto It = Layout.CallResultOffsets.find(Call);
     if (It != Layout.CallResultOffsets.end())
-      return loadSlot(B, Call->getType(), Frame, It->second, "mfla.call.use");
+      return loadSlot(B, Call->getType(), A, It->second, "mfla.call.use");
   }
   if (auto *I = dyn_cast<Instruction>(V)) {
     auto It = Layout.SpilledValueOffsets.find(I);
     if (It != Layout.SpilledValueOffsets.end())
-      return loadSlot(B, I->getType(), Frame, It->second, I->getName());
+      return loadSlot(B, I->getType(), A, It->second, I->getName());
   }
   if (auto *Arg = dyn_cast<Argument>(V)) {
     auto It = Layout.ArgOffsetFor.find(Arg);
     if (It != Layout.ArgOffsetFor.end())
-      return loadSlot(B, Arg->getType(), Frame, It->second, Arg->getName());
+      return loadSlot(B, Arg->getType(), A, It->second, Arg->getName());
   }
   return MapValue(V, VMap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
 }
@@ -347,6 +425,11 @@ static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
 static void storeSlot(IRBuilder<> &B, Value *V, GlobalVariable *Frame,
                       uint64_t Offset) {
   B.CreateStore(V, framePtr(B, Frame, Offset));
+}
+
+static void storeSlot(IRBuilder<> &B, Value *V, MFLAArtifacts &A,
+                      StorageRef Ref) {
+  B.CreateStore(V, storagePtr(B, A, Ref));
 }
 
 static Value *retContPtr(IRBuilder<> &B, GlobalVariable *RetCont,
@@ -357,60 +440,195 @@ static Value *retContPtr(IRBuilder<> &B, GlobalVariable *RetCont,
   return B.CreateInBoundsGEP(ContTy, RetCont, {Zero, Index});
 }
 
+static bool reachesFunction(Function *From, Function *To,
+                            const CallGraphInfo &Graph,
+                            DenseSet<Function *> &Seen) {
+  auto It = Graph.Succs.find(From);
+  if (It == Graph.Succs.end())
+    return false;
+  for (Function *Succ : It->second) {
+    if (Succ == To)
+      return true;
+    if (!Seen.insert(Succ).second)
+      continue;
+    if (reachesFunction(Succ, To, Graph, Seen))
+      return true;
+  }
+  return false;
+}
+
+static bool reachesFunction(Function *From, Function *To,
+                            const CallGraphInfo &Graph) {
+  DenseSet<Function *> Seen;
+  Seen.insert(From);
+  return reachesFunction(From, To, Graph, Seen);
+}
+
+static bool functionsInterfere(Function *A, Function *B,
+                               const CallGraphInfo &Graph) {
+  if (A == B)
+    return true;
+  return reachesFunction(A, B, Graph) || reachesFunction(B, A, Graph);
+}
+
+static void addBaseToRef(StorageRef &Ref, uint64_t Base) { Ref.Offset += Base; }
+
+static void addBaseToLayout(FunctionLayout &L, uint64_t Base) {
+  for (StorageRef &Ref : L.ArgOffsets)
+    addBaseToRef(Ref, Base);
+  for (auto &Entry : L.ArgOffsetFor)
+    addBaseToRef(Entry.second, Base);
+  if (L.RetOffset.Ty)
+    addBaseToRef(L.RetOffset, Base);
+  for (auto &Entry : L.PhiOffsets)
+    addBaseToRef(Entry.second, Base);
+  for (auto &Entry : L.CallResultOffsets)
+    addBaseToRef(Entry.second, Base);
+  for (auto &Entry : L.SpilledValueOffsets)
+    addBaseToRef(Entry.second, Base);
+}
+
 static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
                                const DenseMap<Function *, unsigned> &CandidateIDs,
+                               CallGraphInfo CandidateGraph,
+                               const CallGraphInfo &FullGraph,
                                const DataLayout &DL) {
   FramePlan Plan;
-  uint64_t NextOffset = 0;
+  SmallVector<StaticLocalPlan, 8> Locals;
+
   for (unsigned I = 0, E = Candidates.size(); I != E; ++I) {
     Function *F = Candidates[I];
     FunctionLayout L;
     L.EntryID = I;
     L.Owner = F;
+    uint64_t NextOffset = 0;
+
     for (Argument &Arg : F->args()) {
       uint64_t Offset = reserveSlot(NextOffset, Arg.getType(), DL);
-      L.ArgOffsets.push_back(Offset);
-      L.ArgOffsetFor[&Arg] = Offset;
+      StorageRef Ref = staticRef(Arg.getType(), Offset);
+      L.ArgOffsets.push_back(Ref);
+      L.ArgOffsetFor[&Arg] = Ref;
     }
     if (!F->getReturnType()->isVoidTy()) {
-      L.RetOffset = reserveSlot(NextOffset, F->getReturnType(), DL);
+      uint64_t Offset = reserveSlot(NextOffset, F->getReturnType(), DL);
+      L.RetOffset = staticRef(F->getReturnType(), Offset);
     }
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
         if (auto *Call = dyn_cast<CallInst>(&I)) {
           if (Function *Callee = directCalledFunction(Call)) {
             if (CandidateIDs.count(Callee) && !Call->getType()->isVoidTy()) {
-              L.CallResultOffsets[Call] =
-                  reserveSlot(NextOffset, Call->getType(), DL);
+              uint64_t Offset = reserveSlot(NextOffset, Call->getType(), DL);
+              L.CallResultOffsets[Call] = staticRef(Call->getType(), Offset);
               continue;
             }
           }
         }
         auto *Phi = dyn_cast<PHINode>(&I);
         if (Phi) {
-          L.PhiOffsets[Phi] = reserveSlot(NextOffset, Phi->getType(), DL);
+          uint64_t Offset = reserveSlot(NextOffset, Phi->getType(), DL);
+          L.PhiOffsets[Phi] = staticRef(Phi->getType(), Offset);
           continue;
         }
         if (!I.getType()->isVoidTy()) {
-          L.SpilledValueOffsets[&I] = reserveSlot(NextOffset, I.getType(), DL);
+          uint64_t Offset = reserveSlot(NextOffset, I.getType(), DL);
+          L.SpilledValueOffsets[&I] = staticRef(I.getType(), Offset);
         }
       }
     }
-    Plan.Layouts[F] = std::move(L);
+
+    StaticLocalPlan Local;
+    Local.F = F;
+    Local.Layout = std::move(L);
+    Local.LocalSize = std::max<uint64_t>(1, llvm::alignTo(NextOffset, 16));
+    Locals.push_back(std::move(Local));
   }
-  Plan.FrameSize = std::max<uint64_t>(1, llvm::alignTo(NextOffset, 16));
+
+  DenseSet<Function *> CandidateSet;
+  for (Function *F : Candidates)
+    CandidateSet.insert(F);
+  for (StaticLocalPlan &Local : Locals) {
+    bool HasNativeInternalCall = false;
+    auto It = FullGraph.Succs.find(Local.F);
+    if (It != FullGraph.Succs.end()) {
+      for (Function *Callee : It->second) {
+        if (!CandidateSet.count(Callee)) {
+          HasNativeInternalCall = true;
+          break;
+        }
+      }
+    }
+    if (!HasNativeInternalCall)
+      continue;
+    for (Function *Other : Candidates) {
+      if (Other == Local.F)
+        continue;
+      if (functionsInterfere(Local.F, Other, CandidateGraph))
+        continue;
+      if (reachesFunction(Local.F, Other, FullGraph))
+        CandidateGraph.Succs[Local.F].push_back(Other);
+    }
+  }
+
+  llvm::sort(Locals, [](const StaticLocalPlan &A, const StaticLocalPlan &B) {
+    if (A.LocalSize != B.LocalSize)
+      return A.LocalSize > B.LocalSize;
+    return A.F->getName() < B.F->getName();
+  });
+
+  struct Color {
+    uint64_t Base = 0;
+    uint64_t Size = 0;
+    SmallVector<Function *, 4> Occupants;
+  };
+  SmallVector<Color, 8> Colors;
+
+  for (StaticLocalPlan &Local : Locals) {
+    Color *Chosen = nullptr;
+    for (Color &C : Colors) {
+      bool Interferes = false;
+      for (Function *Other : C.Occupants) {
+        if (functionsInterfere(Local.F, Other, CandidateGraph)) {
+          Interferes = true;
+          break;
+        }
+      }
+      if (!Interferes) {
+        Chosen = &C;
+        break;
+      }
+    }
+    if (!Chosen) {
+      Color C;
+      C.Base = Plan.FrameSize;
+      C.Size = Local.LocalSize;
+      Plan.FrameSize += C.Size;
+      Colors.push_back(std::move(C));
+      Chosen = &Colors.back();
+    } else {
+      Chosen->Size = std::max(Chosen->Size, Local.LocalSize);
+    }
+    Local.Base = Chosen->Base;
+    Chosen->Occupants.push_back(Local.F);
+  }
+
+  for (StaticLocalPlan &Local : Locals) {
+    addBaseToLayout(Local.Layout, Local.Base);
+    Plan.Layouts[Local.F] = std::move(Local.Layout);
+  }
+  Plan.FrameSize = std::max<uint64_t>(1, llvm::alignTo(Plan.FrameSize, 16));
   return Plan;
 }
 
 static Instruction *cloneMapped(Instruction &I, IRBuilder<> &B,
                                 ValueToValueMapTy &VMap,
                                 const FunctionLayout &Layout,
-                                GlobalVariable *Frame) {
+                                MFLAArtifacts &A) {
   Instruction *Clone = I.clone();
   RemapInstruction(Clone, VMap,
                    RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
   for (Use &U : I.operands()) {
-    Value *Mapped = mapValueForUse(U.get(), B, VMap, Layout, Frame);
+    Value *Mapped = mapValueForUse(U.get(), B, VMap, Layout, A);
     if (Mapped)
       Clone->setOperand(U.getOperandNo(), Mapped);
   }
@@ -421,19 +639,19 @@ static Instruction *cloneMapped(Instruction &I, IRBuilder<> &B,
 static bool storeIncomingPhis(IRBuilder<> &B, BasicBlock *Pred,
                               BasicBlock *Succ, ValueToValueMapTy &VMap,
                               const FunctionLayout &Layout,
-                              GlobalVariable *Frame) {
+                              MFLAArtifacts &A) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
       break;
     Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, Frame);
+    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A);
     if (!Mapped)
       return false;
     auto It = Layout.PhiOffsets.find(Phi);
     if (It == Layout.PhiOffsets.end())
       return false;
-    storeSlot(B, Mapped, Frame, It->second);
+    storeSlot(B, Mapped, A, It->second);
   }
   return true;
 }
@@ -452,41 +670,42 @@ static Value *muxInt(IRBuilder<> &B, Value *Cond, Value *TrueV, Value *FalseV) {
   return B.CreateOr(B.CreateAnd(TrueV, Mask), B.CreateAnd(FalseV, NotMask));
 }
 
-static Value *muxPtr(IRBuilder<> &B, Value *Cond, Value *TrueV, Value *FalseV) {
-  Type *I64 = Type::getInt64Ty(TrueV->getContext());
-  Value *TrueI = B.CreatePtrToInt(TrueV, I64);
-  Value *FalseI = B.CreatePtrToInt(FalseV, I64);
+static Value *muxPtr(IRBuilder<> &B, const DataLayout &DL, Value *Cond,
+                     Value *TrueV, Value *FalseV) {
+  Type *PtrIntTy = DL.getIntPtrType(TrueV->getType());
+  Value *TrueI = B.CreatePtrToInt(TrueV, PtrIntTy);
+  Value *FalseI = B.CreatePtrToInt(FalseV, PtrIntTy);
   return B.CreateIntToPtr(muxInt(B, Cond, TrueI, FalseI), TrueV->getType());
 }
 
-static Value *muxValue(IRBuilder<> &B, Value *Cond, Value *TrueV,
-                       Value *FalseV) {
+static Value *muxValue(IRBuilder<> &B, const DataLayout &DL, Value *Cond,
+                       Value *TrueV, Value *FalseV) {
   Type *Ty = TrueV->getType();
   if (Ty->isIntegerTy())
     return muxInt(B, Cond, TrueV, FalseV);
   if (Ty->isPointerTy())
-    return muxPtr(B, Cond, TrueV, FalseV);
+    return muxPtr(B, DL, Cond, TrueV, FalseV);
   return B.CreateSelect(Cond, TrueV, FalseV);
 }
 
-static bool muxIncomingPhis(IRBuilder<> &B, BasicBlock *Pred, BasicBlock *Succ,
-                            Value *TakeEdge, ValueToValueMapTy &VMap,
-                            const FunctionLayout &Layout,
-                            GlobalVariable *Frame) {
+static bool muxIncomingPhis(IRBuilder<> &B, const DataLayout &DL, BasicBlock *Pred,
+                            BasicBlock *Succ, Value *TakeEdge,
+                            ValueToValueMapTy &VMap, const FunctionLayout &Layout,
+                            MFLAArtifacts &A) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
       break;
     Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, Frame);
+    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A);
     if (!Mapped)
       return false;
     auto It = Layout.PhiOffsets.find(Phi);
     if (It == Layout.PhiOffsets.end())
       return false;
-    Value *Old = loadSlot(B, Phi->getType(), Frame, It->second, "mfla.phi.old");
-    Value *New = muxValue(B, TakeEdge, Mapped, Old);
-    storeSlot(B, New, Frame, It->second);
+    Value *Old = loadSlot(B, Phi->getType(), A, It->second, "mfla.phi.old");
+    Value *New = muxValue(B, DL, TakeEdge, Mapped, Old);
+    storeSlot(B, New, A, It->second);
   }
   return true;
 }
@@ -498,20 +717,20 @@ static bool hasPhiNodes(BasicBlock *BB) {
 static bool createThreadedTerminator(
     IRBuilder<> &B, Function &Mega, Instruction *OldTerm,
     ValueToValueMapTy &VMap, DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-    BasicBlock *Exit, GlobalVariable *Frame, GlobalVariable *RetCont,
+    BasicBlock *Exit, MFLAArtifacts &A,
     const FunctionLayout &Layout,
     DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> &ReturnDispatches) {
   BasicBlock *Pred = OldTerm->getParent();
 
   if (auto *Ret = dyn_cast<ReturnInst>(OldTerm)) {
     if (Value *RV = Ret->getReturnValue()) {
-      Value *Mapped = mapValueForUse(RV, B, VMap, Layout, Frame);
+      Value *Mapped = mapValueForUse(RV, B, VMap, Layout, A);
       if (!Mapped)
         return false;
-      storeSlot(B, Mapped, Frame, Layout.RetOffset);
+      storeSlot(B, Mapped, A, Layout.RetOffset);
     }
     Type *PtrTy = PointerType::get(Mega.getContext(), 0);
-    Value *ContSlot = retContPtr(B, RetCont, Layout.EntryID);
+    Value *ContSlot = retContPtr(B, A.RetCont, Layout.EntryID);
     Value *Target = B.CreateLoad(PtrTy, ContSlot, "mfla.ret.cont");
     Value *HasContinuation = B.CreateICmpNE(
         Target, ConstantPointerNull::get(cast<PointerType>(PtrTy)));
@@ -522,7 +741,7 @@ static bool createThreadedTerminator(
 
     IRBuilder<> ReturnB(ReturnBB);
     ReturnB.CreateStore(ConstantPointerNull::get(cast<PointerType>(PtrTy)),
-                        retContPtr(ReturnB, RetCont, Layout.EntryID));
+                        retContPtr(ReturnB, A.RetCont, Layout.EntryID));
     auto *End = IndirectBrInst::Create(Target, 0, ReturnBB);
     ReturnDispatches[Layout.Owner].push_back(End);
     return true;
@@ -533,7 +752,7 @@ static bool createThreadedTerminator(
     auto *Sw = dyn_cast<SwitchInst>(OldTerm);
     if (!Sw)
       return false;
-    Value *Cond = mapValueForUse(Sw->getCondition(), B, VMap, Layout, Frame);
+    Value *Cond = mapValueForUse(Sw->getCondition(), B, VMap, Layout, A);
     BasicBlock *OldDefault = Sw->getDefaultDest();
     BasicBlock *NewDefault = BBMap.lookup(OldDefault);
     if (!Cond || !NewDefault)
@@ -549,7 +768,8 @@ static bool createThreadedTerminator(
       if (!NewSucc)
         return false;
       Value *TakeCase = B.CreateICmpEQ(Cond, Case.getCaseValue());
-      Target = muxPtr(B, TakeCase, BlockAddress::get(&Mega, NewSucc), Target);
+      Target = muxPtr(B, Mega.getParent()->getDataLayout(), TakeCase,
+                      BlockAddress::get(&Mega, NewSucc), Target);
 
       bool Found = false;
       for (auto &Entry : SuccConds) {
@@ -591,8 +811,8 @@ static bool createThreadedTerminator(
 
     for (auto &Entry : SuccConds) {
       if (hasPhiNodes(Entry.first)) {
-        if (!muxIncomingPhis(B, Pred, Entry.first, Entry.second, VMap, Layout,
-                             Frame))
+        if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred,
+                             Entry.first, Entry.second, VMap, Layout, A))
           return false;
       }
     }
@@ -606,13 +826,13 @@ static bool createThreadedTerminator(
   if (Br->isUnconditional()) {
     BasicBlock *OldSucc = Br->getSuccessor(0);
     BasicBlock *NewSucc = BBMap.lookup(OldSucc);
-    if (!NewSucc || !storeIncomingPhis(B, Pred, OldSucc, VMap, Layout, Frame))
+    if (!NewSucc || !storeIncomingPhis(B, Pred, OldSucc, VMap, Layout, A))
       return false;
     createStaticIndirectBr(Mega, B.GetInsertBlock(), NewSucc);
     return true;
   }
 
-  Value *Cond = mapValueForUse(Br->getCondition(), B, VMap, Layout, Frame);
+  Value *Cond = mapValueForUse(Br->getCondition(), B, VMap, Layout, A);
   BasicBlock *OldTrue = Br->getSuccessor(0);
   BasicBlock *OldFalse = Br->getSuccessor(1);
   BasicBlock *TrueBB = BBMap.lookup(OldTrue);
@@ -622,11 +842,13 @@ static bool createThreadedTerminator(
 
   Value *TrueAddr = BlockAddress::get(&Mega, TrueBB);
   Value *FalseAddr = BlockAddress::get(&Mega, FalseBB);
-  Value *Target = muxPtr(B, Cond, TrueAddr, FalseAddr);
-  if (!muxIncomingPhis(B, Pred, OldTrue, Cond, VMap, Layout, Frame))
+  Value *Target = muxPtr(B, Mega.getParent()->getDataLayout(), Cond, TrueAddr, FalseAddr);
+  if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldTrue,
+                       Cond, VMap, Layout, A))
     return false;
   Value *NotCond = B.CreateNot(Cond);
-  if (!muxIncomingPhis(B, Pred, OldFalse, NotCond, VMap, Layout, Frame))
+  if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldFalse,
+                       NotCond, VMap, Layout, A))
     return false;
   auto *End = IndirectBrInst::Create(Target, 2, B.GetInsertBlock());
   End->addDestination(TrueBB);
@@ -657,18 +879,18 @@ static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
   unsigned ArgNo = 0;
   for (Value *Arg : Call->args()) {
     Value *MappedArg =
-        mapValueForUse(Arg, B, VMap, CallerLayout, LCtx.Artifacts.Frame);
+        mapValueForUse(Arg, B, VMap, CallerLayout, LCtx.Artifacts);
     if (!MappedArg || ArgNo >= CalleeLayout.ArgOffsets.size())
       return false;
-    storeSlot(B, MappedArg, LCtx.Artifacts.Frame,
-              CalleeLayout.ArgOffsets[ArgNo++]);
+    storeSlot(B, MappedArg, LCtx.Artifacts, CalleeLayout.ArgOffsets[ArgNo++]);
   }
 
   BasicBlock *Cont = BasicBlock::Create(LCtx.Mega.getContext(),
                                         "mfla.call.cont", &LCtx.Mega,
                                         LCtx.Exit);
   LCtx.ContinuationsByCallee[Callee].push_back(Cont);
-  B.CreateStore(BlockAddress::get(&LCtx.Mega, Cont),
+  Value *ContAddr = BlockAddress::get(&LCtx.Mega, Cont);
+  B.CreateStore(ContAddr,
                 retContPtr(B, LCtx.Artifacts.RetCont, CalleeLayout.EntryID));
   auto *Jump = IndirectBrInst::Create(
       BlockAddress::get(&LCtx.Mega, LCtx.EntryBlockFor[Callee]), 1,
@@ -678,12 +900,12 @@ static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
   B.SetInsertPoint(Cont);
   TerminatorBlockFor[&OldBB] = Cont;
   if (!Call->getType()->isVoidTy()) {
-    Value *RetVal = loadSlot(B, Call->getType(), LCtx.Artifacts.Frame,
+    Value *RetVal = loadSlot(B, Call->getType(), LCtx.Artifacts,
                              CalleeLayout.RetOffset, "mfla.call.ret");
     auto It = CallerLayout.CallResultOffsets.find(Call);
     if (It == CallerLayout.CallResultOffsets.end())
       return false;
-    storeSlot(B, RetVal, LCtx.Artifacts.Frame, It->second);
+    storeSlot(B, RetVal, LCtx.Artifacts, It->second);
     VMap[Call] = RetVal;
   }
   return true;
@@ -699,14 +921,11 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   Argument *EntryID = Mega.getArg(0);
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &Mega);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", &Mega);
-  BasicBlock *Trap = BasicBlock::Create(Ctx, "trap", &Mega);
   DenseMap<Function *, SmallVector<BasicBlock *, 4>> ContinuationsByCallee;
   DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> ReturnDispatches;
 
   IRBuilder<> ExitB(Exit);
   ExitB.CreateRetVoid();
-
-  yansollvm_create_trap_block(&Mega, Trap);
 
   SmallVector<BasicBlock *, 16> EntryRegions;
   DenseMap<Function *, BasicBlock *> EntryBlockFor;
@@ -768,7 +987,7 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
           if (It == L.PhiOffsets.end())
             return false;
           VMap[Phi] =
-              loadSlot(B, Phi->getType(), A.Frame, It->second, Phi->getName());
+              loadSlot(B, Phi->getType(), A, It->second, Phi->getName());
           continue;
         }
         if (auto *Call = dyn_cast<CallInst>(&I)) {
@@ -781,13 +1000,13 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
             }
           }
         }
-        Instruction *Clone = cloneMapped(I, B, VMap, L, A.Frame);
+        Instruction *Clone = cloneMapped(I, B, VMap, L, A);
         B.Insert(Clone);
         if (!I.getType()->isVoidTy()) {
           auto It = L.SpilledValueOffsets.find(&I);
           if (It == L.SpilledValueOffsets.end())
             return false;
-          storeSlot(B, Clone, A.Frame, It->second);
+          storeSlot(B, Clone, A, It->second);
         }
       }
     }
@@ -800,7 +1019,7 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
         continue;
       IRBuilder<> B(NewBB);
       if (!createThreadedTerminator(B, Mega, BB.getTerminator(), VMap, BBMap,
-                                    Exit, A.Frame, A.RetCont, L,
+                                    Exit, A, L,
                                     ReturnDispatches))
         return false;
     }
@@ -844,7 +1063,7 @@ static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &F);
   IRBuilder<> B(Entry);
   for (unsigned I = 0, E = Args.size(); I != E; ++I)
-    storeSlot(B, Args[I], A.Frame, L.ArgOffsets[I]);
+    storeSlot(B, Args[I], A, L.ArgOffsets[I]);
   B.CreateStore(
       ConstantPointerNull::get(PointerType::get(Ctx, 0)),
       retContPtr(B, A.RetCont, L.EntryID));
@@ -852,7 +1071,7 @@ static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
   if (F.getReturnType()->isVoidTy())
     B.CreateRetVoid();
   else
-    B.CreateRet(loadSlot(B, F.getReturnType(), A.Frame, L.RetOffset));
+    B.CreateRet(loadSlot(B, F.getReturnType(), A, L.RetOffset, ""));
 }
 } // namespace
 
@@ -867,22 +1086,27 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     InitialCandidates.push_back(&F);
   }
 
-  DenseSet<Function *> Recursive = findRecursiveFunctions(InitialCandidates);
-  std::vector<Function *> NonRecursiveCandidates;
-  DenseMap<Function *, unsigned> NonRecursiveCandidateIDs;
+  CallGraphInfo InitialGraph = buildCandidateCallGraph(InitialCandidates);
+  SmallVector<SCCInfo, 8> InitialSCCs =
+      findCandidateSCCs(InitialCandidates, InitialGraph);
+  DenseSet<Function *> Recursive = recursiveMembers(InitialSCCs);
   for (Function *F : InitialCandidates) {
-    if (Recursive.count(F)) {
+    if (Recursive.count(F))
       YANSO_WARN_FUNCTION(PassName, *F, "recursive SCC not supported");
+  }
+  std::vector<Function *> NonRecursiveCandidates;
+  DenseMap<Function *, unsigned> NonRecursiveIDs;
+  for (Function *F : InitialCandidates) {
+    if (Recursive.count(F))
       continue;
-    }
-    NonRecursiveCandidateIDs[F] = NonRecursiveCandidates.size();
+    NonRecursiveIDs[F] = NonRecursiveCandidates.size();
     NonRecursiveCandidates.push_back(F);
   }
 
   std::vector<Function *> Candidates;
   DenseMap<Function *, unsigned> CandidateIDs;
   for (Function *F : NonRecursiveCandidates) {
-    if (!supportsCurrentLowering(*F, NonRecursiveCandidateIDs))
+    if (!supportsCurrentLowering(*F, NonRecursiveIDs))
       continue;
     CandidateIDs[F] = Candidates.size();
     Candidates.push_back(F);
@@ -893,7 +1117,9 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     return PreservedAnalyses::all();
   }
 
-  FramePlan Plan = makeFramePlan(Candidates, CandidateIDs, M.getDataLayout());
+  CallGraphInfo CandidateGraph = buildCandidateCallGraph(Candidates);
+  FramePlan Plan = makeFramePlan(Candidates, CandidateIDs, CandidateGraph,
+                                 InitialGraph, M.getDataLayout());
   MFLAArtifacts Artifacts = createArtifacts(M, Plan.FrameSize, Candidates.size());
   if (!buildStructuralMega(Artifacts, Candidates, Plan.Layouts, CandidateIDs)) {
     Artifacts.eraseFromParent();
