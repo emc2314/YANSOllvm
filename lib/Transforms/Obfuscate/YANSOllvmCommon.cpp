@@ -130,6 +130,27 @@ void llvm::yansollvm_fix_stack(Function *F,
   } while (!TmpReg.empty() || !TmpPhi.empty());
 }
 
+bool llvm::yansollvm_has_dynamic_stack_state(BasicBlock &BB) {
+  for (Instruction &I : BB) {
+    if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+      if (AI->isArrayAllocation())
+        return true;
+    } else if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+      if (II->getIntrinsicID() == Intrinsic::stacksave ||
+          II->getIntrinsicID() == Intrinsic::stackrestore)
+        return true;
+    }
+  }
+  return false;
+}
+
+bool llvm::yansollvm_has_dynamic_stack_state(Function &F) {
+  for (BasicBlock &BB : F)
+    if (yansollvm_has_dynamic_stack_state(BB))
+      return true;
+  return false;
+}
+
 void llvm::yansollvm_create_trap_block(Function *F, BasicBlock *BB) {
   IRBuilder<> B(BB);
   // Architecture-neutral placeholder for the old x86 inline-asm garbage.

@@ -7,6 +7,7 @@
 #include "IndirectCall.h"
 #include "IndirectGlobalVariable.h"
 #include "MergePass.h"
+#include "MFLAPass.h"
 #include "ObfConPass.h"
 #include "SplitBasicBlock.h"
 #include "StringEncryption.h"
@@ -51,6 +52,9 @@ static cl::opt<bool>
              cl::desc("yansollvm arithmetic virtualization helpers"));
 static cl::opt<bool> EnableMerge("merge", cl::init(false),
                                  cl::desc("yansollvm merge static functions"));
+static cl::opt<bool> EnableMFLA(
+    "mfla", cl::init(false),
+    cl::desc("yansollvm module-level threaded flattening"));
 static cl::opt<bool>
     EnableFunc2Mod("func2mod", cl::init(false),
                    cl::desc("yansollvm split module to bitcode files"));
@@ -73,8 +77,8 @@ bool anyPassEnabled() {
   return EnableStringEncryption || EnableIndirectCall || EnableSplit ||
          EnableFlattening || EnableSubstitution || EnableBogusControlFlow ||
          EnableIndirectBranch || EnableIndirectGlobalVariable || EnableVM ||
-         EnableMerge || EnableFunc2Mod || EnableBB2Func || EnableConnect ||
-         EnableObfCon;
+         EnableMerge || EnableMFLA || EnableFunc2Mod || EnableBB2Func ||
+         EnableConnect || EnableObfCon;
 }
 
 template <typename PassT>
@@ -88,6 +92,7 @@ ModulePassManager buildModulePipeline() {
   ModulePassManager MPM;
   MPM.addPass(VMPass(EnableVM));
   MPM.addPass(MergePass(EnableMerge));
+  MPM.addPass(MFLAPass(EnableMFLA));
   MPM.addPass(Func2ModPass(EnableFunc2Mod, Func2ModOutputs));
   MPM.addPass(StringEncryptionPass(EnableStringEncryption));
 
@@ -114,6 +119,8 @@ bool addNamedPass(StringRef Name, ModulePassManager &MPM) {
     MPM.addPass(VMPass(true));
   else if (Name == "merge")
     MPM.addPass(MergePass(true));
+  else if (Name == "mfla")
+    MPM.addPass(MFLAPass(true));
   else if (Name == "sobf")
     MPM.addPass(StringEncryptionPass(true));
   else if (Name == "icall")
