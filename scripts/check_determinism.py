@@ -14,11 +14,11 @@ import subprocess
 from pathlib import Path
 
 CASES = [
-    ("tests/shape.ll", "-fla -sub -split"),
-    ("tests/shape.ll", "-vm"),
-    ("tests/shape.ll", "-connect"),
-    ("tests/basic-pipeline.c", "-sobf -icall -ibr -igv"),
-    ("tests/complex-pipelines.c", "-split -fla -sub -bcf -ibr -icall -igv -vm -merge -bb2func -connect -obfcon"),
+    ("tests/shape/shape.ll", "-fla -sub -split"),
+    ("tests/shape/shape.ll", "-vm"),
+    ("tests/shape/shape.ll", "-connect"),
+    ("tests/pipelines/basic-pipeline.c", "-sobf -icall -ibr -igv"),
+    ("tests/pipelines/complex-pipelines.c", "-split -fla -sub -bcf -ibr -icall -igv -vm -merge -bb2func -connect -obfcon"),
 ]
 
 
