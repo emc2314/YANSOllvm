@@ -19,7 +19,7 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
 
   std::vector<Function *> MergeList;
   for (Function &F : M) {
-    if (F.isDeclaration() || F.getName().starts_with("__yansollvm_"))
+    if (F.isDeclaration())
       continue;
     if (F.getLinkage() == GlobalValue::InternalLinkage && !F.isVarArg() &&
         (F.getReturnType()->isIntOrPtrTy() || F.getReturnType()->isVoidTy()))

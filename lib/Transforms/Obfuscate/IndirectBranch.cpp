@@ -24,7 +24,7 @@ PreservedAnalyses IndirectBranchPass::run(Module &M,
     if (toObfuscate(flag, &Fn, "ibr")) {
 
       if (Options && Options->skipFunction(Fn.getName())) {
-        YANSO_WARN_FUNCTION("ibr", Fn, "filtered/internal yansollvm function");
+        YANSO_WARN_FUNCTION("ibr", Fn, "not selected by filter");
         continue;
       }
 

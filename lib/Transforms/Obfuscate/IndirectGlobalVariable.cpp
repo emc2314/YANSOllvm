@@ -26,7 +26,7 @@ PreservedAnalyses IndirectGlobalVariablePass::run(Module &M,
     }
 
     if (Options && Options->skipFunction(Fn.getName())) {
-      YANSO_WARN_FUNCTION("igv", Fn, "filtered/internal yansollvm function");
+      YANSO_WARN_FUNCTION("igv", Fn, "not selected by filter");
       continue;
     }
 

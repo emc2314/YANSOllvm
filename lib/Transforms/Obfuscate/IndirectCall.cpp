@@ -23,7 +23,7 @@ PreservedAnalyses IndirectCallPass::run(Function &F,
 
 bool IndirectCallPass::doIndirctCall(Function &Fn) {
   if (Options && Options->skipFunction(Fn.getName())) {
-    YANSO_WARN_FUNCTION("icall", Fn, "filtered/internal yansollvm function");
+    YANSO_WARN_FUNCTION("icall", Fn, "not selected by filter");
     return false;
   }
 

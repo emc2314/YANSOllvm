@@ -53,10 +53,7 @@ static std::set<std::string> getStringList(yaml::Node *n) {
 }
 
 bool ObfuscationOptions::skipFunction(const Twine &FName) {
-  if (FName.str().find("yansollvm_") == std::string::npos) {
-    return hasFilter && FunctionFilter.count(FName.str()) == 0;
-  }
-  return true;
+  return hasFilter && FunctionFilter.count(FName.str()) == 0;
 }
 
 void ObfuscationOptions::handleRoot(yaml::Node *n) {
