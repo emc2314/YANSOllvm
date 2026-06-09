@@ -5,8 +5,7 @@
 ; RUN: grep -qv '@vararg(' %t.out.ll
 
 ; CHECK: yansollvm: warning: mfla: skip function 'vararg': vararg function
-; CHECK: yansollvm: error: mfla: skip function 'has_indirectbr': contains indirectbr/callbr
-; CHECK: yansollvm: warning: mfla: skip function 'has_blockaddress': contains blockaddress constant
+; CHECK: yansollvm: warning: mfla: skip function 'has_blockaddress': unsupported blockaddress use
 ; CHECK: yansollvm: warning: mfla: skip function 'self_rec': recursive SCC not supported
 ; CHECK: yansollvm: warning: mfla: skip function 'mut_a': recursive SCC not supported
 ; CHECK: yansollvm: warning: mfla: skip function 'mut_b': recursive SCC not supported

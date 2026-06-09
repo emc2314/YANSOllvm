@@ -37,8 +37,18 @@ struct MFLAArtifacts {
   GlobalVariable *Frame = nullptr;
   GlobalVariable *RetCont = nullptr;
   GlobalVariable *TargetTable = nullptr;
+  SmallVector<GlobalVariable *, 8> RemappedGlobals;
 
   void eraseFromParent() {
+    for (GlobalVariable *GV : reverse(RemappedGlobals)) {
+      if (GV)
+        GV->eraseFromParent();
+    }
+    RemappedGlobals.clear();
+    if (TargetTable) {
+      TargetTable->eraseFromParent();
+      TargetTable = nullptr;
+    }
     if (Mega) {
       Mega->eraseFromParent();
       Mega = nullptr;
@@ -50,10 +60,6 @@ struct MFLAArtifacts {
     if (RetCont) {
       RetCont->eraseFromParent();
       RetCont = nullptr;
-    }
-    if (TargetTable) {
-      TargetTable->eraseFromParent();
-      TargetTable = nullptr;
     }
   }
 };
@@ -90,19 +96,20 @@ struct SCCInfo {
   bool Recursive = false;
 };
 
-static bool hasUnsupportedIndirectTerminator(Function &F) {
-  for (BasicBlock &BB : F) {
-    Instruction *Term = BB.getTerminator();
-    if (isa<IndirectBrInst>(Term) || isa<CallBrInst>(Term))
+static bool hasUnsupportedCallBr(Function &F) {
+  for (BasicBlock &BB : F)
+    if (isa<CallBrInst>(BB.getTerminator()))
       return true;
-  }
   return false;
 }
 
 static Function *directCalledFunction(CallInst *Call) {
   if (!Call)
     return nullptr;
-  return Call->getCalledFunction();
+  Function *Callee = Call->getCalledFunction();
+  if (!Callee || Callee->getReturnType() != Call->getType())
+    return nullptr;
+  return Callee;
 }
 
 static bool isFrameScalar(Type *Ty) {
@@ -127,11 +134,93 @@ static uint64_t reserveSlot(uint64_t &NextOffset, Type *Ty,
   return Offset;
 }
 
-static bool containsBlockAddress(Function &F) {
-  for (BasicBlock &BB : F)
-    if (BB.hasAddressTaken())
+static bool constantContainsBlockAddress(Constant *C) {
+  if (!C)
+    return false;
+  if (auto *BA = dyn_cast<BlockAddress>(C))
+    return true;
+  if (isa<GlobalValue>(C))
+    return false;
+  for (Use &U : C->operands()) {
+    auto *OpC = dyn_cast<Constant>(U.get());
+    if (!OpC)
+      continue;
+    if (OpC == C)
+      continue;
+    if (constantContainsBlockAddress(OpC))
       return true;
+  }
   return false;
+}
+
+static bool constantUsesOnlyBlockAddressesInFunction(Constant *C, Function &F) {
+  if (!C)
+    return true;
+  if (auto *BA = dyn_cast<BlockAddress>(C))
+    return BA->getFunction() == &F;
+  for (Use &U : C->operands()) {
+    auto *OpC = dyn_cast<Constant>(U.get());
+    if (!OpC)
+      continue;
+    if (OpC == C)
+      continue;
+    if (!constantUsesOnlyBlockAddressesInFunction(OpC, F))
+      return false;
+  }
+  return true;
+}
+
+static bool isLocalGlobalPtr(Value *V) {
+  if (auto *GV = dyn_cast<GlobalVariable>(V->stripPointerCasts()))
+    return GV->hasLocalLinkage();
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return isLocalGlobalPtr(GEP->getPointerOperand());
+  return false;
+}
+
+static bool instructionBlockAddressUseIsSupported(Instruction &I, Function &F) {
+  bool HasBA = false;
+  for (Use &U : I.operands()) {
+    auto *C = dyn_cast<Constant>(U.get());
+    if (!C)
+      continue;
+    if (!constantUsesOnlyBlockAddressesInFunction(C, F))
+      return false;
+    HasBA |= constantContainsBlockAddress(C);
+  }
+  if (!HasBA)
+    return true;
+  if (isa<CallBase>(&I) || isa<ReturnInst>(&I))
+    return false;
+  if (isa<IndirectBrInst>(&I))
+    return true;
+  if (auto *Store = dyn_cast<StoreInst>(&I)) {
+    auto *StoredC = dyn_cast<Constant>(Store->getValueOperand());
+    if (StoredC && constantContainsBlockAddress(StoredC))
+      return isLocalGlobalPtr(Store->getPointerOperand());
+    return true;
+  }
+  return true;
+}
+
+static bool indirectBrDestinationsHavePhis(Function &F) {
+  for (BasicBlock &BB : F) {
+    auto *IB = dyn_cast<IndirectBrInst>(BB.getTerminator());
+    if (!IB)
+      continue;
+    for (unsigned I = 0, E = IB->getNumDestinations(); I != E; ++I)
+      if (isa<PHINode>(&IB->getDestination(I)->front()))
+        return true;
+  }
+  return false;
+}
+
+static bool hasSupportedBlockAddressDomain(Function &F) {
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (!instructionBlockAddressUseIsSupported(I, F))
+        return false;
+  return true;
 }
 
 static bool hasUnsupportedABIAttrs(Function &F) {
@@ -171,12 +260,16 @@ static bool isCandidate(Function &F) {
     YANSO_WARN_FUNCTION(PassName, F, "unsupported ABI parameter attribute");
     return false;
   }
-  if (hasUnsupportedIndirectTerminator(F)) {
-    YANSO_ERROR_FUNCTION(PassName, F, "contains indirectbr/callbr");
+  if (hasUnsupportedCallBr(F)) {
+    YANSO_ERROR_FUNCTION(PassName, F, "contains callbr");
     return false;
   }
-  if (containsBlockAddress(F)) {
-    YANSO_WARN_FUNCTION(PassName, F, "contains blockaddress constant");
+  if (!hasSupportedBlockAddressDomain(F)) {
+    YANSO_WARN_FUNCTION(PassName, F, "unsupported blockaddress use");
+    return false;
+  }
+  if (indirectBrDestinationsHavePhis(F)) {
+    YANSO_WARN_FUNCTION(PassName, F, "indirectbr destination PHI nodes");
     return false;
   }
   if (yansollvm_has_dynamic_stack_state(F)) {
@@ -217,6 +310,13 @@ static bool supportsCurrentLowering(
         continue;
       }
       if (auto *Call = dyn_cast<CallInst>(&I)) {
+        Function *RawCallee = Call->getCalledFunction();
+        if (RawCallee && CandidateIDs.count(RawCallee) &&
+            RawCallee->getReturnType() != Call->getType()) {
+          YANSO_WARN_FUNCTION(PassName, F,
+                              "callee wrapper return type changed");
+          return false;
+        }
         if (Function *Callee = directCalledFunction(Call)) {
           if (CandidateIDs.count(Callee)) {
             if (!Call->getType()->isVoidTy() &&
@@ -251,10 +351,10 @@ static bool supportsCurrentLowering(
     }
     Instruction *Term = BB.getTerminator();
     if (!isa<ReturnInst>(Term) && !isa<BranchInst>(Term) &&
-        !isa<SwitchInst>(Term)) {
+        !isa<SwitchInst>(Term) && !isa<IndirectBrInst>(Term)) {
       YANSO_WARN_FUNCTION(
           PassName, F,
-          "current lowering supports only branch, switch, and return terminators");
+          "current lowering supports only branch, switch, indirectbr, and return terminators");
       return false;
     }
   }
@@ -401,9 +501,91 @@ static LoadInst *loadSlot(IRBuilder<> &B, Type *Ty, MFLAArtifacts &A,
   return B.CreateLoad(Ty, storagePtr(B, A, Ref), Name);
 }
 
+static Constant *remapConstant(Constant *C, Function *OldF, Function &Mega,
+                               DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+                               ValueToValueMapTy &VMap) {
+  if (!C)
+    return nullptr;
+  if (auto *BA = dyn_cast<BlockAddress>(C)) {
+    if (BA->getFunction() == OldF) {
+      BasicBlock *NewBB = BBMap.lookup(BA->getBasicBlock());
+      if (NewBB)
+        return BlockAddress::get(&Mega, NewBB);
+    }
+    return C;
+  }
+  if (auto *GV = dyn_cast<GlobalValue>(C)) {
+    auto It = VMap.find(GV);
+    if (It != VMap.end())
+      if (auto *Mapped = dyn_cast<Constant>(It->second))
+        return Mapped;
+    return C;
+  }
+  if (isa<ConstantData>(C) || isa<ConstantAggregateZero>(C) || isa<UndefValue>(C))
+    return C;
+  bool Changed = false;
+  SmallVector<Constant *, 8> Ops;
+  for (Use &U : C->operands()) {
+    auto *OpC = dyn_cast<Constant>(U.get());
+    if (!OpC)
+      return C;
+    if (OpC == C)
+      return C;
+    Constant *Mapped = remapConstant(OpC, OldF, Mega, BBMap, VMap);
+    Ops.push_back(Mapped);
+    Changed |= Mapped != OpC;
+  }
+  if (!Changed)
+    return C;
+  if (auto *CE = dyn_cast<ConstantExpr>(C))
+    return CE->getWithOperands(Ops);
+  if (auto *CA = dyn_cast<ConstantArray>(C))
+    return ConstantArray::get(CA->getType(), Ops);
+  if (auto *CS = dyn_cast<ConstantStruct>(C))
+    return ConstantStruct::get(CS->getType(), Ops);
+  if (isa<ConstantVector>(C))
+    return ConstantVector::get(Ops);
+  return C;
+}
+
+static GlobalVariable *remapGlobalInitializerForFunction(
+    GlobalVariable &GV, Function *OldF, Function &Mega,
+    DenseMap<BasicBlock *, BasicBlock *> &BBMap, ValueToValueMapTy &VMap,
+    MFLAArtifacts &A) {
+  if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
+      !constantContainsBlockAddress(GV.getInitializer()) ||
+      !constantUsesOnlyBlockAddressesInFunction(GV.getInitializer(), *OldF))
+    return nullptr;
+
+  Constant *Init = remapConstant(GV.getInitializer(), OldF, Mega, BBMap, VMap);
+  auto *NewGV = new GlobalVariable(
+      *Mega.getParent(), GV.getValueType(), GV.isConstant(),
+      GlobalValue::InternalLinkage, Init, (GV.getName() + ".mfla").str(),
+      nullptr, GV.getThreadLocalMode(), GV.getAddressSpace(),
+      GV.isExternallyInitialized());
+  NewGV->copyAttributesFrom(&GV);
+  NewGV->setLinkage(GlobalValue::InternalLinkage);
+  NewGV->setName((GV.getName() + ".mfla").str());
+  VMap[&GV] = NewGV;
+  A.RemappedGlobals.push_back(NewGV);
+  return NewGV;
+}
+
+static void remapLocalBlockAddressGlobals(Function *OldF, Function &Mega,
+                                          DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+                                          ValueToValueMapTy &VMap,
+                                          MFLAArtifacts &A) {
+  for (GlobalVariable &GV : OldF->getParent()->globals())
+    remapGlobalInitializerForFunction(GV, OldF, Mega, BBMap, VMap, A);
+}
+
 static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
-                             const FunctionLayout &Layout,
-                             MFLAArtifacts &A) {
+                             const FunctionLayout &Layout, MFLAArtifacts &A,
+                             Function *OldF = nullptr,
+                             DenseMap<BasicBlock *, BasicBlock *> *BBMap = nullptr) {
+  if (auto *C = dyn_cast<Constant>(V))
+    if (OldF && BBMap)
+      return remapConstant(C, OldF, *A.Mega, *BBMap, VMap);
   if (auto *Call = dyn_cast<CallInst>(V)) {
     auto It = Layout.CallResultOffsets.find(Call);
     if (It != Layout.CallResultOffsets.end())
@@ -488,6 +670,17 @@ static void addBaseToLayout(FunctionLayout &L, uint64_t Base) {
     addBaseToRef(Entry.second, Base);
 }
 
+static bool isInternalCallee(CallInst *Call,
+                             const DenseMap<Function *, unsigned> &CandidateIDs) {
+  Function *Callee = directCalledFunction(Call);
+  return Callee && CandidateIDs.count(Callee);
+}
+
+static bool isCPSLoweredCall(CallInst *Call,
+                             const DenseMap<Function *, unsigned> &CandidateIDs) {
+  return isInternalCallee(Call, CandidateIDs);
+}
+
 static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
                                const DenseMap<Function *, unsigned> &CandidateIDs,
                                CallGraphInfo CandidateGraph,
@@ -516,12 +709,10 @@ static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
         if (auto *Call = dyn_cast<CallInst>(&I)) {
-          if (Function *Callee = directCalledFunction(Call)) {
-            if (CandidateIDs.count(Callee) && !Call->getType()->isVoidTy()) {
-              uint64_t Offset = reserveSlot(NextOffset, Call->getType(), DL);
-              L.CallResultOffsets[Call] = staticRef(Call->getType(), Offset);
-              continue;
-            }
+          if (isCPSLoweredCall(Call, CandidateIDs) && !Call->getType()->isVoidTy()) {
+            uint64_t Offset = reserveSlot(NextOffset, Call->getType(), DL);
+            L.CallResultOffsets[Call] = staticRef(Call->getType(), Offset);
+            continue;
           }
         }
         auto *Phi = dyn_cast<PHINode>(&I);
@@ -622,13 +813,14 @@ static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
 
 static Instruction *cloneMapped(Instruction &I, IRBuilder<> &B,
                                 ValueToValueMapTy &VMap,
-                                const FunctionLayout &Layout,
-                                MFLAArtifacts &A) {
+                                const FunctionLayout &Layout, MFLAArtifacts &A,
+                                Function *OldF,
+                                DenseMap<BasicBlock *, BasicBlock *> &BBMap) {
   Instruction *Clone = I.clone();
   RemapInstruction(Clone, VMap,
                    RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
   for (Use &U : I.operands()) {
-    Value *Mapped = mapValueForUse(U.get(), B, VMap, Layout, A);
+    Value *Mapped = mapValueForUse(U.get(), B, VMap, Layout, A, OldF, &BBMap);
     if (Mapped)
       Clone->setOperand(U.getOperandNo(), Mapped);
   }
@@ -638,14 +830,15 @@ static Instruction *cloneMapped(Instruction &I, IRBuilder<> &B,
 
 static bool storeIncomingPhis(IRBuilder<> &B, BasicBlock *Pred,
                               BasicBlock *Succ, ValueToValueMapTy &VMap,
-                              const FunctionLayout &Layout,
-                              MFLAArtifacts &A) {
+                              const FunctionLayout &Layout, MFLAArtifacts &A,
+                              Function *OldF,
+                              DenseMap<BasicBlock *, BasicBlock *> &BBMap) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
       break;
     Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A);
+    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap);
     if (!Mapped)
       return false;
     auto It = Layout.PhiOffsets.find(Phi);
@@ -691,13 +884,14 @@ static Value *muxValue(IRBuilder<> &B, const DataLayout &DL, Value *Cond,
 static bool muxIncomingPhis(IRBuilder<> &B, const DataLayout &DL, BasicBlock *Pred,
                             BasicBlock *Succ, Value *TakeEdge,
                             ValueToValueMapTy &VMap, const FunctionLayout &Layout,
-                            MFLAArtifacts &A) {
+                            MFLAArtifacts &A, Function *OldF,
+                            DenseMap<BasicBlock *, BasicBlock *> &BBMap) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
       break;
     Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A);
+    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap);
     if (!Mapped)
       return false;
     auto It = Layout.PhiOffsets.find(Phi);
@@ -717,14 +911,14 @@ static bool hasPhiNodes(BasicBlock *BB) {
 static bool createThreadedTerminator(
     IRBuilder<> &B, Function &Mega, Instruction *OldTerm,
     ValueToValueMapTy &VMap, DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-    BasicBlock *Exit, MFLAArtifacts &A,
-    const FunctionLayout &Layout,
-    DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> &ReturnDispatches) {
+    BasicBlock *Exit, MFLAArtifacts &A, const FunctionLayout &Layout,
+    DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> &ReturnDispatches,
+    Function *OldF) {
   BasicBlock *Pred = OldTerm->getParent();
 
   if (auto *Ret = dyn_cast<ReturnInst>(OldTerm)) {
     if (Value *RV = Ret->getReturnValue()) {
-      Value *Mapped = mapValueForUse(RV, B, VMap, Layout, A);
+      Value *Mapped = mapValueForUse(RV, B, VMap, Layout, A, OldF, &BBMap);
       if (!Mapped)
         return false;
       storeSlot(B, Mapped, A, Layout.RetOffset);
@@ -749,10 +943,27 @@ static bool createThreadedTerminator(
 
   auto *Br = dyn_cast<BranchInst>(OldTerm);
   if (!Br) {
+    if (auto *IB = dyn_cast<IndirectBrInst>(OldTerm)) {
+      Value *Target = mapValueForUse(IB->getAddress(), B, VMap, Layout, A,
+                                     OldF, &BBMap);
+      if (!Target)
+        return false;
+      auto *End = IndirectBrInst::Create(Target, IB->getNumDestinations(),
+                                         B.GetInsertBlock());
+      for (unsigned I = 0, E = IB->getNumDestinations(); I != E; ++I) {
+        BasicBlock *NewDest = BBMap.lookup(IB->getDestination(I));
+        if (!NewDest)
+          return false;
+        End->addDestination(NewDest);
+      }
+      return true;
+    }
+
     auto *Sw = dyn_cast<SwitchInst>(OldTerm);
     if (!Sw)
       return false;
-    Value *Cond = mapValueForUse(Sw->getCondition(), B, VMap, Layout, A);
+    Value *Cond = mapValueForUse(Sw->getCondition(), B, VMap, Layout, A,
+                                 OldF, &BBMap);
     BasicBlock *OldDefault = Sw->getDefaultDest();
     BasicBlock *NewDefault = BBMap.lookup(OldDefault);
     if (!Cond || !NewDefault)
@@ -812,7 +1023,8 @@ static bool createThreadedTerminator(
     for (auto &Entry : SuccConds) {
       if (hasPhiNodes(Entry.first)) {
         if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred,
-                             Entry.first, Entry.second, VMap, Layout, A))
+                             Entry.first, Entry.second, VMap, Layout, A,
+                             OldF, BBMap))
           return false;
       }
     }
@@ -826,13 +1038,15 @@ static bool createThreadedTerminator(
   if (Br->isUnconditional()) {
     BasicBlock *OldSucc = Br->getSuccessor(0);
     BasicBlock *NewSucc = BBMap.lookup(OldSucc);
-    if (!NewSucc || !storeIncomingPhis(B, Pred, OldSucc, VMap, Layout, A))
+    if (!NewSucc || !storeIncomingPhis(B, Pred, OldSucc, VMap, Layout, A,
+                                       OldF, BBMap))
       return false;
     createStaticIndirectBr(Mega, B.GetInsertBlock(), NewSucc);
     return true;
   }
 
-  Value *Cond = mapValueForUse(Br->getCondition(), B, VMap, Layout, A);
+  Value *Cond = mapValueForUse(Br->getCondition(), B, VMap, Layout, A,
+                               OldF, &BBMap);
   BasicBlock *OldTrue = Br->getSuccessor(0);
   BasicBlock *OldFalse = Br->getSuccessor(1);
   BasicBlock *TrueBB = BBMap.lookup(OldTrue);
@@ -844,11 +1058,11 @@ static bool createThreadedTerminator(
   Value *FalseAddr = BlockAddress::get(&Mega, FalseBB);
   Value *Target = muxPtr(B, Mega.getParent()->getDataLayout(), Cond, TrueAddr, FalseAddr);
   if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldTrue,
-                       Cond, VMap, Layout, A))
+                       Cond, VMap, Layout, A, OldF, BBMap))
     return false;
   Value *NotCond = B.CreateNot(Cond);
   if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldFalse,
-                       NotCond, VMap, Layout, A))
+                       NotCond, VMap, Layout, A, OldF, BBMap))
     return false;
   auto *End = IndirectBrInst::Create(Target, 2, B.GetInsertBlock());
   End->addDestination(TrueBB);
@@ -970,6 +1184,7 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   for (Function *F : Candidates) {
     ValueToValueMapTy VMap;
     DenseMap<BasicBlock *, BasicBlock *> &BBMap = FunctionBBMaps[F];
+    remapLocalBlockAddressGlobals(F, Mega, BBMap, VMap, A);
     DenseMap<BasicBlock *, BasicBlock *> TerminatorBlockFor;
     const FunctionLayout &L = Layouts[F];
 
@@ -991,16 +1206,14 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
           continue;
         }
         if (auto *Call = dyn_cast<CallInst>(&I)) {
-          if (Function *Callee = directCalledFunction(Call)) {
-            if (CandidateIDs.count(Callee)) {
-              if (!lowerInternalCall(Call, B, VMap, L, TerminatorBlockFor, BB,
-                                     LCtx))
-                return false;
-              continue;
-            }
+          if (isCPSLoweredCall(Call, CandidateIDs)) {
+            if (!lowerInternalCall(Call, B, VMap, L, TerminatorBlockFor, BB,
+                                   LCtx))
+              return false;
+            continue;
           }
         }
-        Instruction *Clone = cloneMapped(I, B, VMap, L, A);
+        Instruction *Clone = cloneMapped(I, B, VMap, L, A, F, BBMap);
         B.Insert(Clone);
         if (!I.getType()->isVoidTy()) {
           auto It = L.SpilledValueOffsets.find(&I);
@@ -1019,8 +1232,7 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
         continue;
       IRBuilder<> B(NewBB);
       if (!createThreadedTerminator(B, Mega, BB.getTerminator(), VMap, BBMap,
-                                    Exit, A, L,
-                                    ReturnDispatches))
+                                    Exit, A, L, ReturnDispatches, F))
         return false;
     }
   }
@@ -1031,6 +1243,15 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
         IB->addDestination(Cont);
 
   return true;
+}
+
+static void markNoUnwindIfNoThrowingCalls(Function &F) {
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->mayThrow())
+          return;
+  F.addFnAttr(Attribute::NoUnwind);
 }
 
 static void sanitizeWrapperAttributes(Function &F) {
@@ -1125,6 +1346,7 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     Artifacts.eraseFromParent();
     return PreservedAnalyses::none();
   }
+  markNoUnwindIfNoThrowingCalls(*Artifacts.Mega);
 
   for (Function *F : Candidates)
     rewriteAsWrapper(*F, Artifacts, Plan.Layouts[F]);
