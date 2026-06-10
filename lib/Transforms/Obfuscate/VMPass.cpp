@@ -1,5 +1,9 @@
 #include "VMPass.h"
 
+#include "CryptoUtils.h"
+#include "YANSOllvmSeed.h"
+#include "VMVariant.h"
+
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/IRBuilder.h"
@@ -10,6 +14,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueHandle.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
@@ -17,8 +22,22 @@
 using namespace llvm;
 
 namespace {
+static cl::opt<unsigned> VMControlFlowVariantPermille(
+    "vm-cf-variant-permille", cl::init(80), cl::Hidden,
+    cl::desc("Permille probability for control-flow VM binary-op variants"));
+static cl::opt<unsigned> VMForkVariantPermille(
+    "vm-fork-variant-permille", cl::init(40), cl::Hidden,
+    cl::desc("Permille probability for opaque-fork VM binary-op variants"));
+static cl::opt<unsigned> VMDataMuxVariantPermille(
+    "vm-datamux-variant-permille", cl::init(40), cl::Hidden,
+    cl::desc("Permille probability for data-mux VM binary-op variants"));
+static cl::opt<unsigned> VMRelationVariantPermille(
+    "vm-relation-variant-permille", cl::init(80), cl::Hidden,
+    cl::desc("Permille probability for relation-decorated VM binary-op variants"));
+
 class VirtualizeImpl {
   StringMap<Function *> Cache;
+  uint64_t ModuleSeed = 0;
 
   static constexpr StringRef Prefix = "__yansollvm_vm_";
 
@@ -86,18 +105,53 @@ class VirtualizeImpl {
     return (Twine(Prefix) + Base + "_" + sanitizedTypeName(Ty) + Suffix).str();
   }
 
+  static uint64_t instructionSeed(Instruction *I, uint64_t Seed) {
+    if (!I)
+      return Seed;
+    Function *F = I->getFunction();
+    if (F)
+      Seed = yanso_hash_string(F->getName(), Seed);
+    unsigned BlockIndex = 0;
+    if (F) {
+      for (BasicBlock &BB : *F) {
+        if (&BB == I->getParent())
+          break;
+        ++BlockIndex;
+      }
+    }
+    unsigned InstIndex = 0;
+    if (BasicBlock *BB = I->getParent()) {
+      for (Instruction &Cur : *BB) {
+        if (&Cur == I)
+          break;
+        ++InstIndex;
+      }
+    }
+    Seed = yanso_mix64(BlockIndex + 1, Seed);
+    Seed = yanso_mix64(InstIndex + 1, Seed);
+    Seed = yanso_mix64(I->getOpcode() + 1, Seed);
+    return Seed;
+  }
+
+
   static std::string castHandlerName(StringRef Base, Type *SrcTy, Type *DstTy) {
     return (Twine(Prefix) + Base + "_" + sanitizedTypeName(SrcTy) + "_" +
             sanitizedTypeName(DstTy))
         .str();
   }
 
-  Function *createBinaryHandler(Module &M, unsigned Opcode, IntegerType *Ty) {
+  Function *createBinaryHandler(Module &M, unsigned Opcode, IntegerType *Ty,
+                                uint64_t VariantSeed) {
     std::string Name = instructionName(Opcode);
     if (Name.empty())
       return nullptr;
 
-    std::string FullName = typedName(Name, Ty);
+    VMVariantEmitter::BinaryVariant Variant =
+        VMVariantEmitter::selectBinaryVariant(
+            Opcode, Ty, VariantSeed, VMControlFlowVariantPermille,
+            VMForkVariantPermille, VMDataMuxVariantPermille,
+            VMRelationVariantPermille);
+    std::string FullName = typedName(Name, Ty, VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
     if (F)
       return F;
@@ -110,87 +164,21 @@ class VirtualizeImpl {
     BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
     IRBuilder<> B(Entry);
 
-    switch (Opcode) {
-    case BinaryOperator::Add:
-      emitAdd(B, X, Y);
-      break;
-    case BinaryOperator::Sub:
-      emitSub(B, Ty, X, Y);
-      break;
-    case BinaryOperator::And:
-      emitAnd(B, X, Y);
-      break;
-    case BinaryOperator::Or:
-      emitOr(B, X, Y);
-      break;
-    case BinaryOperator::Xor:
-      emitXor(B, Ty, X, Y);
-      break;
-    default:
-      B.CreateRet(B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X,
-                                Y));
-      break;
-    }
-
+    VMVariantEmitter::emitBinary(B, Opcode, Ty, X, Y, Variant, VariantSeed);
     attrs(F);
     return F;
   }
 
-  static void emitAdd(IRBuilder<> &B, Value *X, Value *Y) {
-    Value *A = B.CreateNot(Y);
-    A = B.CreateOr(A, X);
-    Value *C = B.CreateNot(X);
-    C = B.CreateAnd(C, Y);
-    Value *D = B.CreateAnd(X, Y);
-    D = B.CreateNot(D);
-    Value *E = B.CreateOr(X, Y);
-    Value *R = B.CreateAdd(A, C);
-    R = B.CreateSub(R, D);
-    R = B.CreateAdd(R, E);
-    B.CreateRet(R);
-  }
-
-  static void emitSub(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y) {
-    Value *R = B.CreateAdd(X, B.CreateNot(Y));
-    R = B.CreateAdd(R, ConstantInt::get(Ty, 1));
-    B.CreateRet(R);
-  }
-
-  static void emitAnd(IRBuilder<> &B, Value *X, Value *Y) {
-    Value *A = B.CreateAnd(X, Y);
-    A = B.CreateNot(A);
-    Value *C = B.CreateNot(X);
-    C = B.CreateOr(C, Y);
-    Value *D = B.CreateNot(Y);
-    D = B.CreateAnd(X, D);
-    Value *R = B.CreateAdd(C, D);
-    R = B.CreateSub(R, A);
-    B.CreateRet(R);
-  }
-
-  static void emitOr(IRBuilder<> &B, Value *X, Value *Y) {
-    Value *A = B.CreateXor(X, Y);
-    Value *C = B.CreateNot(X);
-    C = B.CreateAnd(C, Y);
-    Value *R = B.CreateAdd(A, Y);
-    R = B.CreateSub(R, C);
-    B.CreateRet(R);
-  }
-
-  static void emitXor(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y) {
-    Value *A = B.CreateAdd(X, Y);
-    Value *C = B.CreateAnd(X, Y);
-    Value *R = B.CreateShl(C, ConstantInt::get(Ty, 1));
-    R = B.CreateSub(A, R);
-    B.CreateRet(R);
-  }
-
-  Function *createICmpHandler(Module &M, CmpInst::Predicate Pred, Type *Ty) {
+  Function *createICmpHandler(Module &M, CmpInst::Predicate Pred, Type *Ty,
+                              uint64_t VariantSeed) {
     std::string Name = (Twine("icmp_") + predicateName(Pred)).str();
     if (Name.empty())
       return nullptr;
 
-    std::string FullName = typedName(Name, Ty);
+    VMVariantEmitter::PredicateVariant Variant =
+        VMVariantEmitter::selectPredicateVariant(
+            Ty, VariantSeed, VMForkVariantPermille, VMDataMuxVariantPermille);
+    std::string FullName = typedName(Name, Ty, VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
     if (F)
       return F;
@@ -203,7 +191,7 @@ class VirtualizeImpl {
     Value *Y = &*It;
     BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
     IRBuilder<> B(Entry);
-    B.CreateRet(B.CreateICmp(Pred, X, Y));
+    VMVariantEmitter::emitICmp(B, Pred, Ty, X, Y, Variant, VariantSeed);
     attrs(F);
     return F;
   }
@@ -287,8 +275,12 @@ class VirtualizeImpl {
     return F;
   }
 
-  Function *createSelectHandler(Module &M, Type *Ty) {
-    std::string FullName = typedName(instructionName(Instruction::Select), Ty);
+  Function *createSelectHandler(Module &M, Type *Ty, uint64_t VariantSeed) {
+    VMVariantEmitter::SelectVariant Variant =
+        VMVariantEmitter::selectSelectVariant(
+            Ty, VariantSeed, VMForkVariantPermille, VMDataMuxVariantPermille);
+    std::string FullName = typedName(instructionName(Instruction::Select), Ty,
+                                     VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
     if (F)
       return F;
@@ -303,15 +295,8 @@ class VirtualizeImpl {
     BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
     IRBuilder<> B(Entry);
 
-    if (auto *ITy = dyn_cast<IntegerType>(Ty)) {
-      Value *CondZ = B.CreateZExt(Cond, ITy);
-      Value *Mask = B.CreateSub(ConstantInt::get(ITy, 0), CondZ);
-      Value *TruePart = B.CreateAnd(TrueV, Mask);
-      Value *FalsePart = B.CreateAnd(FalseV, B.CreateNot(Mask));
-      B.CreateRet(B.CreateOr(TruePart, FalsePart));
-    } else {
-      B.CreateRet(B.CreateSelect(Cond, TrueV, FalseV));
-    }
+    VMVariantEmitter::emitSelect(B, Ty, Cond, TrueV, FalseV, Variant,
+                                 VariantSeed);
     attrs(F);
     return F;
   }
@@ -511,19 +496,20 @@ class VirtualizeImpl {
     void visitSelectInst(SelectInst &SI) { Impl.addSelectPlan(Plans, &SI); }
   };
 
-  Function *createHandler(Module &M, const HandlerKey &Key) {
+  Function *createHandler(Module &M, const HandlerKey &Key, uint64_t VariantSeed) {
     switch (Key.Kind) {
     case HandlerKind::Binary:
-      return createBinaryHandler(M, Key.Opcode, cast<IntegerType>(Key.Ty));
+      return createBinaryHandler(M, Key.Opcode, cast<IntegerType>(Key.Ty),
+                                 VariantSeed);
     case HandlerKind::ICmp:
-      return createICmpHandler(M, Key.Predicate, Key.Ty);
+      return createICmpHandler(M, Key.Predicate, Key.Ty, VariantSeed);
     case HandlerKind::Intrinsic:
       return createIntrinsicHandler(M, Key.IntrinsicID,
                                     cast<IntegerType>(Key.Ty), Key.ImmArg);
     case HandlerKind::Cast:
       return createCastHandler(M, Key.Opcode, Key.SrcTy, Key.DstTy);
     case HandlerKind::Select:
-      return createSelectHandler(M, Key.Ty);
+      return createSelectHandler(M, Key.Ty, VariantSeed);
     }
     llvm_unreachable("unknown VM handler kind");
   }
@@ -542,7 +528,15 @@ class VirtualizeImpl {
     if (!Variant)
       return false;
 
-    Function *Func = createHandler(M, Variant->Key);
+    uint64_t VariantSeed = ModuleSeed;
+    VariantSeed = yanso_mix64(static_cast<uint64_t>(Variant->Key.Kind) + 1,
+                              VariantSeed);
+    VariantSeed = yanso_mix64(Variant->Key.Opcode + 1, VariantSeed);
+    VariantSeed = yanso_mix64(Variant->Key.Predicate + 1, VariantSeed);
+    VariantSeed = yanso_mix64(Variant->Key.IntrinsicID + 1, VariantSeed);
+    VariantSeed = instructionSeed(Plan.Match.ResultInst, VariantSeed);
+
+    Function *Func = createHandler(M, Variant->Key, VariantSeed);
     if (!Func)
       return false;
 
@@ -565,6 +559,7 @@ class VirtualizeImpl {
 
 public:
   bool run(Module &M) {
+    ModuleSeed = yanso_module_seed(M, "vm");
     SmallVector<VMRewritePlan, 64> Plans;
     PlanCollector Collector(*this, Plans);
     for (Function &F : M)

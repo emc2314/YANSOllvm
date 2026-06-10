@@ -31,6 +31,7 @@ add_llvm_pass_plugin(yansollvm
   lib/Transforms/Obfuscate/IndirectCall.cpp
   lib/Transforms/Obfuscate/IndirectGlobalVariable.cpp
   lib/Transforms/Obfuscate/YANSOllvmCommon.cpp
+  lib/Transforms/Obfuscate/VMVariant.cpp
   lib/Transforms/Obfuscate/VMPass.cpp
   lib/Transforms/Obfuscate/MergePass.cpp
   lib/Transforms/Obfuscate/MFLAPass.cpp
