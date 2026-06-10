@@ -1,47 +1,47 @@
 ; RUN: rm -rf %t && mkdir -p %t
 ; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -S %s -o %t/vm-expanded.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm,vm -verify-each -S %s -o %t/vm-twice.ll
-; RUN: grep '__yansollvm_vm_Add_i32' %t/vm-twice.ll
+; RUN: grep '__yansollvm_vm_add_i32' %t/vm-twice.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm,merge -verify-each -S %s -o %t/vm-merge.ll
 ; RUN: grep 'merge' %t/vm-merge.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -icall -S %s -o %t/vm-icall.ll
-; RUN: grep '__yansollvm_vm_Ctlz_i32_0' %t/vm-icall.ll
-; RUN: grep '__yansollvm_vm_Add_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Sub_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Mul_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_UDiv_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_SDiv_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_URem_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_SRem_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Shl_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_LShr_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_AShr_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_And_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Or_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Xor_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_ICmpUGT_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_FShl_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_FShr_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_BSwap_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_CtPop_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Ctlz_i32_0' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Cttz_i32_0' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Abs_i32_0' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_SMin_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_UMax_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Trunc_i32_i8' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_ZExt_i8_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_SExt_i8_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Select_i32' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Add_i128' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_ICmpEQ_i128' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Select_i128' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_ICmpNE_p0' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_Select_p0' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_PtrToInt_p0_i64' %t/vm-expanded.ll
-; RUN: grep '__yansollvm_vm_IntToPtr_i64_p0' %t/vm-expanded.ll
-; RUN: ! grep '__yansollvm_vm_Add[^_]' %t/vm-expanded.ll
-; RUN: ! grep 'call i64 @__yansollvm_vm_Add' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_ctlz_i32_0' %t/vm-icall.ll
+; RUN: grep '__yansollvm_vm_add_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_sub_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_mul_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_udiv_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_sdiv_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_urem_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_srem_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_shl_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_lshr_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_ashr_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_and_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_or_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_xor_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_icmp_ugt_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_fshl_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_fshr_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_bswap_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_ctpop_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_ctlz_i32_0' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_cttz_i32_0' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_abs_i32_0' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_smin_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_umax_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_trunc_i32_i8' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_zext_i8_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_sext_i8_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_select_i32' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_add_i128' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_icmp_eq_i128' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_select_i128' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_icmp_ne_ptr' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_select_ptr' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_ptrtoint_ptr_i64' %t/vm-expanded.ll
+; RUN: grep '__yansollvm_vm_inttoptr_i64_ptr' %t/vm-expanded.ll
+; RUN: ! grep '__yansollvm_vm_add[^_]' %t/vm-expanded.ll
+; RUN: ! grep 'call i64 @__yansollvm_vm_add' %t/vm-expanded.ll
 ; RUN: %clang %t/vm-expanded.ll -o %t/vm-expanded
 ; RUN: %t/vm-expanded
 

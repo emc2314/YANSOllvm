@@ -1,16 +1,18 @@
 #include "VMPass.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ValueHandle.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <string>
-#include <vector>
 
 using namespace llvm;
 
@@ -33,135 +35,65 @@ class VirtualizeImpl {
     return isSupportedInt(Ty) || isSupportedPointer(Ty);
   }
 
-  static StringRef binaryName(unsigned Opcode) {
-    switch (Opcode) {
-    case BinaryOperator::Add:
-      return "Add";
-    case BinaryOperator::Sub:
-      return "Sub";
-    case BinaryOperator::Mul:
-      return "Mul";
-    case BinaryOperator::UDiv:
-      return "UDiv";
-    case BinaryOperator::SDiv:
-      return "SDiv";
-    case BinaryOperator::URem:
-      return "URem";
-    case BinaryOperator::SRem:
-      return "SRem";
-    case BinaryOperator::Shl:
-      return "Shl";
-    case BinaryOperator::AShr:
-      return "AShr";
-    case BinaryOperator::LShr:
-      return "LShr";
-    case BinaryOperator::And:
-      return "And";
-    case BinaryOperator::Or:
-      return "Or";
-    case BinaryOperator::Xor:
-      return "Xor";
-    default:
-      return "";
+  static std::string sanitizeName(StringRef Name) {
+    std::string Sanitized;
+    Sanitized.reserve(Name.size());
+    bool LastWasUnderscore = false;
+
+    for (char C : Name) {
+      if ((C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
+          (C >= '0' && C <= '9')) {
+        Sanitized.push_back(C);
+        LastWasUnderscore = false;
+      } else if (!LastWasUnderscore) {
+        Sanitized.push_back('_');
+        LastWasUnderscore = true;
+      }
     }
+
+    while (!Sanitized.empty() && Sanitized.front() == '_')
+      Sanitized.erase(Sanitized.begin());
+    while (!Sanitized.empty() && Sanitized.back() == '_')
+      Sanitized.pop_back();
+    return Sanitized;
   }
 
-  static StringRef predicateName(CmpInst::Predicate Pred) {
-    switch (Pred) {
-    case CmpInst::ICMP_EQ:
-      return "ICmpEQ";
-    case CmpInst::ICMP_NE:
-      return "ICmpNE";
-    case CmpInst::ICMP_UGT:
-      return "ICmpUGT";
-    case CmpInst::ICMP_UGE:
-      return "ICmpUGE";
-    case CmpInst::ICMP_ULT:
-      return "ICmpULT";
-    case CmpInst::ICMP_ULE:
-      return "ICmpULE";
-    case CmpInst::ICMP_SGT:
-      return "ICmpSGT";
-    case CmpInst::ICMP_SGE:
-      return "ICmpSGE";
-    case CmpInst::ICMP_SLT:
-      return "ICmpSLT";
-    case CmpInst::ICMP_SLE:
-      return "ICmpSLE";
-    default:
-      return "";
-    }
+  static std::string sanitizedTypeName(Type *Ty) {
+    std::string Name;
+    raw_string_ostream OS(Name);
+    Ty->print(OS);
+    OS.flush();
+    return sanitizeName(Name);
   }
 
-  static StringRef castName(unsigned Opcode) {
-    switch (Opcode) {
-    case Instruction::Trunc:
-      return "Trunc";
-    case Instruction::ZExt:
-      return "ZExt";
-    case Instruction::SExt:
-      return "SExt";
-    case Instruction::PtrToInt:
-      return "PtrToInt";
-    case Instruction::IntToPtr:
-      return "IntToPtr";
-    default:
-      return "";
-    }
+  static std::string instructionName(unsigned Opcode) {
+    return sanitizeName(Instruction::getOpcodeName(Opcode));
   }
 
-  static StringRef intrinsicName(Intrinsic::ID ID) {
-    switch (ID) {
-    case Intrinsic::fshl:
-      return "FShl";
-    case Intrinsic::fshr:
-      return "FShr";
-    case Intrinsic::bswap:
-      return "BSwap";
-    case Intrinsic::bitreverse:
-      return "BitReverse";
-    case Intrinsic::ctpop:
-      return "CtPop";
-    case Intrinsic::ctlz:
-      return "Ctlz";
-    case Intrinsic::cttz:
-      return "Cttz";
-    case Intrinsic::abs:
-      return "Abs";
-    case Intrinsic::smin:
-      return "SMin";
-    case Intrinsic::smax:
-      return "SMax";
-    case Intrinsic::umin:
-      return "UMin";
-    case Intrinsic::umax:
-      return "UMax";
-    default:
-      return "";
-    }
+  static std::string predicateName(CmpInst::Predicate Pred) {
+    return sanitizeName(CmpInst::getPredicateName(Pred));
   }
 
-  static std::string typeSuffix(Type *Ty) {
-    if (auto *ITy = dyn_cast<IntegerType>(Ty))
-      return (Twine("i") + Twine(ITy->getBitWidth())).str();
-    if (auto *PTy = dyn_cast<PointerType>(Ty))
-      return (Twine("p") + Twine(PTy->getAddressSpace())).str();
-    llvm_unreachable("unsupported VM handler type");
+  static std::string intrinsicName(Intrinsic::ID ID) {
+    StringRef Name = Intrinsic::getBaseName(ID);
+    if (Name.consume_front("llvm."))
+      return sanitizeName(Name);
+    return sanitizeName(Name);
   }
 
   static std::string typedName(StringRef Base, Type *Ty,
                                StringRef Suffix = "") {
-    return (Twine(Prefix) + Base + "_" + typeSuffix(Ty) + Suffix).str();
+    return (Twine(Prefix) + Base + "_" + sanitizedTypeName(Ty) + Suffix).str();
   }
 
   static std::string castHandlerName(StringRef Base, Type *SrcTy, Type *DstTy) {
-    return (Twine(Prefix) + Base + "_" + typeSuffix(SrcTy) + "_" +
-            typeSuffix(DstTy))
+    return (Twine(Prefix) + Base + "_" + sanitizedTypeName(SrcTy) + "_" +
+            sanitizedTypeName(DstTy))
         .str();
   }
 
   Function *createBinaryHandler(Module &M, unsigned Opcode, IntegerType *Ty) {
-    StringRef Name = binaryName(Opcode);
+    std::string Name = instructionName(Opcode);
     if (Name.empty())
       return nullptr;
 
@@ -254,7 +186,7 @@ class VirtualizeImpl {
   }
 
   Function *createICmpHandler(Module &M, CmpInst::Predicate Pred, Type *Ty) {
-    StringRef Name = predicateName(Pred);
+    std::string Name = (Twine("icmp_") + predicateName(Pred)).str();
     if (Name.empty())
       return nullptr;
 
@@ -278,7 +210,7 @@ class VirtualizeImpl {
 
   Function *createIntrinsicHandler(Module &M, Intrinsic::ID ID, IntegerType *Ty,
                                    ConstantInt *ImmArg = nullptr) {
-    StringRef Name = intrinsicName(ID);
+    std::string Name = intrinsicName(ID);
     if (Name.empty())
       return nullptr;
 
@@ -335,7 +267,7 @@ class VirtualizeImpl {
 
   Function *createCastHandler(Module &M, unsigned Opcode, Type *SrcTy,
                               Type *DstTy) {
-    StringRef Name = castName(Opcode);
+    std::string Name = instructionName(Opcode);
     if (Name.empty())
       return nullptr;
 
@@ -356,7 +288,7 @@ class VirtualizeImpl {
   }
 
   Function *createSelectHandler(Module &M, Type *Ty) {
-    std::string FullName = typedName("Select", Ty);
+    std::string FullName = typedName(instructionName(Instruction::Select), Ty);
     Function *&F = Cache[FullName];
     if (F)
       return F;
@@ -416,9 +348,6 @@ class VirtualizeImpl {
   }
 
   static bool isSupportedCast(CastInst *CI) {
-    if (castName(CI->getOpcode()).empty())
-      return false;
-
     switch (CI->getOpcode()) {
     case Instruction::Trunc:
     case Instruction::ZExt:
@@ -440,119 +369,210 @@ class VirtualizeImpl {
            SI->getFalseValue()->getType() == SI->getType();
   }
 
+  enum class HandlerKind { Binary, ICmp, Intrinsic, Cast, Select };
+
+  struct HandlerKey {
+    HandlerKind Kind;
+    unsigned Opcode = 0;
+    CmpInst::Predicate Predicate = CmpInst::ICMP_EQ;
+    Intrinsic::ID IntrinsicID = Intrinsic::not_intrinsic;
+    Type *Ty = nullptr;
+    Type *SrcTy = nullptr;
+    Type *DstTy = nullptr;
+    ConstantInt *ImmArg = nullptr;
+  };
+
+  struct VMVariant {
+    HandlerKey Key;
+    unsigned Weight = 1;
+  };
+
+  struct VMMatch {
+    SmallVector<Instruction *, 4> Insts;
+    SmallVector<TrackingVH<Value>, 8> Args;
+    Instruction *ResultInst = nullptr;
+  };
+
+  struct VMRewritePlan {
+    VMMatch Match;
+    SmallVector<VMVariant, 4> Variants;
+  };
+
+  static HandlerKey binaryKey(BinaryOperator *BO) {
+    HandlerKey Key{HandlerKind::Binary};
+    Key.Opcode = BO->getOpcode();
+    Key.Ty = BO->getType();
+    return Key;
+  }
+
+  static HandlerKey icmpKey(ICmpInst *ICI) {
+    HandlerKey Key{HandlerKind::ICmp};
+    Key.Predicate = ICI->getPredicate();
+    Key.Ty = ICI->getOperand(0)->getType();
+    return Key;
+  }
+
+  static HandlerKey intrinsicKey(CallInst *CI, ConstantInt *ImmArg) {
+    HandlerKey Key{HandlerKind::Intrinsic};
+    Key.IntrinsicID = CI->getIntrinsicID();
+    Key.Ty = CI->getType();
+    Key.ImmArg = ImmArg;
+    return Key;
+  }
+
+  static HandlerKey castKey(CastInst *CI) {
+    HandlerKey Key{HandlerKind::Cast};
+    Key.Opcode = CI->getOpcode();
+    Key.SrcTy = CI->getSrcTy();
+    Key.DstTy = CI->getDestTy();
+    return Key;
+  }
+
+  static HandlerKey selectKey(SelectInst *SI) {
+    HandlerKey Key{HandlerKind::Select};
+    Key.Ty = SI->getType();
+    return Key;
+  }
+
+  static void addSingleInstPlan(SmallVectorImpl<VMRewritePlan> &Plans,
+                                Instruction *I, HandlerKey Key,
+                                ArrayRef<Value *> Args) {
+    VMRewritePlan Plan;
+    Plan.Match.Insts.push_back(I);
+    Plan.Match.ResultInst = I;
+    for (Value *Arg : Args)
+      Plan.Match.Args.push_back(Arg);
+    Plan.Variants.push_back({Key, 1});
+    Plans.push_back(std::move(Plan));
+  }
+
+  void addBinaryPlan(SmallVectorImpl<VMRewritePlan> &Plans, BinaryOperator *BO) {
+    if (!isSupportedInt(BO->getType()) ||
+        !Instruction::isBinaryOp(BO->getOpcode()))
+      return;
+    Value *Args[] = {BO->getOperand(0), BO->getOperand(1)};
+    addSingleInstPlan(Plans, BO, binaryKey(BO), Args);
+  }
+
+  void addICmpPlan(SmallVectorImpl<VMRewritePlan> &Plans, ICmpInst *ICI) {
+    if (!isSupportedScalar(ICI->getOperand(0)->getType()) ||
+        ICI->getOperand(0)->getType() != ICI->getOperand(1)->getType() ||
+        !CmpInst::isIntPredicate(ICI->getPredicate()))
+      return;
+    Value *Args[] = {ICI->getOperand(0), ICI->getOperand(1)};
+    addSingleInstPlan(Plans, ICI, icmpKey(ICI), Args);
+  }
+
+  void addIntrinsicPlan(SmallVectorImpl<VMRewritePlan> &Plans, CallInst *CI) {
+    if (!CI->getCalledFunction() ||
+        CI->getIntrinsicID() == Intrinsic::not_intrinsic ||
+        !isSupportedIntrinsicCall(CI))
+      return;
+
+    ConstantInt *ImmArg = nullptr;
+    if (CI->arg_size() == 2 && CI->getArgOperand(1)->getType()->isIntegerTy(1))
+      ImmArg = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+
+    SmallVector<Value *, 4> Args;
+    for (unsigned I = 0, E = CI->arg_size(); I != E; ++I) {
+      if (ImmArg && I == E - 1)
+        continue;
+      Args.push_back(CI->getArgOperand(I));
+    }
+    addSingleInstPlan(Plans, CI, intrinsicKey(CI, ImmArg), Args);
+  }
+
+  void addCastPlan(SmallVectorImpl<VMRewritePlan> &Plans, CastInst *CI) {
+    if (!isSupportedCast(CI))
+      return;
+    Value *Args[] = {CI->getOperand(0)};
+    addSingleInstPlan(Plans, CI, castKey(CI), Args);
+  }
+
+  void addSelectPlan(SmallVectorImpl<VMRewritePlan> &Plans, SelectInst *SI) {
+    if (!isSupportedSelect(SI))
+      return;
+    Value *Args[] = {SI->getCondition(), SI->getTrueValue(), SI->getFalseValue()};
+    addSingleInstPlan(Plans, SI, selectKey(SI), Args);
+  }
+
+  class PlanCollector : public InstVisitor<PlanCollector> {
+    VirtualizeImpl &Impl;
+    SmallVectorImpl<VMRewritePlan> &Plans;
+
+  public:
+    PlanCollector(VirtualizeImpl &Impl, SmallVectorImpl<VMRewritePlan> &Plans)
+        : Impl(Impl), Plans(Plans) {}
+
+    void visitBinaryOperator(BinaryOperator &BO) { Impl.addBinaryPlan(Plans, &BO); }
+    void visitICmpInst(ICmpInst &ICI) { Impl.addICmpPlan(Plans, &ICI); }
+    void visitCallInst(CallInst &CI) { Impl.addIntrinsicPlan(Plans, &CI); }
+    void visitCastInst(CastInst &CI) { Impl.addCastPlan(Plans, &CI); }
+    void visitSelectInst(SelectInst &SI) { Impl.addSelectPlan(Plans, &SI); }
+  };
+
+  Function *createHandler(Module &M, const HandlerKey &Key) {
+    switch (Key.Kind) {
+    case HandlerKind::Binary:
+      return createBinaryHandler(M, Key.Opcode, cast<IntegerType>(Key.Ty));
+    case HandlerKind::ICmp:
+      return createICmpHandler(M, Key.Predicate, Key.Ty);
+    case HandlerKind::Intrinsic:
+      return createIntrinsicHandler(M, Key.IntrinsicID,
+                                    cast<IntegerType>(Key.Ty), Key.ImmArg);
+    case HandlerKind::Cast:
+      return createCastHandler(M, Key.Opcode, Key.SrcTy, Key.DstTy);
+    case HandlerKind::Select:
+      return createSelectHandler(M, Key.Ty);
+    }
+    llvm_unreachable("unknown VM handler kind");
+  }
+
+  static VMVariant *selectVariant(VMRewritePlan &Plan) {
+    if (Plan.Variants.empty())
+      return nullptr;
+    return &Plan.Variants.front();
+  }
+
+  bool rewritePlan(Module &M, VMRewritePlan &Plan) {
+    if (!Plan.Match.ResultInst || Plan.Match.Insts.empty())
+      return false;
+
+    VMVariant *Variant = selectVariant(Plan);
+    if (!Variant)
+      return false;
+
+    Function *Func = createHandler(M, Variant->Key);
+    if (!Func)
+      return false;
+
+    SmallVector<Value *, 8> Args;
+    for (TrackingVH<Value> &Arg : Plan.Match.Args) {
+      if (!Arg)
+        return false;
+      Args.push_back(Arg);
+    }
+
+    IRBuilder<> B(Plan.Match.ResultInst);
+    Value *R = B.CreateCall(Func, Args);
+    Plan.Match.ResultInst->replaceAllUsesWith(R);
+
+    for (Instruction *I : reverse(Plan.Match.Insts))
+      if (I->getParent())
+        I->eraseFromParent();
+    return true;
+  }
+
 public:
   bool run(Module &M) {
+    SmallVector<VMRewritePlan, 64> Plans;
+    PlanCollector Collector(*this, Plans);
+    for (Function &F : M)
+      Collector.visit(F);
+
     bool Modified = false;
-    std::vector<BinaryOperator *> BinOps;
-    std::vector<ICmpInst *> ICmps;
-    std::vector<CallInst *> Intrinsics;
-    std::vector<CastInst *> Casts;
-    std::vector<SelectInst *> Selects;
-
-    for (Function &F : M) {
-      for (Instruction &I : instructions(F)) {
-        if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-          if (isSupportedInt(BO->getType()) && !binaryName(BO->getOpcode()).empty())
-            BinOps.push_back(BO);
-          continue;
-        }
-        if (auto *ICI = dyn_cast<ICmpInst>(&I)) {
-          if (isSupportedScalar(ICI->getOperand(0)->getType()) &&
-              ICI->getOperand(0)->getType() == ICI->getOperand(1)->getType() &&
-              !predicateName(ICI->getPredicate()).empty())
-            ICmps.push_back(ICI);
-          continue;
-        }
-        if (auto *CI = dyn_cast<CallInst>(&I)) {
-          if (CI->getCalledFunction() &&
-              CI->getIntrinsicID() != Intrinsic::not_intrinsic &&
-              isSupportedIntrinsicCall(CI))
-            Intrinsics.push_back(CI);
-          continue;
-        }
-        if (auto *CI = dyn_cast<CastInst>(&I)) {
-          if (isSupportedCast(CI))
-            Casts.push_back(CI);
-          continue;
-        }
-        if (auto *SI = dyn_cast<SelectInst>(&I)) {
-          if (isSupportedSelect(SI))
-            Selects.push_back(SI);
-          continue;
-        }
-      }
-    }
-
-    for (BinaryOperator *BO : BinOps) {
-      auto *Ty = cast<IntegerType>(BO->getType());
-      Function *Func = createBinaryHandler(M, BO->getOpcode(), Ty);
-      if (!Func)
-        continue;
-      IRBuilder<> B(BO);
-      Value *R = B.CreateCall(Func, {BO->getOperand(0), BO->getOperand(1)});
-      BO->replaceAllUsesWith(R);
-      BO->eraseFromParent();
-      Modified = true;
-    }
-
-    for (ICmpInst *ICI : ICmps) {
-      Type *Ty = ICI->getOperand(0)->getType();
-      Function *Func = createICmpHandler(M, ICI->getPredicate(), Ty);
-      if (!Func)
-        continue;
-      IRBuilder<> B(ICI);
-      Value *R = B.CreateCall(Func, {ICI->getOperand(0), ICI->getOperand(1)});
-      ICI->replaceAllUsesWith(R);
-      ICI->eraseFromParent();
-      Modified = true;
-    }
-
-    for (CallInst *CI : Intrinsics) {
-      auto *Ty = cast<IntegerType>(CI->getType());
-      ConstantInt *ImmArg = nullptr;
-      if (CI->arg_size() == 2 && CI->getArgOperand(1)->getType()->isIntegerTy(1))
-        ImmArg = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-      Function *Func = createIntrinsicHandler(M, CI->getIntrinsicID(), Ty, ImmArg);
-      if (!Func)
-        continue;
-      IRBuilder<> B(CI);
-      SmallVector<Value *, 4> Args;
-      for (unsigned I = 0, E = CI->arg_size(); I != E; ++I) {
-        if (ImmArg && I == E - 1)
-          continue;
-        Args.push_back(CI->getArgOperand(I));
-      }
-      Value *R = B.CreateCall(Func, Args);
-      CI->replaceAllUsesWith(R);
-      CI->eraseFromParent();
-      Modified = true;
-    }
-
-    for (CastInst *CI : Casts) {
-      Type *SrcTy = CI->getSrcTy();
-      Type *DstTy = CI->getDestTy();
-      Function *Func = createCastHandler(M, CI->getOpcode(), SrcTy, DstTy);
-      if (!Func)
-        continue;
-      IRBuilder<> B(CI);
-      Value *R = B.CreateCall(Func, {CI->getOperand(0)});
-      CI->replaceAllUsesWith(R);
-      CI->eraseFromParent();
-      Modified = true;
-    }
-
-    for (SelectInst *SI : Selects) {
-      Type *Ty = SI->getType();
-      Function *Func = createSelectHandler(M, Ty);
-      if (!Func)
-        continue;
-      IRBuilder<> B(SI);
-      Value *R = B.CreateCall(
-          Func, {SI->getCondition(), SI->getTrueValue(), SI->getFalseValue()});
-      SI->replaceAllUsesWith(R);
-      SI->eraseFromParent();
-      Modified = true;
-    }
+    for (VMRewritePlan &Plan : Plans)
+      Modified |= rewritePlan(M, Plan);
 
     return Modified;
   }
