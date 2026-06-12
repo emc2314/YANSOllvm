@@ -3,21 +3,25 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm,vm -verify-each -S %s -o %t/vm-twice.ll
 ; RUN: grep '__yansollvm_vm_add_i32' %t/vm-twice.ll
 ; RUN: grep '_e[0-9]' %t/vm-expanded.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-cf-variant-permille=1000 -S %s -o %t/vm-cf.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-max-variants-per-op=1 -S %s -o %t/vm-cap1.ll
+; RUN: test $(grep -c '^define internal i32 @__yansollvm_vm_add_i32' %t/vm-cap1.ll) -eq 1
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-mutation-variant-permille=1000 -S %s -o %t/vm-cf.ll
 ; RUN: grep 'vm.cf.loop' %t/vm-cf.ll
 ; RUN: grep '_mloop' %t/vm-cf.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-fork-variant-permille=1000 -S %s -o %t/vm-fork.ll
-; RUN: grep 'vm.cf.fork' %t/vm-fork.ll
-; RUN: grep '_mfork' %t/vm-fork.ll
-; RUN: grep 'vm.pred.fork\|vm.select.fork' %t/vm-fork.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-datamux-variant-permille=1000 -S %s -o %t/vm-mux.ll
+; RUN: grep '_mmux' %t/vm-cf.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-mutation-variant-permille=1000 -S %s -o %t/vm-mux.ll
 ; RUN: grep 'vm.mux.pred' %t/vm-mux.ll
 ; RUN: grep '_mmux' %t/vm-mux.ll
 ; RUN: grep 'vm.pred.mux\|vm.select.mux' %t/vm-mux.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-relation-variant-permille=1000 -S %s -o %t/vm-id.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-relation-app-variant-permille=1000 -S %s -o %t/vm-id.ll
 ; RUN: grep 'vm.rel' %t/vm-id.ll
-; RUN: grep 'vm.id.app.diff\|vm.id.app.mul\|vm.id.app.aff' %t/vm-id.ll
-; RUN: grep '_rpopcarry' %t/vm-id.ll
+; RUN: grep 'vm.id.app.diff\|vm.id.app.mul\|vm.id.app.aff\|vm.id.app.fork' %t/vm-id.ll
+; RUN: grep '_rpopcarry\|_rmaskpart\|_raffrt' %t/vm-id.ll
+; RUN: grep 'vm.rel.maskpart\|vm.rel.aff\|vm.rel.popcarry' %t/vm-id.ll
+; RUN: grep 'vm.id.app.fork.guard\|vm.id.app.fork.bad' %t/vm-id.ll
+; RUN: grep 'vm.div\|vm.divrem' %t/vm-expanded.ll
+; RUN: grep 'vm.intr.out' %t/vm-expanded.ll
+; RUN: grep 'vm.cast.in\|vm.cast.out' %t/vm-expanded.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm,merge -verify-each -S %s -o %t/vm-merge.ll
 ; RUN: grep 'merge' %t/vm-merge.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -icall -S %s -o %t/vm-icall.ll

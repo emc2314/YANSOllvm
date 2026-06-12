@@ -17,26 +17,31 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <map>
 #include <string>
+#include <tuple>
 
 using namespace llvm;
 
 namespace {
-static cl::opt<unsigned> VMControlFlowVariantPermille(
-    "vm-cf-variant-permille", cl::init(80), cl::Hidden,
-    cl::desc("Permille probability for control-flow VM binary-op variants"));
-static cl::opt<unsigned> VMForkVariantPermille(
-    "vm-fork-variant-permille", cl::init(40), cl::Hidden,
-    cl::desc("Permille probability for opaque-fork VM binary-op variants"));
-static cl::opt<unsigned> VMDataMuxVariantPermille(
-    "vm-datamux-variant-permille", cl::init(40), cl::Hidden,
-    cl::desc("Permille probability for data-mux VM binary-op variants"));
-static cl::opt<unsigned> VMRelationVariantPermille(
-    "vm-relation-variant-permille", cl::init(80), cl::Hidden,
-    cl::desc("Permille probability for relation-decorated VM binary-op variants"));
+static cl::opt<unsigned> VMMutationVariantPermille(
+    "vm-mutation-variant-permille", cl::init(500), cl::Hidden,
+    cl::desc("Permille probability for VM binary-op mutation wrappers"));
+static cl::opt<unsigned> VMRelationAppVariantPermille(
+    "vm-relation-app-variant-permille", cl::init(500), cl::Hidden,
+    cl::desc("Permille probability for relation-applied VM binary-op variants"));
+static cl::opt<unsigned> VMMaxVariantsPerOp(
+    "vm-max-variants-per-op", cl::init(8), cl::Hidden,
+    cl::desc("Maximum VM helper-body variants per operation/type bucket; 0 means unlimited"));
 
 class VirtualizeImpl {
+  enum class HandlerKind { Binary, ICmp, Intrinsic, Cast, Select };
+
   StringMap<Function *> Cache;
+  std::map<std::tuple<HandlerKind, unsigned, unsigned, Intrinsic::ID,
+                      CmpInst::Predicate, Type *, Type *, Type *>,
+           SmallVector<uint64_t, 8>>
+      VariantBuckets;
   uint64_t ModuleSeed = 0;
 
   static constexpr StringRef Prefix = "__yansollvm_vm_";
@@ -148,9 +153,8 @@ class VirtualizeImpl {
 
     VMVariantEmitter::BinaryVariant Variant =
         VMVariantEmitter::selectBinaryVariant(
-            Opcode, Ty, VariantSeed, VMControlFlowVariantPermille,
-            VMForkVariantPermille, VMDataMuxVariantPermille,
-            VMRelationVariantPermille);
+            Opcode, Ty, VariantSeed, VMMutationVariantPermille,
+            VMRelationAppVariantPermille);
     std::string FullName = typedName(Name, Ty, VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
     if (F)
@@ -177,7 +181,7 @@ class VirtualizeImpl {
 
     VMVariantEmitter::PredicateVariant Variant =
         VMVariantEmitter::selectPredicateVariant(
-            Ty, VariantSeed, VMForkVariantPermille, VMDataMuxVariantPermille);
+            Ty, VariantSeed, VMMutationVariantPermille);
     std::string FullName = typedName(Name, Ty, VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
     if (F)
@@ -197,13 +201,18 @@ class VirtualizeImpl {
   }
 
   Function *createIntrinsicHandler(Module &M, Intrinsic::ID ID, IntegerType *Ty,
-                                   ConstantInt *ImmArg = nullptr) {
+                                   ConstantInt *ImmArg = nullptr,
+                                   uint64_t VariantSeed = 0) {
     std::string Name = intrinsicName(ID);
     if (Name.empty())
       return nullptr;
 
+    VMVariantEmitter::ScalarVariant Variant =
+        VMVariantEmitter::selectIntrinsicVariant(ID, Ty, VariantSeed);
     std::string FullName = typedName(
-        Name, Ty, ImmArg ? (ImmArg->isZero() ? "_0" : "_1") : "");
+        Name, Ty,
+        (ImmArg ? (ImmArg->isZero() ? "_0" : "_1") : "") +
+            VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
     if (F)
       return F;
@@ -225,8 +234,7 @@ class VirtualizeImpl {
       Args.push_back(ConstantInt::get(Type::getInt1Ty(M.getContext()),
                                       !ImmArg->isZero()));
 
-    FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(&M, ID, {Ty});
-    B.CreateRet(B.CreateCall(Intr, Args));
+    VMVariantEmitter::emitIntrinsic(B, ID, Ty, Args, Variant, VariantSeed);
     attrs(F);
     return F;
   }
@@ -254,12 +262,15 @@ class VirtualizeImpl {
   }
 
   Function *createCastHandler(Module &M, unsigned Opcode, Type *SrcTy,
-                              Type *DstTy) {
+                              Type *DstTy, uint64_t VariantSeed) {
     std::string Name = instructionName(Opcode);
     if (Name.empty())
       return nullptr;
 
-    std::string FullName = castHandlerName(Name, SrcTy, DstTy);
+    VMVariantEmitter::ScalarVariant Variant =
+        VMVariantEmitter::selectCastVariant(Opcode, SrcTy, DstTy, VariantSeed);
+    std::string FullName = castHandlerName(Name, SrcTy, DstTy) +
+                           VMVariantEmitter::suffix(Variant);
     Function *&F = Cache[FullName];
     if (F)
       return F;
@@ -269,8 +280,7 @@ class VirtualizeImpl {
     Value *X = &*F->arg_begin();
     BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
     IRBuilder<> B(Entry);
-    B.CreateRet(B.CreateCast(static_cast<Instruction::CastOps>(Opcode), X,
-                             DstTy));
+    VMVariantEmitter::emitCast(B, Opcode, SrcTy, DstTy, X, Variant, VariantSeed);
     attrs(F);
     return F;
   }
@@ -278,7 +288,7 @@ class VirtualizeImpl {
   Function *createSelectHandler(Module &M, Type *Ty, uint64_t VariantSeed) {
     VMVariantEmitter::SelectVariant Variant =
         VMVariantEmitter::selectSelectVariant(
-            Ty, VariantSeed, VMForkVariantPermille, VMDataMuxVariantPermille);
+            Ty, VariantSeed, VMMutationVariantPermille);
     std::string FullName = typedName(instructionName(Instruction::Select), Ty,
                                      VMVariantEmitter::suffix(Variant));
     Function *&F = Cache[FullName];
@@ -354,8 +364,6 @@ class VirtualizeImpl {
            SI->getFalseValue()->getType() == SI->getType();
   }
 
-  enum class HandlerKind { Binary, ICmp, Intrinsic, Cast, Select };
-
   struct HandlerKey {
     HandlerKind Kind;
     unsigned Opcode = 0;
@@ -417,6 +425,35 @@ class VirtualizeImpl {
     HandlerKey Key{HandlerKind::Select};
     Key.Ty = SI->getType();
     return Key;
+  }
+
+  using HandlerBucketKey =
+      std::tuple<HandlerKind, unsigned, unsigned, Intrinsic::ID,
+                 CmpInst::Predicate, Type *, Type *, Type *>;
+
+  static HandlerBucketKey bucketKey(const HandlerKey &Key) {
+    return {Key.Kind,
+            Key.Opcode,
+            Key.ImmArg ? (Key.ImmArg->isZero() ? 0U : 1U) : 0U,
+            Key.IntrinsicID,
+            Key.Predicate,
+            Key.Ty,
+            Key.SrcTy,
+            Key.DstTy};
+  }
+
+  uint64_t limitVariantSeed(const HandlerKey &Key, uint64_t Seed) {
+    if (VMMaxVariantsPerOp == 0)
+      return Seed;
+
+    SmallVector<uint64_t, 8> &Bucket = VariantBuckets[bucketKey(Key)];
+    if (Bucket.size() < VMMaxVariantsPerOp) {
+      Bucket.push_back(Seed);
+      return Seed;
+    }
+
+    uint64_t Pick = yanso_mix64(Seed, 0x94d049bb133111ebULL) % Bucket.size();
+    return Bucket[Pick];
   }
 
   static void addSingleInstPlan(SmallVectorImpl<VMRewritePlan> &Plans,
@@ -505,9 +542,11 @@ class VirtualizeImpl {
       return createICmpHandler(M, Key.Predicate, Key.Ty, VariantSeed);
     case HandlerKind::Intrinsic:
       return createIntrinsicHandler(M, Key.IntrinsicID,
-                                    cast<IntegerType>(Key.Ty), Key.ImmArg);
+                                    cast<IntegerType>(Key.Ty), Key.ImmArg,
+                                    VariantSeed);
     case HandlerKind::Cast:
-      return createCastHandler(M, Key.Opcode, Key.SrcTy, Key.DstTy);
+      return createCastHandler(M, Key.Opcode, Key.SrcTy, Key.DstTy,
+                               VariantSeed);
     case HandlerKind::Select:
       return createSelectHandler(M, Key.Ty, VariantSeed);
     }
@@ -535,6 +574,7 @@ class VirtualizeImpl {
     VariantSeed = yanso_mix64(Variant->Key.Predicate + 1, VariantSeed);
     VariantSeed = yanso_mix64(Variant->Key.IntrinsicID + 1, VariantSeed);
     VariantSeed = instructionSeed(Plan.Match.ResultInst, VariantSeed);
+    VariantSeed = limitVariantSeed(Variant->Key, VariantSeed);
 
     Function *Func = createHandler(M, Variant->Key, VariantSeed);
     if (!Func)

@@ -45,7 +45,7 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
 
   for (Function *F : MergeList) {
     if (auto *Ty = dyn_cast<IntegerType>(F->getReturnType()))
-      RetBitLen = std::max<size_t>(RetBitLen, Ty->getBitWidth());
+      RetBitLen = std::max<size_t>(RetBitLen, Ty->getBitWidth() == 1 ? 8 : Ty->getBitWidth());
     int NFI32 = 0, NFI64 = 0;
     for (Type *Ty : F->getFunctionType()->params()) {
       if (auto *TI = dyn_cast<IntegerType>(Ty)) {
@@ -196,11 +196,13 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
       ReturnInst::Create(M.getContext(),
                          new PtrToIntInst(CallI, RetTy, "", CallFunc),
                          CallFunc);
-    else if (cast<IntegerType>(MergeList[I]->getReturnType())->getBitWidth() <
-             RetBitLen)
-      ReturnInst::Create(M.getContext(),
-                         new ZExtInst(CallI, RetTy, "", CallFunc), CallFunc);
-    else
+    else if (auto *RetIntTy = dyn_cast<IntegerType>(MergeList[I]->getReturnType())) {
+      if (RetIntTy->getBitWidth() < RetBitLen)
+        ReturnInst::Create(M.getContext(),
+                           new ZExtInst(CallI, RetTy, "", CallFunc), CallFunc);
+      else
+        ReturnInst::Create(M.getContext(), CallI, CallFunc);
+    } else
       ReturnInst::Create(M.getContext(), CallI, CallFunc);
     SwitchI->addCase(ConstantInt::get(I32, FuncID[I]), CallFunc);
     InlineFunctionInfo IFI;
