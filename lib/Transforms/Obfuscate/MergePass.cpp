@@ -41,7 +41,7 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
   std::vector<Type *> OtherTypes;
   IntegerType *I32 = IntegerType::get(M.getContext(), 32);
   IntegerType *I64 = IntegerType::get(M.getContext(), 64);
-  ParamTy.push_back(I32);
+  ParamTy.push_back(I64);
 
   for (Function *F : MergeList) {
     if (auto *Ty = dyn_cast<IntegerType>(F->getReturnType()))
@@ -90,7 +90,11 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
     for (CallInst *Call : VecCall) {
       std::vector<Value *> CallArgs;
       std::vector<Value *> I32Args, I64Args, OtherArgs;
-      CallArgs.push_back(ConstantInt::get(I32, FuncID[I]));
+      uint32_t SelectorHi = RNG.next32();
+      uint32_t SelectorLo = SelectorHi ^ FuncID[I];
+      uint64_t SelectorKey = (static_cast<uint64_t>(SelectorHi) << 32) |
+                             static_cast<uint64_t>(SelectorLo);
+      CallArgs.push_back(ConstantInt::get(I64, SelectorKey));
       for (Value *Arg : Call->args()) {
         Type *Ty = Arg->getType();
         if (auto *TI = dyn_cast<IntegerType>(Ty)) {
@@ -148,9 +152,16 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
   BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", NewFunction);
   BasicBlock *SwitchB =
       BasicBlock::Create(M.getContext(), "switch", NewFunction);
+  Value *SelectorKey = &*NewFunction->arg_begin();
+  Value *SelectorHi = BinaryOperator::CreateLShr(
+      SelectorKey, ConstantInt::get(I64, 32), "", Entry);
+  Value *SelectorLo = BinaryOperator::CreateAnd(
+      SelectorKey, ConstantInt::get(I64, 0xffffffffULL), "", Entry);
+  Value *SelectorXor =
+      BinaryOperator::CreateXor(SelectorHi, SelectorLo, "", Entry);
+  Value *Selector = new TruncInst(SelectorXor, I32, "", Entry);
   BranchInst::Create(SwitchB, Entry);
-  SwitchInst *SwitchI =
-      SwitchInst::Create(&*NewFunction->arg_begin(), SwitchB, 0, SwitchB);
+  SwitchInst *SwitchI = SwitchInst::Create(Selector, SwitchB, 0, SwitchB);
 
   for (size_t I = 0; I < MergeList.size(); I++) {
     BasicBlock *CallFunc =
