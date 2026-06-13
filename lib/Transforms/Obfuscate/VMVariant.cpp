@@ -958,8 +958,9 @@ Value *VMVariantEmitter::applyRelation(IRBuilder<> &B, IntegerType *Ty, Value *R
 // Binary mutation wrappers
 //===----------------------------------------------------------------------===//
 
-void VMVariantEmitter::emitControlFlowBitRebuild(IRBuilder<> &B, Function *F,
-                                                 IntegerType *Ty, Value *Input) {
+Value *VMVariantEmitter::emitControlFlowBitRebuild(IRBuilder<> &B, Function *F,
+                                                   IntegerType *Ty,
+                                                   Value *Input) {
   LLVMContext &Ctx = F->getContext();
   BasicBlock *Entry = B.GetInsertBlock();
   BasicBlock *Loop = BasicBlock::Create(Ctx, "vm.cf.loop", F);
@@ -987,13 +988,15 @@ void VMVariantEmitter::emitControlFlowBitRebuild(IRBuilder<> &B, Function *F,
   A->addIncoming(NextA, Body);
 
   IRBuilder<> DB(Done);
-  DB.CreateRet(A);
+  B.SetInsertPoint(Done);
+  return A;
 }
 
-void VMVariantEmitter::emitDataMuxBinary(IRBuilder<> &B, unsigned Opcode,
-                                         IntegerType *Ty, Value *X, Value *Y,
-                                         const BinaryVariant &Variant,
-                                         uint64_t Seed) {
+Value *VMVariantEmitter::emitDataMuxBinaryValue(IRBuilder<> &B, unsigned Opcode,
+                                                IntegerType *Ty, Value *X,
+                                                Value *Y,
+                                                const BinaryVariant &Variant,
+                                                uint64_t Seed) {
   Value *R0 = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
   R0 = applyRelation(B, Ty, R0, X, Y, Variant, Seed);
   Value *R1 = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant + 1,
@@ -1021,7 +1024,14 @@ void VMVariantEmitter::emitDataMuxBinary(IRBuilder<> &B, unsigned Opcode,
   Value *Mask = B.CreateSub(loConst(Ty, 0), B.CreateZExt(Pred, Ty));
   Value *TruePart = B.CreateAnd(R0, Mask);
   Value *FalsePart = B.CreateAnd(R1, B.CreateNot(Mask));
-  B.CreateRet(B.CreateOr(TruePart, FalsePart));
+  return B.CreateOr(TruePart, FalsePart);
+}
+
+void VMVariantEmitter::emitDataMuxBinary(IRBuilder<> &B, unsigned Opcode,
+                                         IntegerType *Ty, Value *X, Value *Y,
+                                         const BinaryVariant &Variant,
+                                         uint64_t Seed) {
+  B.CreateRet(emitDataMuxBinaryValue(B, Opcode, Ty, X, Y, Variant, Seed));
 }
 
 //===----------------------------------------------------------------------===//
@@ -1032,16 +1042,31 @@ void VMVariantEmitter::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID,
                                      IntegerType *Ty, ArrayRef<Value *> Args,
                                      const ScalarVariant &Variant,
                                      uint64_t Seed) {
+  B.CreateRet(emitIntrinsicValue(B, ID, Ty, Args, Variant, Seed));
+}
+
+Value *VMVariantEmitter::emitIntrinsicValue(IRBuilder<> &B, Intrinsic::ID ID,
+                                            IntegerType *Ty,
+                                            ArrayRef<Value *> Args,
+                                            const ScalarVariant &Variant,
+                                            uint64_t Seed) {
   FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(
       B.GetInsertBlock()->getModule(), ID, {Ty});
   Value *R = B.CreateCall(Intr, Args, "vm.intr.core");
-  B.CreateRet(decorateIntegerResult(B, Ty, R, Variant.ExprVariant, Seed,
-                                    "vm.intr.out"));
+  return decorateIntegerResult(B, Ty, R, Variant.ExprVariant, Seed,
+                               "vm.intr.out");
 }
 
 void VMVariantEmitter::emitCast(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
                                 Type *DstTy, Value *X,
                                 const ScalarVariant &Variant, uint64_t Seed) {
+  B.CreateRet(emitCastValue(B, Opcode, SrcTy, DstTy, X, Variant, Seed));
+}
+
+Value *VMVariantEmitter::emitCastValue(IRBuilder<> &B, unsigned Opcode,
+                                       Type *SrcTy, Type *DstTy, Value *X,
+                                       const ScalarVariant &Variant,
+                                       uint64_t Seed) {
   Value *UseX = X;
   if (auto *ITy = dyn_cast<IntegerType>(SrcTy)) {
     UseX = decorateIntegerResult(B, ITy, X, Variant.ExprVariant, Seed,
@@ -1053,7 +1078,7 @@ void VMVariantEmitter::emitCast(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
   if (auto *ITy = dyn_cast<IntegerType>(DstTy))
     R = decorateIntegerResult(B, ITy, R, Variant.ExprVariant + 1, Seed,
                               "vm.cast.out");
-  B.CreateRet(R);
+  return R;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1064,12 +1089,18 @@ void VMVariantEmitter::emitICmp(IRBuilder<> &B, CmpInst::Predicate Pred,
                                 Type *Ty, Value *X, Value *Y,
                                 const PredicateVariant &Variant,
                                 uint64_t Seed) {
+  B.CreateRet(emitICmpValue(B, Pred, Ty, X, Y, Variant, Seed));
+}
+
+Value *VMVariantEmitter::emitICmpValue(IRBuilder<> &B, CmpInst::Predicate Pred,
+                                       Type *Ty, Value *X, Value *Y,
+                                       const PredicateVariant &Variant,
+                                       uint64_t Seed) {
   Value *P = emitICmpExpr(B, Pred, Ty, X, Y, Variant.ExprVariant, Seed);
   switch (Variant.Mutation) {
   case MutationKind::None:
   case MutationKind::BitRebuild:
-    B.CreateRet(P);
-    return;
+    return P;
   case MutationKind::DataMux: {
     IntegerType *I1 = Type::getInt1Ty(B.getContext());
     Value *P2 = emitICmpExpr(B, Pred, Ty, X, Y, Variant.ExprVariant + 1,
@@ -1077,8 +1108,7 @@ void VMVariantEmitter::emitICmp(IRBuilder<> &B, CmpInst::Predicate Pred,
     Value *Key = ConstantInt::get(I1, (Seed >> 9) & 1);
     Value *Sel = B.CreateICmpEQ(B.CreateXor(B.CreateXor(P, Key), Key), P,
                                 "vm.pred.mux.sel");
-    B.CreateRet(B.CreateSelect(Sel, P, P2, "vm.pred.mux"));
-    return;
+    return B.CreateSelect(Sel, P, P2, "vm.pred.mux");
   }
   }
   llvm_unreachable("unknown VM predicate mutation");
@@ -1088,12 +1118,17 @@ void VMVariantEmitter::emitSelect(IRBuilder<> &B, Type *Ty, Value *Cond,
                                   Value *TrueV, Value *FalseV,
                                   const SelectVariant &Variant,
                                   uint64_t Seed) {
+  B.CreateRet(emitSelectValue(B, Ty, Cond, TrueV, FalseV, Variant, Seed));
+}
+
+Value *VMVariantEmitter::emitSelectValue(IRBuilder<> &B, Type *Ty, Value *Cond,
+                                         Value *TrueV, Value *FalseV,
+                                         const SelectVariant &Variant,
+                                         uint64_t Seed) {
   switch (Variant.Mutation) {
   case MutationKind::None:
   case MutationKind::BitRebuild:
-    B.CreateRet(emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant,
-                               Seed));
-    return;
+    return emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant, Seed);
   case MutationKind::DataMux: {
     Value *R0 = emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant,
                                Seed);
@@ -1106,11 +1141,10 @@ void VMVariantEmitter::emitSelect(IRBuilder<> &B, Type *Ty, Value *Cond,
       Value *Mask = B.CreateSub(loConst(ITy, 0), B.CreateZExt(Sel, ITy));
       Value *TruePart = B.CreateAnd(R0, Mask);
       Value *FalsePart = B.CreateAnd(R1, B.CreateNot(Mask));
-      B.CreateRet(B.CreateOr(TruePart, FalsePart, "vm.select.mux"));
+      return B.CreateOr(TruePart, FalsePart, "vm.select.mux");
     } else {
-      B.CreateRet(B.CreateSelect(Sel, R0, R1, "vm.select.mux"));
+      return B.CreateSelect(Sel, R0, R1, "vm.select.mux");
     }
-    return;
   }
   }
   llvm_unreachable("unknown VM select mutation");
@@ -1119,11 +1153,17 @@ void VMVariantEmitter::emitSelect(IRBuilder<> &B, Type *Ty, Value *Cond,
 void VMVariantEmitter::emitBinary(IRBuilder<> &B, unsigned Opcode,
                                   IntegerType *Ty, Value *X, Value *Y,
                                   const BinaryVariant &Variant, uint64_t Seed) {
+  B.CreateRet(emitBinaryValue(B, Opcode, Ty, X, Y, Variant, Seed));
+}
+
+Value *VMVariantEmitter::emitBinaryValue(IRBuilder<> &B, unsigned Opcode,
+                                         IntegerType *Ty, Value *X, Value *Y,
+                                         const BinaryVariant &Variant,
+                                         uint64_t Seed) {
   switch (Variant.Mutation) {
   case MutationKind::None: {
     Value *R = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
-    B.CreateRet(applyRelation(B, Ty, R, X, Y, Variant, Seed));
-    return;
+    return applyRelation(B, Ty, R, X, Y, Variant, Seed);
   }
   case MutationKind::BitRebuild: {
     Value *R = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
@@ -1131,7 +1171,7 @@ void VMVariantEmitter::emitBinary(IRBuilder<> &B, unsigned Opcode,
     return emitControlFlowBitRebuild(B, B.GetInsertBlock()->getParent(), Ty, R);
   }
   case MutationKind::DataMux:
-    return emitDataMuxBinary(B, Opcode, Ty, X, Y, Variant, Seed);
+    return emitDataMuxBinaryValue(B, Opcode, Ty, X, Y, Variant, Seed);
   }
   llvm_unreachable("unknown VM binary mutation");
 }

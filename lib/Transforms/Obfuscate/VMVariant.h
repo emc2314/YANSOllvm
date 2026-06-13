@@ -80,16 +80,25 @@ public:
   static void emitBinary(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
                          Value *X, Value *Y, const BinaryVariant &Variant,
                          uint64_t Seed);
+  static Value *emitBinaryValue(IRBuilder<> &B, unsigned Opcode,
+                                IntegerType *Ty, Value *X, Value *Y,
+                                const BinaryVariant &Variant, uint64_t Seed);
   static PredicateVariant selectPredicateVariant(Type *Ty, uint64_t Seed,
                                                  unsigned MutationPermille);
   static void emitICmp(IRBuilder<> &B, CmpInst::Predicate Pred, Type *Ty,
                        Value *X, Value *Y, const PredicateVariant &Variant,
                        uint64_t Seed);
+  static Value *emitICmpValue(IRBuilder<> &B, CmpInst::Predicate Pred,
+                              Type *Ty, Value *X, Value *Y,
+                              const PredicateVariant &Variant, uint64_t Seed);
   static SelectVariant selectSelectVariant(Type *Ty, uint64_t Seed,
                                            unsigned MutationPermille);
   static void emitSelect(IRBuilder<> &B, Type *Ty, Value *Cond, Value *TrueV,
                          Value *FalseV, const SelectVariant &Variant,
                          uint64_t Seed);
+  static Value *emitSelectValue(IRBuilder<> &B, Type *Ty, Value *Cond,
+                                Value *TrueV, Value *FalseV,
+                                const SelectVariant &Variant, uint64_t Seed);
   static ScalarVariant selectIntrinsicVariant(Intrinsic::ID ID, IntegerType *Ty,
                                               uint64_t Seed);
   static ScalarVariant selectCastVariant(unsigned Opcode, Type *SrcTy,
@@ -98,9 +107,16 @@ public:
   static void emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
                             ArrayRef<Value *> Args,
                             const ScalarVariant &Variant, uint64_t Seed);
+  static Value *emitIntrinsicValue(IRBuilder<> &B, Intrinsic::ID ID,
+                                   IntegerType *Ty, ArrayRef<Value *> Args,
+                                   const ScalarVariant &Variant,
+                                   uint64_t Seed);
   static void emitCast(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
                        Type *DstTy, Value *X, const ScalarVariant &Variant,
                        uint64_t Seed);
+  static Value *emitCastValue(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
+                              Type *DstTy, Value *X,
+                              const ScalarVariant &Variant, uint64_t Seed);
 
 private:
   struct Relation {
@@ -175,8 +191,12 @@ private:
   static Value *emitSelectExpr(IRBuilder<> &B, Type *Ty, Value *Cond,
                                Value *TrueV, Value *FalseV,
                                unsigned ExprVariant, uint64_t Seed);
-  static void emitControlFlowBitRebuild(IRBuilder<> &B, Function *F,
-                                        IntegerType *Ty, Value *Input);
+  static Value *emitControlFlowBitRebuild(IRBuilder<> &B, Function *F,
+                                          IntegerType *Ty, Value *Input);
+  static Value *emitDataMuxBinaryValue(IRBuilder<> &B, unsigned Opcode,
+                                       IntegerType *Ty, Value *X, Value *Y,
+                                       const BinaryVariant &Variant,
+                                       uint64_t Seed);
   static void emitDataMuxBinary(IRBuilder<> &B, unsigned Opcode,
                                 IntegerType *Ty, Value *X, Value *Y,
                                 const BinaryVariant &Variant, uint64_t Seed);
