@@ -1,6 +1,6 @@
 #include "ObfConPass.h"
-#include "YANSOllvmCommon.h"
 #include "Utils.h"
+#include "YANSOllvmCommon.h"
 
 #include "YANSOllvmSeed.h"
 #include "llvm/IR/Constants.h"
@@ -56,11 +56,10 @@ class ObfConImpl {
       uint64_t RandV = (RNG->next64() | 1ULL);
       BinaryOperator *RV1 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
-          ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "",
-          it(Inst));
+          ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "", it(Inst));
       BinaryOperator *RV2 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
-          ConstantInt::get(I64, yansollvm_mod_inv(RandV) * V),
+          ConstantInt::get(I64, yanso_mod_inverse(RandV) * V),
           ConstantInt::get(I64, 0), "", it(Inst));
       Replaced = B.CreateMul(RV1, RV2);
       break;
@@ -69,8 +68,7 @@ class ObfConImpl {
       uint64_t RandV = RNG->next64();
       BinaryOperator *RV1 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
-          ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "",
-          it(Inst));
+          ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "", it(Inst));
       BinaryOperator *RV2 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, RandV ^ V), ConstantInt::get(I64, 0), "",
@@ -82,8 +80,7 @@ class ObfConImpl {
       uint64_t RandV = RNG->next64();
       BinaryOperator *RV1 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
-          ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "",
-          it(Inst));
+          ConstantInt::get(I64, RandV), ConstantInt::get(I64, 0), "", it(Inst));
       BinaryOperator *RV2 = BinaryOperator::Create(
           (RNG->range(2) ? BinaryOperator::Add : BinaryOperator::Xor),
           ConstantInt::get(I64, V - RandV), ConstantInt::get(I64, 0), "",

@@ -1,7 +1,7 @@
-#include "CryptoUtils.h"
 #include "VMVariant.h"
+#include "CryptoUtils.h"
+#include "YMBA.h"
 
-#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -9,6 +9,39 @@
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
+
+namespace {
+
+template <typename VariantT>
+void fillRelationApplication(VariantT &V, uint64_t Seed) {
+  switch ((Seed >> 8) % 4) {
+  case 0:
+    V.RelationApp = VMVariantEmitter::RelationApplication::DiffFold;
+    break;
+  case 1:
+    V.RelationApp = VMVariantEmitter::RelationApplication::PairedMulBranch;
+    break;
+  case 2:
+    V.RelationApp = VMVariantEmitter::RelationApplication::PairedAffineBranch;
+    break;
+  default:
+    V.RelationApp = VMVariantEmitter::RelationApplication::OpaqueFork;
+    break;
+  }
+  switch ((Seed >> 10) % 3) {
+  case 0:
+    V.Projector = VMVariantEmitter::ProjectorKind::LowBit;
+    break;
+  case 1:
+    V.Projector = VMVariantEmitter::ProjectorKind::Parity;
+    break;
+  default:
+    V.Projector = VMVariantEmitter::ProjectorKind::KeyedBit;
+    break;
+  }
+}
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Common helpers and capability gates
@@ -18,9 +51,17 @@ Value *VMVariantEmitter::loConst(IntegerType *Ty, uint64_t V) {
   return ConstantInt::get(Ty, V);
 }
 
-Value *VMVariantEmitter::notV(IRBuilder<> &B, Value *V) { return B.CreateNot(V); }
+static Value *modInvConst(IntegerType *Ty, uint64_t V) {
+  return ConstantInt::get(
+      Ty, yanso_mod_inverse(APInt(Ty->getBitWidth(), V, false, true)));
+}
 
-bool VMVariantEmitter::supportsLoopMutation(unsigned Opcode, unsigned BitWidth) {
+Value *VMVariantEmitter::notV(IRBuilder<> &B, Value *V) {
+  return B.CreateNot(V);
+}
+
+bool VMVariantEmitter::supportsLoopMutation(unsigned Opcode,
+                                            unsigned BitWidth) {
   return BitWidth >= 8 && BitWidth <= 64 && isSupportedBinaryOpcode(Opcode);
 }
 
@@ -44,7 +85,8 @@ bool VMVariantEmitter::supportsDataMuxMutation(unsigned Opcode,
 }
 
 bool VMVariantEmitter::supportsRelation(unsigned BitWidth) {
-  return BitWidth >= 8 && BitWidth <= 64;
+  return BitWidth == 8 || BitWidth == 16 || BitWidth == 32 || BitWidth == 64 ||
+         BitWidth == 128;
 }
 
 bool VMVariantEmitter::supportsPredicateMutation(Type *Ty) {
@@ -59,54 +101,42 @@ bool VMVariantEmitter::supportsSelectMutation(Type *Ty) {
 // Variant selection policy
 //===----------------------------------------------------------------------===//
 
-VMVariantEmitter::BinaryVariant VMVariantEmitter::selectBinaryVariant(
-    unsigned Opcode, IntegerType *Ty, uint64_t Seed, unsigned MutationPermille,
-    unsigned RelationAppPermille) {
+VMVariantEmitter::BinaryVariant
+VMVariantEmitter::selectBinaryVariant(unsigned Opcode, IntegerType *Ty,
+                                      uint64_t Seed, unsigned MutationPermille,
+                                      unsigned RelationAppPermille) {
   BinaryVariant V;
   unsigned BitWidth = Ty->getBitWidth();
 
   V.ExprVariant = Seed % binaryExprVariantCount(Opcode);
 
+  if (YMBA::hasRewrite(Opcode, BitWidth) && ((Seed >> 44) & 1)) {
+    V.UseMBARewrite = true;
+    V.MBARewriteVariant = (Seed >> 16) % YMBA::rewriteCount(Opcode, BitWidth);
+  }
+
   if (supportsRelation(BitWidth) &&
       (RelationAppPermille >= 1000 ||
        ((Seed >> 56) % 1000) < RelationAppPermille)) {
-    switch ((Seed >> 4) % 3) {
-    case 0:
-      V.Relation = RelationKind::PopcountCarry;
-      break;
-    case 1:
-      V.Relation = RelationKind::MaskedPartition;
-      break;
-    default:
-      V.Relation = RelationKind::AffineRoundTrip;
-      break;
+    bool UseYMBARelation = YMBA::hasRelation(BitWidth) && ((Seed >> 52) & 1);
+    if (UseYMBARelation) {
+      V.Relation = RelationKind::YMBA;
+      V.RelationVariant = (Seed >> 12) % YMBA::relationCount(BitWidth);
+    } else {
+      switch ((Seed >> 4) % 3) {
+      case 0:
+        V.Relation = RelationKind::PopcountCarry;
+        break;
+      case 1:
+        V.Relation = RelationKind::MaskedPartition;
+        break;
+      default:
+        V.Relation = RelationKind::AffineRoundTrip;
+        break;
+      }
+      V.RelationVariant = (Seed >> 12) & 7;
     }
-    switch ((Seed >> 8) % 4) {
-    case 0:
-      V.RelationApp = RelationApplication::DiffFold;
-      break;
-    case 1:
-      V.RelationApp = RelationApplication::PairedMulBranch;
-      break;
-    case 2:
-      V.RelationApp = RelationApplication::PairedAffineBranch;
-      break;
-    default:
-      V.RelationApp = RelationApplication::OpaqueFork;
-      break;
-    }
-    switch ((Seed >> 10) % 3) {
-    case 0:
-      V.Projector = ProjectorKind::LowBit;
-      break;
-    case 1:
-      V.Projector = ProjectorKind::Parity;
-      break;
-    default:
-      V.Projector = ProjectorKind::KeyedBit;
-      break;
-    }
-    V.RelationVariant = (Seed >> 12) & 7;
+    fillRelationApplication(V, Seed);
   }
 
   bool SupportsLoop = supportsLoopMutation(Opcode, BitWidth);
@@ -132,6 +162,77 @@ VMVariantEmitter::BinaryVariant VMVariantEmitter::selectBinaryVariant(
   return V;
 }
 
+VMVariantEmitter::PredicateVariant
+VMVariantEmitter::selectPredicateVariant(Type *Ty, uint64_t Seed,
+                                         unsigned MutationPermille) {
+  PredicateVariant V;
+  V.ExprVariant = Seed % 3;
+  if (!supportsPredicateMutation(Ty))
+    return V;
+  if (MutationPermille >= 1000) {
+    V.Mutation = MutationKind::DataMux;
+    V.MutationVariant = (Seed >> 24) & 3;
+  } else if (((Seed >> 8) % 1000) < MutationPermille) {
+    V.Mutation = MutationKind::DataMux;
+    V.MutationVariant = (Seed >> 24) & 3;
+  }
+  return V;
+}
+
+VMVariantEmitter::SelectVariant
+VMVariantEmitter::selectSelectVariant(Type *Ty, uint64_t Seed,
+                                      unsigned MutationPermille) {
+  SelectVariant V;
+  V.ExprVariant = Seed % 3;
+  if (!supportsSelectMutation(Ty))
+    return V;
+  if (MutationPermille >= 1000) {
+    V.Mutation = MutationKind::DataMux;
+    V.MutationVariant = (Seed >> 24) & 3;
+  } else if (((Seed >> 8) % 1000) < MutationPermille) {
+    V.Mutation = MutationKind::DataMux;
+    V.MutationVariant = (Seed >> 24) & 3;
+  }
+  return V;
+}
+
+VMVariantEmitter::ScalarVariant
+VMVariantEmitter::selectIntrinsicVariant(Intrinsic::ID ID, IntegerType *Ty,
+                                         uint64_t Seed) {
+  ScalarVariant V;
+  V.ExprVariant = Seed % 4;
+  unsigned BitWidth = Ty->getBitWidth();
+  if (YMBA::hasIntrinsicRewrite(ID, BitWidth) && ((Seed >> 44) & 1)) {
+    V.UseMBARewrite = true;
+    V.MBARewriteVariant =
+        (Seed >> 16) % YMBA::intrinsicRewriteCount(ID, BitWidth);
+  }
+  if (supportsRelation(BitWidth) && YMBA::hasRelation(BitWidth) &&
+      ((Seed >> 52) & 1)) {
+    V.Relation = RelationKind::YMBA;
+    V.RelationVariant = (Seed >> 12) % YMBA::relationCount(BitWidth);
+    fillRelationApplication(V, Seed);
+  }
+  return V;
+}
+
+VMVariantEmitter::ScalarVariant
+VMVariantEmitter::selectCastVariant(unsigned, Type *, Type *DstTy,
+                                    uint64_t Seed) {
+  ScalarVariant V;
+  V.ExprVariant = Seed % 4;
+  if (auto *ITy = dyn_cast<IntegerType>(DstTy)) {
+    unsigned BitWidth = ITy->getBitWidth();
+    if (supportsRelation(BitWidth) && YMBA::hasRelation(BitWidth) &&
+        ((Seed >> 52) & 1)) {
+      V.Relation = RelationKind::YMBA;
+      V.RelationVariant = (Seed >> 12) % YMBA::relationCount(BitWidth);
+      fillRelationApplication(V, Seed);
+    }
+  }
+  return V;
+}
+
 //===----------------------------------------------------------------------===//
 // Handler-name suffix formatting
 //===----------------------------------------------------------------------===//
@@ -140,6 +241,8 @@ std::string VMVariantEmitter::suffix(const BinaryVariant &Variant) {
   std::string S;
   raw_string_ostream OS(S);
   OS << "_e" << Variant.ExprVariant;
+  if (Variant.UseMBARewrite)
+    OS << "_ymba" << Variant.MBARewriteVariant;
   switch (Variant.Mutation) {
   case MutationKind::None:
     break;
@@ -161,6 +264,9 @@ std::string VMVariantEmitter::suffix(const BinaryVariant &Variant) {
     break;
   case RelationKind::AffineRoundTrip:
     OS << "_raffrt" << Variant.RelationVariant;
+    break;
+  case RelationKind::YMBA:
+    OS << "_rymba" << Variant.RelationVariant;
     break;
   }
   if (Variant.Relation != RelationKind::None) {
@@ -198,6 +304,24 @@ std::string VMVariantEmitter::suffix(const ScalarVariant &Variant) {
   std::string S;
   raw_string_ostream OS(S);
   OS << "_e" << Variant.ExprVariant;
+  if (Variant.UseMBARewrite)
+    OS << "_ymba" << Variant.MBARewriteVariant;
+  switch (Variant.Relation) {
+  case RelationKind::None:
+    break;
+  case RelationKind::PopcountCarry:
+    OS << "_rpop" << Variant.RelationVariant;
+    break;
+  case RelationKind::MaskedPartition:
+    OS << "_rmsk" << Variant.RelationVariant;
+    break;
+  case RelationKind::AffineRoundTrip:
+    OS << "_raffrt" << Variant.RelationVariant;
+    break;
+  case RelationKind::YMBA:
+    OS << "_rymba" << Variant.RelationVariant;
+    break;
+  }
   OS.flush();
   return S;
 }
@@ -234,57 +358,6 @@ std::string VMVariantEmitter::suffix(const SelectVariant &Variant) {
   return S;
 }
 
-VMVariantEmitter::PredicateVariant VMVariantEmitter::selectPredicateVariant(
-    Type *Ty, uint64_t Seed, unsigned MutationPermille) {
-  PredicateVariant V;
-  V.ExprVariant = Seed % 3;
-  if (!supportsPredicateMutation(Ty))
-    return V;
-  if (MutationPermille >= 1000) {
-    V.Mutation = MutationKind::DataMux;
-    V.MutationVariant = (Seed >> 24) & 3;
-  } else if (((Seed >> 8) % 1000) < MutationPermille) {
-    V.Mutation = MutationKind::DataMux;
-    V.MutationVariant = (Seed >> 24) & 3;
-  }
-  return V;
-}
-
-VMVariantEmitter::SelectVariant VMVariantEmitter::selectSelectVariant(
-    Type *Ty, uint64_t Seed, unsigned MutationPermille) {
-  SelectVariant V;
-  V.ExprVariant = Seed % 3;
-  if (!supportsSelectMutation(Ty))
-    return V;
-  if (MutationPermille >= 1000) {
-    V.Mutation = MutationKind::DataMux;
-    V.MutationVariant = (Seed >> 24) & 3;
-  } else if (((Seed >> 8) % 1000) < MutationPermille) {
-    V.Mutation = MutationKind::DataMux;
-    V.MutationVariant = (Seed >> 24) & 3;
-  }
-  return V;
-}
-
-VMVariantEmitter::ScalarVariant VMVariantEmitter::selectIntrinsicVariant(
-    Intrinsic::ID ID, IntegerType *Ty, uint64_t Seed) {
-  (void)ID;
-  (void)Ty;
-  ScalarVariant V;
-  V.ExprVariant = Seed % 4;
-  return V;
-}
-
-VMVariantEmitter::ScalarVariant VMVariantEmitter::selectCastVariant(
-    unsigned Opcode, Type *SrcTy, Type *DstTy, uint64_t Seed) {
-  (void)Opcode;
-  (void)SrcTy;
-  (void)DstTy;
-  ScalarVariant V;
-  V.ExprVariant = Seed % 4;
-  return V;
-}
-
 //===----------------------------------------------------------------------===//
 // Binary expression templates
 //===----------------------------------------------------------------------===//
@@ -309,9 +382,8 @@ Value *VMVariantEmitter::emitXorExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
   }
 }
 
-Value *VMVariantEmitter::emitAndExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
+Value *VMVariantEmitter::emitAndExpr(IRBuilder<> &B, IntegerType *, Value *X,
                                      Value *Y, unsigned Variant) {
-  (void)Ty;
   switch (Variant % 4) {
   case 0:
     return B.CreateAnd(X, Y);
@@ -324,9 +396,8 @@ Value *VMVariantEmitter::emitAndExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
   }
 }
 
-Value *VMVariantEmitter::emitOrExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
+Value *VMVariantEmitter::emitOrExpr(IRBuilder<> &B, IntegerType *, Value *X,
                                     Value *Y, unsigned Variant) {
-  (void)Ty;
   switch (Variant % 4) {
   case 0:
     return B.CreateOr(X, Y);
@@ -390,13 +461,15 @@ Value *VMVariantEmitter::emitShiftExpr(IRBuilder<> &B, unsigned Opcode,
   case 1: {
     Value *Noise = B.CreateMul(B.CreateXor(X, Y), loConst(Ty, 3));
     Value *UseAmt = B.CreateSub(B.CreateAdd(Y, Noise), Noise);
-    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X, UseAmt);
+    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X,
+                         UseAmt);
   }
   default: {
     Value *Salt = loConst(Ty, (BW * 13u) | 1u);
     Value *Noise = B.CreateOr(B.CreateAnd(X, Y), Salt);
     Value *UseAmt = B.CreateSub(B.CreateAdd(Y, Noise), Noise);
-    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X, UseAmt);
+    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X,
+                         UseAmt);
   }
   }
 }
@@ -439,16 +512,14 @@ Value *VMVariantEmitter::emitDivRemExpr(IRBuilder<> &B, unsigned Opcode,
     break;
   case 1: {
     Value *K = loConst(Ty, yanso_mix64(Seed, 0x510e527fade682d1ULL));
-    UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.xor0"), K,
-                       "vm.div.x.xor1");
+    UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.xor0"), K, "vm.div.x.xor1");
     break;
   }
   case 2: {
     Value *N = B.CreateOr(
         B.CreateAnd(X, loConst(Ty, yanso_mix64(Seed, 0x9b05688c2b3e6c1fULL))),
         loConst(Ty, 1), "vm.div.y.noise");
-    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.add"), N,
-                       "vm.div.y.sub");
+    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.add"), N, "vm.div.y.sub");
     break;
   }
   default: {
@@ -456,8 +527,8 @@ Value *VMVariantEmitter::emitDivRemExpr(IRBuilder<> &B, unsigned Opcode,
     Value *N = B.CreateOr(B.CreateXor(X, K, "vm.div.xy.mix"), loConst(Ty, 1));
     UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.mixxor0"), K,
                        "vm.div.x.mixxor1");
-    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.mixadd"), N,
-                       "vm.div.y.mixsub");
+    UseY =
+        B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.mixadd"), N, "vm.div.y.mixsub");
     break;
   }
   }
@@ -509,6 +580,19 @@ bool VMVariantEmitter::isSupportedBinaryOpcode(unsigned Opcode) {
   }
 }
 
+Value *VMVariantEmitter::emitSelectedBinaryExpr(IRBuilder<> &B, unsigned Opcode,
+                                                IntegerType *Ty, Value *X,
+                                                Value *Y,
+                                                const BinaryVariant &Variant,
+                                                uint64_t Seed) {
+  if (Variant.UseMBARewrite) {
+    if (Value *R = YMBA::emitRewrite(B, Opcode, Ty, X, Y,
+                                     Variant.MBARewriteVariant, Seed))
+      return R;
+  }
+  return emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+}
+
 //===----------------------------------------------------------------------===//
 // Predicate / ICmp expression templates and wrappers
 //===----------------------------------------------------------------------===//
@@ -536,10 +620,10 @@ Value *VMVariantEmitter::emitICmpExpr(IRBuilder<> &B, CmpInst::Predicate Pred,
   Value *NZWide = B.CreateLShr(B.CreateOr(D, DNeg), loConst(ITy, BW - 1),
                                "vm.pred.nz.wide");
   Value *EqWide = B.CreateXor(NZWide, loConst(ITy, 1), "vm.pred.eq.wide");
-  Value *Eq = B.CreateTrunc(EqWide, Type::getInt1Ty(B.getContext()),
-                            "vm.pred.eq");
-  Value *Ne = B.CreateTrunc(NZWide, Type::getInt1Ty(B.getContext()),
-                            "vm.pred.ne");
+  Value *Eq =
+      B.CreateTrunc(EqWide, Type::getInt1Ty(B.getContext()), "vm.pred.eq");
+  Value *Ne =
+      B.CreateTrunc(NZWide, Type::getInt1Ty(B.getContext()), "vm.pred.ne");
 
   Value *Base = nullptr;
   switch (Pred) {
@@ -560,11 +644,12 @@ Value *VMVariantEmitter::emitICmpExpr(IRBuilder<> &B, CmpInst::Predicate Pred,
       Value *SY = B.CreateLShr(C, loConst(ITy, BW - 1), "vm.pred.sy");
       Value *SignDiff = B.CreateXor(SX, SY, "vm.pred.sdiff");
       Value *Diff = B.CreateSub(A, C, "vm.pred.ssub");
-      Value *SubSign = B.CreateLShr(Diff, loConst(ITy, BW - 1), "vm.pred.ssub.sign");
-      LtWide = B.CreateOr(B.CreateAnd(SignDiff, SX),
-                          B.CreateAnd(B.CreateXor(SignDiff, loConst(ITy, 1)),
-                                      SubSign),
-                          "vm.pred.slt.wide");
+      Value *SubSign =
+          B.CreateLShr(Diff, loConst(ITy, BW - 1), "vm.pred.ssub.sign");
+      LtWide = B.CreateOr(
+          B.CreateAnd(SignDiff, SX),
+          B.CreateAnd(B.CreateXor(SignDiff, loConst(ITy, 1)), SubSign),
+          "vm.pred.slt.wide");
     } else {
       Value *NX = B.CreateNot(A);
       Value *T0 = B.CreateAnd(NX, C);
@@ -604,7 +689,8 @@ Value *VMVariantEmitter::emitICmpExpr(IRBuilder<> &B, CmpInst::Predicate Pred,
   case 1:
     return B.CreateNot(B.CreateNot(Base), "vm.pred.notnot");
   default: {
-    Value *K = ConstantInt::get(Type::getInt1Ty(B.getContext()), (Seed >> 7) & 1);
+    Value *K =
+        ConstantInt::get(Type::getInt1Ty(B.getContext()), (Seed >> 7) & 1);
     return B.CreateXor(B.CreateXor(Base, K), K, "vm.pred.xorxor");
   }
   }
@@ -616,8 +702,7 @@ Value *VMVariantEmitter::emitICmpExpr(IRBuilder<> &B, CmpInst::Predicate Pred,
 
 Value *VMVariantEmitter::emitSelectExpr(IRBuilder<> &B, Type *Ty, Value *Cond,
                                         Value *TrueV, Value *FalseV,
-                                        unsigned ExprVariant, uint64_t Seed) {
-  (void)Seed;
+                                        unsigned ExprVariant, uint64_t) {
   if (auto *ITy = dyn_cast<IntegerType>(Ty)) {
     switch (ExprVariant % 3) {
     case 0:
@@ -694,40 +779,51 @@ Value *VMVariantEmitter::emitRotateRight(IRBuilder<> &B, IntegerType *Ty,
   return B.CreateOr(Lo, Hi, "vm.id.rot");
 }
 
-VMVariantEmitter::Relation VMVariantEmitter::emitRelation(
-    IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y, RelationKind Kind,
-    unsigned Variant, uint64_t Seed) {
+VMVariantEmitter::Relation
+VMVariantEmitter::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
+                               Value *Y, RelationKind Kind, unsigned Variant,
+                               uint64_t Seed) {
   switch (Kind) {
   case RelationKind::None:
     return {loConst(Ty, 0), loConst(Ty, 0)};
   case RelationKind::PopcountCarry: {
-    Value *A = (Variant & 1) ? emitRotateRight(B, Ty, X, 1 + ((Seed >> 21) % (Ty->getBitWidth() - 1))) : X;
-    Value *C = (Variant & 2) ? emitRotateRight(B, Ty, Y, 1 + ((Seed >> 29) % (Ty->getBitWidth() - 1))) : Y;
+    Value *A = (Variant & 1)
+                   ? emitRotateRight(
+                         B, Ty, X, 1 + ((Seed >> 21) % (Ty->getBitWidth() - 1)))
+                   : X;
+    Value *C = (Variant & 2)
+                   ? emitRotateRight(
+                         B, Ty, Y, 1 + ((Seed >> 29) % (Ty->getBitWidth() - 1)))
+                   : Y;
     Value *PA = B.CreateUnaryIntrinsic(Intrinsic::ctpop, A);
     Value *PC = B.CreateUnaryIntrinsic(Intrinsic::ctpop, C);
-    Value *PXor = B.CreateUnaryIntrinsic(Intrinsic::ctpop,
-                                         B.CreateXor(A, C, "vm.rel.popcarry.xor"));
-    Value *PAnd = B.CreateUnaryIntrinsic(Intrinsic::ctpop,
-                                         B.CreateAnd(A, C, "vm.rel.popcarry.and"));
+    Value *PXor = B.CreateUnaryIntrinsic(
+        Intrinsic::ctpop, B.CreateXor(A, C, "vm.rel.popcarry.xor"));
+    Value *PAnd = B.CreateUnaryIntrinsic(
+        Intrinsic::ctpop, B.CreateAnd(A, C, "vm.rel.popcarry.and"));
     Value *L = B.CreateAdd(PA, PC, "vm.rel.lhs");
-    Value *R = B.CreateAdd(PXor, B.CreateShl(PAnd, loConst(Ty, 1)),
-                           "vm.rel.rhs");
+    Value *R =
+        B.CreateAdd(PXor, B.CreateShl(PAnd, loConst(Ty, 1)), "vm.rel.rhs");
     return {L, R};
   }
   case RelationKind::MaskedPartition: {
     Value *Mask = loConst(Ty, yanso_mix64(Seed, 0x8c3d37c819544da2ULL));
-    Value *A = (Variant & 1) ? emitRotateRight(B, Ty, X, 1 + ((Seed >> 17) % (Ty->getBitWidth() - 1))) : X;
+    Value *A = (Variant & 1)
+                   ? emitRotateRight(
+                         B, Ty, X, 1 + ((Seed >> 17) % (Ty->getBitWidth() - 1)))
+                   : X;
     Value *L = A;
-    Value *R = B.CreateOr(B.CreateAnd(A, Mask, "vm.rel.maskpart.lo"),
-                          B.CreateAnd(A, B.CreateNot(Mask), "vm.rel.maskpart.hi"),
-                          "vm.rel.maskpart.rhs");
+    Value *R =
+        B.CreateOr(B.CreateAnd(A, Mask, "vm.rel.maskpart.lo"),
+                   B.CreateAnd(A, B.CreateNot(Mask), "vm.rel.maskpart.hi"),
+                   "vm.rel.maskpart.rhs");
     return {L, R};
   }
   case RelationKind::AffineRoundTrip: {
     uint64_t AConst = yanso_mix64(Seed, 0xd1b54a32d192ed03ULL) | 1ULL;
     uint64_t CConst = yanso_mix64(Seed, 0x94d049bb133111ebULL);
     Value *A = loConst(Ty, AConst);
-    Value *AInv = loConst(Ty, oddInverse64(AConst));
+    Value *AInv = modInvConst(Ty, AConst);
     Value *C = loConst(Ty, CConst);
     Value *Base = (Variant & 1) ? X : B.CreateXor(X, Y, "vm.rel.aff.base");
     Value *Enc = B.CreateAdd(B.CreateMul(Base, A, "vm.rel.aff.mul"), C,
@@ -735,6 +831,12 @@ VMVariantEmitter::Relation VMVariantEmitter::emitRelation(
     Value *Dec = B.CreateMul(B.CreateSub(Enc, C, "vm.rel.aff.sub"), AInv,
                              "vm.rel.aff.dec");
     return {Base, Dec};
+  }
+  case RelationKind::YMBA: {
+    YMBA::Relation Rel = YMBA::emitRelation(B, Ty, X, Y, Variant, Seed);
+    if (Rel.L && Rel.R)
+      return {Rel.L, Rel.R};
+    return {loConst(Ty, 0), loConst(Ty, 0)};
   }
   }
   llvm_unreachable("unknown VM relation kind");
@@ -752,8 +854,9 @@ Value *VMVariantEmitter::emitProjector(IRBuilder<> &B, IntegerType *Ty,
   case ProjectorKind::KeyedBit: {
     unsigned BW = Ty->getBitWidth();
     unsigned Shift = (Seed >> 33) % BW;
-    Value *Mixed = B.CreateXor(V, loConst(Ty, yanso_mix64(Seed, 0x517cc1b727220a95ULL)),
-                               Twine(Name) + ".mix");
+    Value *Mixed =
+        B.CreateXor(V, loConst(Ty, yanso_mix64(Seed, 0x517cc1b727220a95ULL)),
+                    Twine(Name) + ".mix");
     return B.CreateAnd(B.CreateLShr(Mixed, loConst(Ty, Shift)), loConst(Ty, 1),
                        Name);
   }
@@ -762,22 +865,16 @@ Value *VMVariantEmitter::emitProjector(IRBuilder<> &B, IntegerType *Ty,
 }
 
 Value *VMVariantEmitter::applyRelationDiffFold(IRBuilder<> &B, IntegerType *Ty,
-                                               Value *R,
-                                               const Relation &Rel) {
+                                               Value *R, const Relation &Rel) {
   Value *T = B.CreateAdd(R, Rel.L, "vm.id.app.diff.addx");
   return B.CreateSub(T, Rel.R, "vm.id.app.diff.suby");
 }
 
-uint64_t VMVariantEmitter::oddInverse64(uint64_t V) {
-  uint64_t X = V;
-  for (unsigned I = 0; I != 6; ++I)
-    X *= 2 - V * X;
-  return X;
-}
-
-Value *VMVariantEmitter::applyRelationPairedMulBranch(
-    IRBuilder<> &B, IntegerType *Ty, Value *R, const Relation &Rel,
-    ProjectorKind Projector, uint64_t Seed) {
+Value *VMVariantEmitter::applyRelationPairedMulBranch(IRBuilder<> &B,
+                                                      IntegerType *Ty, Value *R,
+                                                      const Relation &Rel,
+                                                      ProjectorKind Projector,
+                                                      uint64_t Seed) {
   Function *F = B.GetInsertBlock()->getParent();
   LLVMContext &Ctx = F->getContext();
   BasicBlock *Then0 = BasicBlock::Create(Ctx, "vm.id.app.mul0.t", F);
@@ -795,8 +892,8 @@ Value *VMVariantEmitter::applyRelationPairedMulBranch(
   uint64_t Bc = yanso_mix64(Seed, 0x243f6a8885a308d3ULL) | 1ULL;
   Value *A0 = loConst(Ty, A);
   Value *B0 = loConst(Ty, Bc);
-  Value *AInv = loConst(Ty, oddInverse64(A));
-  Value *BInv = loConst(Ty, oddInverse64(Bc));
+  Value *AInv = modInvConst(Ty, A);
+  Value *BInv = modInvConst(Ty, Bc);
 
   B.CreateCondBr(Pred0, Then0, Else0);
 
@@ -842,10 +939,10 @@ Value *VMVariantEmitter::applyRelationPairedAffineBranch(
   BasicBlock *Else1 = BasicBlock::Create(Ctx, "vm.id.app.aff1.f", F);
   BasicBlock *Join1 = BasicBlock::Create(Ctx, "vm.id.app.aff1.join", F);
 
-  Value *PX = emitProjector(B, Ty, Rel.L, Projector, Seed,
-                            "vm.id.app.aff.predx.v");
-  Value *PY = emitProjector(B, Ty, Rel.R, Projector, Seed,
-                            "vm.id.app.aff.predy.v");
+  Value *PX =
+      emitProjector(B, Ty, Rel.L, Projector, Seed, "vm.id.app.aff.predx.v");
+  Value *PY =
+      emitProjector(B, Ty, Rel.R, Projector, Seed, "vm.id.app.aff.predy.v");
   Value *Pred0 = B.CreateICmpNE(PX, loConst(Ty, 0), "vm.id.app.aff.predx");
   Value *Pred1 = B.CreateICmpNE(PY, loConst(Ty, 0), "vm.id.app.aff.predy");
 
@@ -853,8 +950,8 @@ Value *VMVariantEmitter::applyRelationPairedAffineBranch(
   uint64_t Bc = yanso_mix64(Seed, 0xbe5466cf34e90c6cULL) | 1ULL;
   Value *A0 = loConst(Ty, A);
   Value *B0 = loConst(Ty, Bc);
-  Value *AInv = loConst(Ty, oddInverse64(A));
-  Value *BInv = loConst(Ty, oddInverse64(Bc));
+  Value *AInv = modInvConst(Ty, A);
+  Value *BInv = modInvConst(Ty, Bc);
   Value *C0 = loConst(Ty, yanso_mix64(Seed, 0xc0ac29b7c97c50ddULL));
   Value *D0 = loConst(Ty, yanso_mix64(Seed, 0x3f84d5b5b5470917ULL));
 
@@ -877,13 +974,13 @@ Value *VMVariantEmitter::applyRelationPairedAffineBranch(
   J0B.CreateCondBr(Pred1, Then1, Else1);
 
   IRBuilder<> T1B(Then1);
-  Value *T1 = T1B.CreateMul(T1B.CreateSub(Mid, C0, "vm.id.app.aff.sub.c"),
-                            AInv, "vm.id.app.aff.mul.ainv");
+  Value *T1 = T1B.CreateMul(T1B.CreateSub(Mid, C0, "vm.id.app.aff.sub.c"), AInv,
+                            "vm.id.app.aff.mul.ainv");
   T1B.CreateBr(Join1);
 
   IRBuilder<> E1B(Else1);
-  Value *E1 = E1B.CreateMul(E1B.CreateSub(Mid, D0, "vm.id.app.aff.sub.d"),
-                            BInv, "vm.id.app.aff.mul.binv");
+  Value *E1 = E1B.CreateMul(E1B.CreateSub(Mid, D0, "vm.id.app.aff.sub.d"), BInv,
+                            "vm.id.app.aff.mul.binv");
   E1B.CreateBr(Join1);
 
   IRBuilder<> J1B(Join1);
@@ -894,19 +991,21 @@ Value *VMVariantEmitter::applyRelationPairedAffineBranch(
   return Out;
 }
 
-Value *VMVariantEmitter::applyRelationOpaqueFork(
-    IRBuilder<> &B, IntegerType *Ty, Value *R, const Relation &Rel,
-    ProjectorKind Projector, uint64_t Seed) {
+Value *VMVariantEmitter::applyRelationOpaqueFork(IRBuilder<> &B,
+                                                 IntegerType *Ty, Value *R,
+                                                 const Relation &Rel,
+                                                 ProjectorKind Projector,
+                                                 uint64_t Seed) {
   Function *F = B.GetInsertBlock()->getParent();
   LLVMContext &Ctx = F->getContext();
   BasicBlock *Good = BasicBlock::Create(Ctx, "vm.id.app.fork.good", F);
   BasicBlock *Bad = BasicBlock::Create(Ctx, "vm.id.app.fork.bad", F);
   BasicBlock *Join = BasicBlock::Create(Ctx, "vm.id.app.fork.join", F);
 
-  Value *PX = emitProjector(B, Ty, Rel.L, Projector, Seed,
-                            "vm.id.app.fork.predx.v");
-  Value *PY = emitProjector(B, Ty, Rel.R, Projector, Seed,
-                            "vm.id.app.fork.predy.v");
+  Value *PX =
+      emitProjector(B, Ty, Rel.L, Projector, Seed, "vm.id.app.fork.predx.v");
+  Value *PY =
+      emitProjector(B, Ty, Rel.R, Projector, Seed, "vm.id.app.fork.predy.v");
   Value *Guard = B.CreateICmpEQ(PX, PY, "vm.id.app.fork.guard");
   B.CreateCondBr(Guard, Good, Bad);
 
@@ -930,8 +1029,8 @@ Value *VMVariantEmitter::applyRelationOpaqueFork(
   return Out;
 }
 
-Value *VMVariantEmitter::applyRelation(IRBuilder<> &B, IntegerType *Ty, Value *R,
-                                       Value *X, Value *Y,
+Value *VMVariantEmitter::applyRelation(IRBuilder<> &B, IntegerType *Ty,
+                                       Value *R, Value *X, Value *Y,
                                        const BinaryVariant &Variant,
                                        uint64_t Seed) {
   if (Variant.Relation == RelationKind::None)
@@ -943,8 +1042,7 @@ Value *VMVariantEmitter::applyRelation(IRBuilder<> &B, IntegerType *Ty, Value *R
   case RelationApplication::DiffFold:
     return applyRelationDiffFold(B, Ty, R, Rel);
   case RelationApplication::PairedMulBranch:
-    return applyRelationPairedMulBranch(B, Ty, R, Rel, Variant.Projector,
-                                        Seed);
+    return applyRelationPairedMulBranch(B, Ty, R, Rel, Variant.Projector, Seed);
   case RelationApplication::PairedAffineBranch:
     return applyRelationPairedAffineBranch(B, Ty, R, Rel, Variant.Projector,
                                            Seed);
@@ -952,6 +1050,28 @@ Value *VMVariantEmitter::applyRelation(IRBuilder<> &B, IntegerType *Ty, Value *R
     return applyRelationOpaqueFork(B, Ty, R, Rel, Variant.Projector, Seed);
   }
   llvm_unreachable("unknown VM relation application");
+}
+
+Value *VMVariantEmitter::applyScalarRelation(IRBuilder<> &B, IntegerType *Ty,
+                                             Value *R, Value *X, Value *Y,
+                                             const ScalarVariant &Variant,
+                                             uint64_t Seed) {
+  if (Variant.Relation == RelationKind::None)
+    return R;
+  Relation Rel = emitRelation(B, Ty, X, Y, Variant.Relation,
+                              Variant.RelationVariant, Seed);
+  switch (Variant.RelationApp) {
+  case RelationApplication::DiffFold:
+    return applyRelationDiffFold(B, Ty, R, Rel);
+  case RelationApplication::PairedMulBranch:
+    return applyRelationPairedMulBranch(B, Ty, R, Rel, Variant.Projector, Seed);
+  case RelationApplication::PairedAffineBranch:
+    return applyRelationPairedAffineBranch(B, Ty, R, Rel, Variant.Projector,
+                                           Seed);
+  case RelationApplication::OpaqueFork:
+    return applyRelationOpaqueFork(B, Ty, R, Rel, Variant.Projector, Seed);
+  }
+  llvm_unreachable("unknown VM scalar relation application");
 }
 
 //===----------------------------------------------------------------------===//
@@ -997,10 +1117,12 @@ Value *VMVariantEmitter::emitDataMuxBinaryValue(IRBuilder<> &B, unsigned Opcode,
                                                 Value *Y,
                                                 const BinaryVariant &Variant,
                                                 uint64_t Seed) {
-  Value *R0 = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+  Value *R0 = emitSelectedBinaryExpr(B, Opcode, Ty, X, Y, Variant, Seed);
   R0 = applyRelation(B, Ty, R0, X, Y, Variant, Seed);
-  Value *R1 = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant + 1,
-                             yanso_mix64(Seed, 0x13198a2e03707344ULL));
+  BinaryVariant AltVariant = Variant;
+  AltVariant.UseMBARewrite = false;
+  Value *R1 = emitSelectedBinaryExpr(B, Opcode, Ty, X, Y, AltVariant,
+                                     yanso_mix64(Seed, 0x13198a2e03707344ULL));
   R1 = applyRelation(B, Ty, R1, X, Y, Variant,
                      yanso_mix64(Seed, 0x13198a2e03707344ULL));
 
@@ -1008,16 +1130,13 @@ Value *VMVariantEmitter::emitDataMuxBinaryValue(IRBuilder<> &B, unsigned Opcode,
   Value *Pred = nullptr;
   switch (Variant.MutationVariant % 3) {
   case 0:
-    Pred = B.CreateICmpEQ(B.CreateSub(B.CreateAdd(X, K), K), X,
-                          "vm.mux.pred");
+    Pred = B.CreateICmpEQ(B.CreateSub(B.CreateAdd(X, K), K), X, "vm.mux.pred");
     break;
   case 1:
-    Pred = B.CreateICmpEQ(B.CreateOr(B.CreateAnd(X, Y), X), X,
-                          "vm.mux.pred");
+    Pred = B.CreateICmpEQ(B.CreateOr(B.CreateAnd(X, Y), X), X, "vm.mux.pred");
     break;
   default:
-    Pred = B.CreateICmpEQ(B.CreateXor(B.CreateXor(Y, K), K), Y,
-                          "vm.mux.pred");
+    Pred = B.CreateICmpEQ(B.CreateXor(B.CreateXor(Y, K), K), Y, "vm.mux.pred");
     break;
   }
 
@@ -1050,11 +1169,22 @@ Value *VMVariantEmitter::emitIntrinsicValue(IRBuilder<> &B, Intrinsic::ID ID,
                                             ArrayRef<Value *> Args,
                                             const ScalarVariant &Variant,
                                             uint64_t Seed) {
-  FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(
-      B.GetInsertBlock()->getModule(), ID, {Ty});
-  Value *R = B.CreateCall(Intr, Args, "vm.intr.core");
-  return decorateIntegerResult(B, Ty, R, Variant.ExprVariant, Seed,
-                               "vm.intr.out");
+  Value *R = nullptr;
+  if (Variant.UseMBARewrite)
+    R = YMBA::emitIntrinsicRewrite(B, ID, Ty, Args, Variant.MBARewriteVariant,
+                                   Seed);
+  if (!R) {
+    FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(
+        B.GetInsertBlock()->getModule(), ID, {Ty});
+    R = B.CreateCall(Intr, Args, "vm.intr.core");
+  }
+  R = decorateIntegerResult(B, Ty, R, Variant.ExprVariant, Seed, "vm.intr.out");
+  Value *RelX = Args.empty() ? R : Args[0];
+  Value *RelY =
+      (Args.size() >= 2 && Args[1]->getType() == Ty) ? Args[1] : loConst(Ty, 0);
+  if ((ID == Intrinsic::fshl || ID == Intrinsic::fshr) && Args.size() >= 3)
+    RelY = Args[2];
+  return applyScalarRelation(B, Ty, R, RelX, RelY, Variant, Seed);
 }
 
 void VMVariantEmitter::emitCast(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
@@ -1075,9 +1205,12 @@ Value *VMVariantEmitter::emitCastValue(IRBuilder<> &B, unsigned Opcode,
 
   Value *R = B.CreateCast(static_cast<Instruction::CastOps>(Opcode), UseX,
                           DstTy, "vm.cast.core");
-  if (auto *ITy = dyn_cast<IntegerType>(DstTy))
+  if (auto *ITy = dyn_cast<IntegerType>(DstTy)) {
     R = decorateIntegerResult(B, ITy, R, Variant.ExprVariant + 1, Seed,
                               "vm.cast.out");
+    Value *RelY = loConst(ITy, yanso_mix64(Seed, 0x7f4a7c159e3779b9ULL));
+    return applyScalarRelation(B, ITy, R, R, RelY, Variant, Seed);
+  }
   return R;
 }
 
@@ -1116,8 +1249,7 @@ Value *VMVariantEmitter::emitICmpValue(IRBuilder<> &B, CmpInst::Predicate Pred,
 
 void VMVariantEmitter::emitSelect(IRBuilder<> &B, Type *Ty, Value *Cond,
                                   Value *TrueV, Value *FalseV,
-                                  const SelectVariant &Variant,
-                                  uint64_t Seed) {
+                                  const SelectVariant &Variant, uint64_t Seed) {
   B.CreateRet(emitSelectValue(B, Ty, Cond, TrueV, FalseV, Variant, Seed));
 }
 
@@ -1128,15 +1260,17 @@ Value *VMVariantEmitter::emitSelectValue(IRBuilder<> &B, Type *Ty, Value *Cond,
   switch (Variant.Mutation) {
   case MutationKind::None:
   case MutationKind::BitRebuild:
-    return emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant, Seed);
+    return emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant,
+                          Seed);
   case MutationKind::DataMux: {
-    Value *R0 = emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant,
-                               Seed);
-    Value *R1 = emitSelectExpr(B, Ty, Cond, TrueV, FalseV,
-                               Variant.ExprVariant + 1,
-                               yanso_mix64(Seed, 0x13198a2e03707344ULL));
-    Value *Sel = B.CreateICmpEQ(B.CreateXor(Cond, ConstantInt::getFalse(B.getContext())),
-                                Cond, "vm.select.mux.sel");
+    Value *R0 =
+        emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant, Seed);
+    Value *R1 =
+        emitSelectExpr(B, Ty, Cond, TrueV, FalseV, Variant.ExprVariant + 1,
+                       yanso_mix64(Seed, 0x13198a2e03707344ULL));
+    Value *Sel =
+        B.CreateICmpEQ(B.CreateXor(Cond, ConstantInt::getFalse(B.getContext())),
+                       Cond, "vm.select.mux.sel");
     if (auto *ITy = dyn_cast<IntegerType>(Ty)) {
       Value *Mask = B.CreateSub(loConst(ITy, 0), B.CreateZExt(Sel, ITy));
       Value *TruePart = B.CreateAnd(R0, Mask);
@@ -1162,11 +1296,11 @@ Value *VMVariantEmitter::emitBinaryValue(IRBuilder<> &B, unsigned Opcode,
                                          uint64_t Seed) {
   switch (Variant.Mutation) {
   case MutationKind::None: {
-    Value *R = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+    Value *R = emitSelectedBinaryExpr(B, Opcode, Ty, X, Y, Variant, Seed);
     return applyRelation(B, Ty, R, X, Y, Variant, Seed);
   }
   case MutationKind::BitRebuild: {
-    Value *R = emitBinaryExpr(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+    Value *R = emitSelectedBinaryExpr(B, Opcode, Ty, X, Y, Variant, Seed);
     R = applyRelation(B, Ty, R, X, Y, Variant, Seed);
     return emitControlFlowBitRebuild(B, B.GetInsertBlock()->getParent(), Ty, R);
   }

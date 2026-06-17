@@ -32,6 +32,7 @@ add_llvm_pass_plugin(yansollvm
   lib/Transforms/Obfuscate/IndirectGlobalVariable.cpp
   lib/Transforms/Obfuscate/YANSOllvmCommon.cpp
   lib/Transforms/Obfuscate/VMVariant.cpp
+  lib/Transforms/Obfuscate/YMBA.cpp
   lib/Transforms/Obfuscate/VMPass.cpp
   lib/Transforms/Obfuscate/MergePass.cpp
   lib/Transforms/Obfuscate/MFLAPass.cpp
@@ -41,13 +42,23 @@ add_llvm_pass_plugin(yansollvm
   lib/Transforms/Obfuscate/ObfConPass.cpp
 )
 
+add_executable(ymba-catalog-selftest
+  tests/ymba_catalog_selftest.cpp
+  lib/Transforms/Obfuscate/YMBA.cpp
+)
+target_include_directories(ymba-catalog-selftest PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/Obfuscate
+)
+target_link_libraries(ymba-catalog-selftest PRIVATE LLVMCore LLVMSupport)
+
 find_program(LLVM_LIT llvm-lit HINTS "${LLVM_TOOLS_BINARY_DIR}" REQUIRED)
 add_custom_target(check-yansollvm
+  COMMAND "$<TARGET_FILE:ymba-catalog-selftest>"
   COMMAND "${CMAKE_COMMAND}" -E env
           "LLVM_BUILD=${LLVM_TOOLS_BINARY_DIR}/.."
           "YANSOLLVM_PLUGIN=$<TARGET_FILE:yansollvm>"
           "${LLVM_LIT}" -sv "${CMAKE_CURRENT_SOURCE_DIR}/tests"
-  DEPENDS yansollvm
+  DEPENDS yansollvm ymba-catalog-selftest
   WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
   USES_TERMINAL
 )

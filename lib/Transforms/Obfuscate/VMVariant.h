@@ -1,9 +1,9 @@
 #pragma once
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/ADT/ArrayRef.h"
 
 #include <cstdint>
 #include <string>
@@ -32,7 +32,8 @@ public:
     None,
     PopcountCarry,
     MaskedPartition,
-    AffineRoundTrip
+    AffineRoundTrip,
+    YMBA
   };
   enum class ProjectorKind : uint8_t { LowBit, Parity, KeyedBit };
   enum class RelationApplication : uint8_t {
@@ -44,6 +45,8 @@ public:
 
   struct BinaryVariant {
     unsigned ExprVariant = 0;
+    bool UseMBARewrite = false;
+    unsigned MBARewriteVariant = 0;
     MutationKind Mutation = MutationKind::None;
     unsigned MutationVariant = 0;
     RelationKind Relation = RelationKind::None;
@@ -66,6 +69,12 @@ public:
 
   struct ScalarVariant {
     unsigned ExprVariant = 0;
+    bool UseMBARewrite = false;
+    unsigned MBARewriteVariant = 0;
+    RelationKind Relation = RelationKind::None;
+    ProjectorKind Projector = ProjectorKind::LowBit;
+    RelationApplication RelationApp = RelationApplication::DiffFold;
+    unsigned RelationVariant = 0;
   };
 
   static BinaryVariant selectBinaryVariant(unsigned Opcode, IntegerType *Ty,
@@ -88,8 +97,8 @@ public:
   static void emitICmp(IRBuilder<> &B, CmpInst::Predicate Pred, Type *Ty,
                        Value *X, Value *Y, const PredicateVariant &Variant,
                        uint64_t Seed);
-  static Value *emitICmpValue(IRBuilder<> &B, CmpInst::Predicate Pred,
-                              Type *Ty, Value *X, Value *Y,
+  static Value *emitICmpValue(IRBuilder<> &B, CmpInst::Predicate Pred, Type *Ty,
+                              Value *X, Value *Y,
                               const PredicateVariant &Variant, uint64_t Seed);
   static SelectVariant selectSelectVariant(Type *Ty, uint64_t Seed,
                                            unsigned MutationPermille);
@@ -109,8 +118,7 @@ public:
                             const ScalarVariant &Variant, uint64_t Seed);
   static Value *emitIntrinsicValue(IRBuilder<> &B, Intrinsic::ID ID,
                                    IntegerType *Ty, ArrayRef<Value *> Args,
-                                   const ScalarVariant &Variant,
-                                   uint64_t Seed);
+                                   const ScalarVariant &Variant, uint64_t Seed);
   static void emitCast(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
                        Type *DstTy, Value *X, const ScalarVariant &Variant,
                        uint64_t Seed);
@@ -127,16 +135,16 @@ private:
   static Value *loConst(IntegerType *Ty, uint64_t V);
   static Value *notV(IRBuilder<> &B, Value *V);
 
-  static Value *emitXorExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                            Value *Y, unsigned Variant);
-  static Value *emitAndExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                            Value *Y, unsigned Variant);
+  static Value *emitXorExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                            unsigned Variant);
+  static Value *emitAndExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                            unsigned Variant);
   static Value *emitOrExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
                            unsigned Variant);
-  static Value *emitAddExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                            Value *Y, unsigned Variant);
-  static Value *emitSubExpr(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                            Value *Y, unsigned Variant);
+  static Value *emitAddExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                            unsigned Variant);
+  static Value *emitSubExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                            unsigned Variant);
   static Value *emitShiftExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
                               Value *X, Value *Y, unsigned Variant);
   static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
@@ -145,6 +153,10 @@ private:
   static Value *emitBinaryExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
                                Value *X, Value *Y, unsigned ExprVariant,
                                uint64_t Seed);
+  static Value *emitSelectedBinaryExpr(IRBuilder<> &B, unsigned Opcode,
+                                       IntegerType *Ty, Value *X, Value *Y,
+                                       const BinaryVariant &Variant,
+                                       uint64_t Seed);
   static unsigned binaryExprVariantCount(unsigned Opcode);
   static bool isSupportedBinaryOpcode(unsigned Opcode);
   static Value *decorateIntegerResult(IRBuilder<> &B, IntegerType *Ty, Value *V,
@@ -161,8 +173,8 @@ private:
                               StringRef Name);
 
   static Value *applyRelation(IRBuilder<> &B, IntegerType *Ty, Value *R,
-                              Value *X, Value *Y,
-                              const BinaryVariant &Variant, uint64_t Seed);
+                              Value *X, Value *Y, const BinaryVariant &Variant,
+                              uint64_t Seed);
   static Value *applyRelationDiffFold(IRBuilder<> &B, IntegerType *Ty, Value *R,
                                       const Relation &Rel);
   static Value *applyRelationPairedMulBranch(IRBuilder<> &B, IntegerType *Ty,
@@ -175,10 +187,11 @@ private:
                                                 uint64_t Seed);
   static Value *applyRelationOpaqueFork(IRBuilder<> &B, IntegerType *Ty,
                                         Value *R, const Relation &Rel,
-                                        ProjectorKind Projector,
-                                        uint64_t Seed);
-  static uint64_t oddInverse64(uint64_t V);
-
+                                        ProjectorKind Projector, uint64_t Seed);
+  static Value *applyScalarRelation(IRBuilder<> &B, IntegerType *Ty, Value *R,
+                                    Value *X, Value *Y,
+                                    const ScalarVariant &Variant,
+                                    uint64_t Seed);
   static bool supportsLoopMutation(unsigned Opcode, unsigned BitWidth);
   static bool supportsDataMuxMutation(unsigned Opcode, unsigned BitWidth);
   static bool supportsRelation(unsigned BitWidth);

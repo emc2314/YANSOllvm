@@ -14,6 +14,5 @@ bool yansollvm_has_dynamic_stack_state(BasicBlock &BB);
 bool yansollvm_has_dynamic_stack_state(Function &F);
 void yansollvm_create_trap_block(Function *F, BasicBlock *BB);
 uint32_t yansollvm_rand_prime(uint32_t Min, uint32_t Max, YansoRNG &RNG);
-uint64_t yansollvm_mod_inv(uint64_t A);
 
 } // namespace llvm

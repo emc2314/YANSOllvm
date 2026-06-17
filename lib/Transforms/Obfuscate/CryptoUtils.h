@@ -10,6 +10,7 @@
 #include <vector>
 
 namespace llvm {
+class APInt;
 class BasicBlock;
 class Module;
 class Value;
@@ -20,6 +21,10 @@ inline constexpr unsigned YansoMixRotate = 13;
 
 uint64_t yanso_mix64(uint64_t A, uint64_t B);
 uint64_t yanso_hash_string(StringRef S, uint64_t Seed = YansoMixBasis);
+uint64_t yanso_mod_inverse(uint64_t A);
+uint64_t yanso_mod_inverse(uint64_t A, uint64_t Modulus);
+APInt yanso_mod_inverse(const APInt &A);
+APInt yanso_mod_inverse(const APInt &A, const APInt &Modulus);
 Value *yanso_create_mix64_ir(Value *A, Value *B, BasicBlock *InsertAtEnd,
                              Module &M);
 

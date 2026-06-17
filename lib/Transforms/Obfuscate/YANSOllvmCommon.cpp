@@ -169,10 +169,3 @@ uint32_t llvm::yansollvm_rand_prime(uint32_t Min, uint32_t Max, YansoRNG &RNG) {
     P = Min + RNG.range(Max - Min + 1);
   return P;
 }
-
-uint64_t llvm::yansollvm_mod_inv(uint64_t A) {
-  uint64_t X = A;
-  for (int K = 2; K < 64; K *= 2)
-    X = (X * (2 - A * X)) % (1ULL << K);
-  return X * (2 - A * X);
-}
