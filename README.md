@@ -89,7 +89,7 @@ separate `opt -load LLVMObf.so -vm -merge ...` pass names.
 | Flag | Current registration / invocation | Implementation origin | Status | Notes |
 | --- | --- | --- | --- | --- |
 | `-vm` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Replaces selected integer binary operators with helper calls. LLVM 9 used direct legacy-PM `RegisterPass("vm")`. |
-| `-merge` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Merges eligible internal functions behind a dispatcher. LLVM 9 used direct legacy-PM `RegisterPass("merge")`. |
+| `-merge` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Merges eligible function definitions into internal dispatchers. Local functions are rewritten at direct callsites; ordinary external definitions keep their public symbol and become wrappers. LLVM 9 used direct legacy-PM `RegisterPass("merge")`. |
 | `-mfla` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | YANSOllvm LLVM 21 module-level flattening pass. | experimental | Merges eligible non-recursive functions into one mega function with threaded `indirectbr` control flow. Uses global frame/state/return-continuation storage; not reentrant or thread-safe. See MFLA limitations below. |
 | `-func2mod` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass and writes side-effect bitcode outputs. | Original YANSOllvm pass. | updated / experimental | Module partitioning tool, not a normal protection pass. LLVM 9 had a direct legacy-PM `RegisterPass("func2mod")`. |
 | `-bb2func` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Extracts eligible basic blocks into new functions. LLVM 9 used direct legacy-PM `RegisterPass("bb2func")`. |
@@ -121,6 +121,16 @@ into the plugin and causes duplicate command-line option registration inside
 `opt`. Treat `func2mod` as a separate follow-up: either implement splitting
 without `SplitModule`, build it as a standalone tool, or use an LLVM shared
 library setup where the symbol is exported by the host.
+
+### Merge notes
+
+This LLVM 21 merge pass groups candidates into bounded dispatchers instead of
+one module-wide mega dispatcher. Its dispatcher scalar slots are storage slots,
+not source-level types: `float` reuses `i32`, `double` and pointers reuse `i64`,
+and narrower scalar slots may be promoted into available `i64` slots. Ordinary
+external definitions keep their public symbol and are rewritten as wrappers that
+call an internal dispatcher. The hidden `-merge-max-group-size=N` option caps
+dispatcher group size; default is 8.
 
 ### MFLA limitations
 
