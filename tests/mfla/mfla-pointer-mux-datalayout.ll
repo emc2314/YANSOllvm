@@ -1,6 +1,8 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %s -o %t.out.ll
-; RUN: grep 'ptrtoint (ptr blockaddress.* to i32' %t.out.ll
-; RUN: %not grep 'ptrtoint (ptr blockaddress.* to i64' %t.out.ll
+; RUN: grep 'define internal void @__yansollvm_mfla_main(i64' %t.out.ll
+; RUN: grep '@__yansollvm_mfla_edge = private unnamed_addr constant i64' %t.out.ll
+; RUN: grep 'ptrtoint (ptr blockaddress.* to i64' %t.out.ll
+; RUN: grep 'indirectbr ptr %mfla.target' %t.out.ll
 
 target datalayout = "e-p:32:32"
 

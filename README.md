@@ -90,6 +90,7 @@ separate `opt -load LLVMObf.so -vm -merge ...` pass names.
 | --- | --- | --- | --- | --- |
 | `-vm` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Replaces selected integer binary operators with helper calls. LLVM 9 used direct legacy-PM `RegisterPass("vm")`. |
 | `-merge` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Merges eligible internal functions behind a dispatcher. LLVM 9 used direct legacy-PM `RegisterPass("merge")`. |
+| `-mfla` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | YANSOllvm LLVM 21 module-level flattening pass. | experimental | Merges eligible non-recursive functions into one mega function with threaded `indirectbr` control flow. Uses global frame/state/return-continuation storage; not reentrant or thread-safe. See MFLA limitations below. |
 | `-func2mod` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass and writes side-effect bitcode outputs. | Original YANSOllvm pass. | updated / experimental | Module partitioning tool, not a normal protection pass. LLVM 9 had a direct legacy-PM `RegisterPass("func2mod")`. |
 | `-bb2func` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Extracts eligible basic blocks into new functions. LLVM 9 used direct legacy-PM `RegisterPass("bb2func")`. |
 | `-connect` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Splits/connects basic blocks and adds trap-backed default paths. LLVM 9 used direct legacy-PM `RegisterPass("connect")`. |
@@ -120,6 +121,29 @@ into the plugin and causes duplicate command-line option registration inside
 `opt`. Treat `func2mod` as a separate follow-up: either implement splitting
 without `SplitModule`, build it as a standalone tool, or use an LLVM shared
 library setup where the symbol is exported by the host.
+
+### MFLA limitations
+
+`-mfla` is currently experimental. It lowers eligible functions into one mega
+function and stores arguments, return values, PHI spill slots, the current MFLA
+state, and return-continuation metadata in internal globals such as
+`__yansollvm_mfla_frame`, `__yansollvm_mfla_state`,
+`__yansollvm_mfla_ret_cont_xor`, and `__yansollvm_mfla_ret_cont_edge`.
+Because that storage is process-global, transformed functions are not reentrant
+and are not thread-safe: recursive SCCs are skipped, but concurrent calls,
+signal/async reentry, callbacks that reenter transformed code, or other native
+reentry can corrupt the shared frame/state/continuation slots. Use `-mfla` only
+for code paths where calls into the transformed set are externally serialized, or
+keep those functions out of the MFLA candidate set until a TLS/explicit-context
+runtime is implemented.
+
+Other current MFLA constraints: varargs, selected ABI attributes, dynamic stack
+state, EH pads, `callbr`, non-scalar frame values, and escaping or unsupported
+`blockaddress` use domains are skipped. Native input `indirectbr` terminators
+are lowered through address-taken helper blocks that set the MFLA state and then
+use the encoded-edge jump path; destination PHI slots are filled at the original
+indirectbr source through the same mux-based PHI lowering used by switch/branch
+edges.
 
 ### Difference from the LLVM 9 main branch
 

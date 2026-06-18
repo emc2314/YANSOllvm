@@ -1,9 +1,12 @@
 #include "MFLAPass.h"
+#include "CryptoUtils.h"
 #include "Utils.h"
 #include "YANSOllvmCommon.h"
+#include "YANSOllvmSeed.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -18,6 +21,7 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include <unordered_set>
 #include <vector>
 
 using namespace llvm;
@@ -35,37 +39,54 @@ static StorageRef staticRef(Type *Ty, uint64_t Offset) { return {Ty, Offset}; }
 struct MFLAArtifacts {
   Function *Mega = nullptr;
   GlobalVariable *Frame = nullptr;
-  GlobalVariable *RetCont = nullptr;
-  GlobalVariable *TargetTable = nullptr;
+  GlobalVariable *RetContXor = nullptr;
+  GlobalVariable *RetContEdge = nullptr;
+  GlobalVariable *State = nullptr;
+  uint64_t StateKeySalt = 0;
+  DenseMap<Function *, uint64_t> EntryStateForFunction;
+  DenseMap<Function *, GlobalVariable *> EntryEdgeForFunction;
+  DenseMap<GlobalVariable *, GlobalVariable *> GlobalRemaps;
+  SmallVector<GlobalVariable *, 8> EdgeConstants;
   SmallVector<GlobalVariable *, 8> RemappedGlobals;
 
   void eraseFromParent() {
+    if (Mega) {
+      Mega->eraseFromParent();
+      Mega = nullptr;
+    }
+    for (GlobalVariable *GV : reverse(EdgeConstants)) {
+      if (GV)
+        GV->eraseFromParent();
+    }
+    EdgeConstants.clear();
     for (GlobalVariable *GV : reverse(RemappedGlobals)) {
       if (GV)
         GV->eraseFromParent();
     }
     RemappedGlobals.clear();
-    if (TargetTable) {
-      TargetTable->eraseFromParent();
-      TargetTable = nullptr;
+    if (State) {
+      State->eraseFromParent();
+      State = nullptr;
     }
-    if (Mega) {
-      Mega->eraseFromParent();
-      Mega = nullptr;
+    if (RetContEdge) {
+      RetContEdge->eraseFromParent();
+      RetContEdge = nullptr;
     }
+    GlobalRemaps.clear();
+    EntryEdgeForFunction.clear();
     if (Frame) {
       Frame->eraseFromParent();
       Frame = nullptr;
     }
-    if (RetCont) {
-      RetCont->eraseFromParent();
-      RetCont = nullptr;
+    if (RetContXor) {
+      RetContXor->eraseFromParent();
+      RetContXor = nullptr;
     }
   }
 };
 
 struct FunctionLayout {
-  unsigned EntryID = 0;
+  unsigned ContinuationSlotID = 0;
   Function *Owner = nullptr;
   SmallVector<StorageRef, 4> ArgOffsets;
   DenseMap<Argument *, StorageRef> ArgOffsetFor;
@@ -158,6 +179,8 @@ static bool constantUsesOnlyBlockAddressesInFunction(Constant *C, Function &F) {
     return true;
   if (auto *BA = dyn_cast<BlockAddress>(C))
     return BA->getFunction() == &F;
+  if (isa<GlobalValue>(C))
+    return true;
   for (Use &U : C->operands()) {
     auto *OpC = dyn_cast<Constant>(U.get());
     if (!OpC)
@@ -203,16 +226,152 @@ static bool instructionBlockAddressUseIsSupported(Instruction &I, Function &F) {
   return true;
 }
 
-static bool indirectBrDestinationsHavePhis(Function &F) {
-  for (BasicBlock &BB : F) {
-    auto *IB = dyn_cast<IndirectBrInst>(BB.getTerminator());
-    if (!IB)
-      continue;
-    for (unsigned I = 0, E = IB->getNumDestinations(); I != E; ++I)
-      if (isa<PHINode>(&IB->getDestination(I)->front()))
-        return true;
+static void collectBlockAddressOwners(Constant *C,
+                                      SmallPtrSetImpl<Function *> &Owners) {
+  if (!C)
+    return;
+  if (auto *BA = dyn_cast<BlockAddress>(C)) {
+    Owners.insert(BA->getFunction());
+    return;
   }
+  if (isa<GlobalValue>(C))
+    return;
+  for (Use &U : C->operands())
+    if (auto *OpC = dyn_cast<Constant>(U.get()))
+      if (OpC != C)
+        collectBlockAddressOwners(OpC, Owners);
+}
+
+static bool hasNonCandidateInstructionUser(
+    GlobalVariable &GV, const DenseSet<Function *> &CandidateSet) {
+  SmallVector<User *, 16> Work(GV.users());
+  SmallPtrSet<User *, 16> Seen;
+
+  while (!Work.empty()) {
+    User *U = Work.pop_back_val();
+    if (!Seen.insert(U).second)
+      continue;
+
+    if (auto *I = dyn_cast<Instruction>(U)) {
+      Function *Owner = I->getFunction();
+      if (!Owner || !CandidateSet.count(Owner))
+        return true;
+      continue;
+    }
+
+    if (auto *C = dyn_cast<Constant>(U)) {
+      for (User *Next : C->users())
+        Work.push_back(Next);
+      continue;
+    }
+
+    for (User *Next : U->users())
+      Work.push_back(Next);
+  }
+
   return false;
+}
+
+static bool pruneCandidatesForBlockAddressGlobals(
+    Module &M, DenseSet<Function *> &CandidateSet) {
+  SmallPtrSet<Function *, 8> ToRemove;
+
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
+        !constantContainsBlockAddress(GV.getInitializer()))
+      continue;
+
+    SmallPtrSet<Function *, 8> Owners;
+    collectBlockAddressOwners(GV.getInitializer(), Owners);
+
+    bool HasCandidateOwner = false;
+    bool HasNonCandidateOwner = false;
+    for (Function *Owner : Owners) {
+      if (CandidateSet.count(Owner))
+        HasCandidateOwner = true;
+      else
+        HasNonCandidateOwner = true;
+    }
+    if (!HasCandidateOwner)
+      continue;
+
+    bool UnsafeUse = hasNonCandidateInstructionUser(GV, CandidateSet);
+    if (!HasNonCandidateOwner && !UnsafeUse)
+      continue;
+
+    for (Function *Owner : Owners) {
+      if (!CandidateSet.count(Owner))
+        continue;
+      ToRemove.insert(Owner);
+      std::string Reason = HasNonCandidateOwner
+                               ? (Twine("blockaddress global '") + GV.getName() +
+                                  "' mixes candidate and non-candidate labels")
+                                     .str()
+                               : (Twine("blockaddress global '") + GV.getName() +
+                                  "' is used by non-candidate code")
+                                     .str();
+      YANSO_WARN_FUNCTION(PassName, *Owner, Reason);
+    }
+  }
+
+  for (Function *F : ToRemove)
+    CandidateSet.erase(F);
+  return !ToRemove.empty();
+}
+
+static void collectBlockAddresses(Constant *C, Function &F,
+                                  SmallPtrSetImpl<BasicBlock *> &Blocks) {
+  if (!C)
+    return;
+  if (auto *BA = dyn_cast<BlockAddress>(C)) {
+    if (BA->getFunction() == &F)
+      Blocks.insert(BA->getBasicBlock());
+    return;
+  }
+  if (isa<GlobalValue>(C))
+    return;
+  for (Use &U : C->operands())
+    if (auto *OpC = dyn_cast<Constant>(U.get()))
+      if (OpC != C)
+        collectBlockAddresses(OpC, F, Blocks);
+}
+
+static SmallVector<BasicBlock *, 8> collectAddressTakenBlocks(Function &F) {
+  SmallPtrSet<BasicBlock *, 8> Seen;
+  SmallVector<BasicBlock *, 8> Blocks;
+  auto Add = [&](BasicBlock *BB) {
+    if (BB && Seen.insert(BB).second)
+      Blocks.push_back(BB);
+  };
+
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      for (Use &U : I.operands()) {
+        auto *C = dyn_cast<Constant>(U.get());
+        if (!C)
+          continue;
+        SmallPtrSet<BasicBlock *, 8> Found;
+        collectBlockAddresses(C, F, Found);
+        for (BasicBlock *AddrBB : Found)
+          Add(AddrBB);
+      }
+    }
+    if (auto *IB = dyn_cast<IndirectBrInst>(BB.getTerminator()))
+      for (unsigned I = 0, E = IB->getNumDestinations(); I != E; ++I)
+        Add(IB->getDestination(I));
+  }
+
+  for (GlobalVariable &GV : F.getParent()->globals()) {
+    if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
+        !constantUsesOnlyBlockAddressesInFunction(GV.getInitializer(), F))
+      continue;
+    SmallPtrSet<BasicBlock *, 8> Found;
+    collectBlockAddresses(GV.getInitializer(), F, Found);
+    for (BasicBlock *AddrBB : Found)
+      Add(AddrBB);
+  }
+
+  return Blocks;
 }
 
 static bool hasSupportedBlockAddressDomain(Function &F) {
@@ -268,17 +427,13 @@ static bool isCandidate(Function &F) {
     YANSO_WARN_FUNCTION(PassName, F, "unsupported blockaddress use");
     return false;
   }
-  if (indirectBrDestinationsHavePhis(F)) {
-    YANSO_WARN_FUNCTION(PassName, F, "indirectbr destination PHI nodes");
-    return false;
-  }
   if (yansollvm_has_dynamic_stack_state(F)) {
     YANSO_WARN_FUNCTION(PassName, F, "dynamic stack state");
     return false;
   }
   if (!F.hasLocalLinkage())
     YANSO_WARN_FUNCTION(PassName, F,
-                        "non-local function will be kept as ABI wrapper");
+                        "non-local function will be rewritten as ABI-preserving wrapper");
   if (F.empty())
     return false;
   return true;
@@ -457,22 +612,36 @@ static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
   MFLAArtifacts A;
 
   auto *I8 = Type::getInt8Ty(Ctx);
-  auto *I32 = Type::getInt32Ty(Ctx);
-  auto *Ptr = PointerType::get(Ctx, 0);
+  auto *I64 = Type::getInt64Ty(Ctx);
   auto *FrameTy = ArrayType::get(I8, FrameSize);
-  auto *RetContTy = ArrayType::get(Ptr, NumFunctions);
+  auto *RetContTy = ArrayType::get(I64, NumFunctions);
 
   A.Frame = new GlobalVariable(M, FrameTy, false, GlobalValue::InternalLinkage,
                                Constant::getNullValue(FrameTy),
                                "__yansollvm_mfla_frame");
   A.Frame->setAlignment(Align(16));
 
-  A.RetCont = new GlobalVariable(
+  A.RetContXor = new GlobalVariable(
       M, RetContTy, false, GlobalValue::InternalLinkage,
-      Constant::getNullValue(RetContTy), "__yansollvm_mfla_ret_cont");
-  A.RetCont->setAlignment(Align(8));
+      Constant::getNullValue(RetContTy), "__yansollvm_mfla_ret_cont_xor");
+  A.RetContXor->setAlignment(Align(8));
 
-  FunctionType *FTy = FunctionType::get(Type::getVoidTy(Ctx), {I32}, false);
+  A.RetContEdge = new GlobalVariable(
+      M, RetContTy, false, GlobalValue::InternalLinkage,
+      Constant::getNullValue(RetContTy), "__yansollvm_mfla_ret_cont_edge");
+  A.RetContEdge->setAlignment(Align(8));
+
+  A.State = new GlobalVariable(M, I64, false, GlobalValue::InternalLinkage,
+                               Constant::getNullValue(I64),
+                               "__yansollvm_mfla_state");
+  A.State->setAlignment(Align(8));
+  YansoRNG SaltRNG(yanso_hash_string("state-key-salt",
+                                      yanso_module_seed(M, PassName)));
+  do {
+    A.StateKeySalt = SaltRNG.next64();
+  } while (!A.StateKeySalt);
+
+  FunctionType *FTy = FunctionType::get(Type::getVoidTy(Ctx), {I64, I64}, false);
   A.Mega = Function::Create(FTy, GlobalValue::InternalLinkage,
                             "__yansollvm_mfla_main", M);
   A.Mega->addFnAttr(Attribute::NoInline);
@@ -501,17 +670,24 @@ static LoadInst *loadSlot(IRBuilder<> &B, Type *Ty, MFLAArtifacts &A,
   return B.CreateLoad(Ty, storagePtr(B, A, Ref), Name);
 }
 
-static Constant *remapConstant(Constant *C, Function *OldF, Function &Mega,
-                               DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-                               ValueToValueMapTy &VMap) {
+static Constant *remapConstantWithBlockAddressMapper(
+    Constant *C, ValueToValueMapTy &VMap,
+    const DenseMap<GlobalVariable *, GlobalVariable *> *GlobalRemaps,
+    function_ref<Constant *(BlockAddress *)> MapBlockAddress) {
   if (!C)
     return nullptr;
-  if (auto *BA = dyn_cast<BlockAddress>(C)) {
-    if (BA->getFunction() == OldF) {
-      BasicBlock *NewBB = BBMap.lookup(BA->getBasicBlock());
-      if (NewBB)
-        return BlockAddress::get(&Mega, NewBB);
+  if (auto *BA = dyn_cast<BlockAddress>(C))
+    return MapBlockAddress(BA);
+  if (auto *GV = dyn_cast<GlobalVariable>(C)) {
+    if (GlobalRemaps) {
+      auto GlobalIt = GlobalRemaps->find(GV);
+      if (GlobalIt != GlobalRemaps->end())
+        return GlobalIt->second;
     }
+    auto It = VMap.find(GV);
+    if (It != VMap.end())
+      if (auto *Mapped = dyn_cast<Constant>(It->second))
+        return Mapped;
     return C;
   }
   if (auto *GV = dyn_cast<GlobalValue>(C)) {
@@ -531,7 +707,8 @@ static Constant *remapConstant(Constant *C, Function *OldF, Function &Mega,
       return C;
     if (OpC == C)
       return C;
-    Constant *Mapped = remapConstant(OpC, OldF, Mega, BBMap, VMap);
+    Constant *Mapped = remapConstantWithBlockAddressMapper(
+        OpC, VMap, GlobalRemaps, MapBlockAddress);
     Ops.push_back(Mapped);
     Changed |= Mapped != OpC;
   }
@@ -548,44 +725,136 @@ static Constant *remapConstant(Constant *C, Function *OldF, Function &Mega,
   return C;
 }
 
-static GlobalVariable *remapGlobalInitializerForFunction(
-    GlobalVariable &GV, Function *OldF, Function &Mega,
-    DenseMap<BasicBlock *, BasicBlock *> &BBMap, ValueToValueMapTy &VMap,
-    MFLAArtifacts &A) {
-  if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
-      !constantContainsBlockAddress(GV.getInitializer()) ||
-      !constantUsesOnlyBlockAddressesInFunction(GV.getInitializer(), *OldF))
-    return nullptr;
+static Constant *remapConstant(
+    Constant *C, Function &Mega,
+    DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &FunctionBBMaps,
+    DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &AddrHelperForFunction,
+    ValueToValueMapTy &VMap,
+    const DenseMap<GlobalVariable *, GlobalVariable *> *GlobalRemaps = nullptr) {
+  return remapConstantWithBlockAddressMapper(
+      C, VMap, GlobalRemaps, [&](BlockAddress *BA) -> Constant * {
+        auto FnIt = FunctionBBMaps.find(BA->getFunction());
+        if (FnIt == FunctionBBMaps.end())
+          return BA;
+        auto HelperFnIt = AddrHelperForFunction.find(BA->getFunction());
+        if (HelperFnIt != AddrHelperForFunction.end()) {
+          auto HelperIt = HelperFnIt->second.find(BA->getBasicBlock());
+          if (HelperIt != HelperFnIt->second.end())
+            return BlockAddress::get(&Mega, HelperIt->second);
+        }
+        BasicBlock *NewBB = FnIt->second.lookup(BA->getBasicBlock());
+        if (NewBB)
+          return BlockAddress::get(&Mega, NewBB);
+        return BA;
+      });
+}
 
-  Constant *Init = remapConstant(GV.getInitializer(), OldF, Mega, BBMap, VMap);
+static Constant *remapConstant(Constant *C, Function *OldF, Function &Mega,
+                               DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+                               ValueToValueMapTy &VMap,
+                               const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr,
+                               const DenseMap<GlobalVariable *, GlobalVariable *> *GlobalRemaps = nullptr) {
+  return remapConstantWithBlockAddressMapper(
+      C, VMap, GlobalRemaps, [&](BlockAddress *BA) -> Constant * {
+        if (BA->getFunction() != OldF)
+          return BA;
+        if (AddrHelperForOldBB) {
+          auto HelperIt = AddrHelperForOldBB->find(BA->getBasicBlock());
+          if (HelperIt != AddrHelperForOldBB->end())
+            return BlockAddress::get(&Mega, HelperIt->second);
+        }
+        BasicBlock *NewBB = BBMap.lookup(BA->getBasicBlock());
+        if (NewBB)
+          return BlockAddress::get(&Mega, NewBB);
+        return BA;
+      });
+}
+
+static GlobalVariable *createRemappedGlobalShell(GlobalVariable &GV,
+                                                Function &Mega,
+                                                MFLAArtifacts &A) {
   auto *NewGV = new GlobalVariable(
       *Mega.getParent(), GV.getValueType(), GV.isConstant(),
-      GlobalValue::InternalLinkage, Init, (GV.getName() + ".mfla").str(),
-      nullptr, GV.getThreadLocalMode(), GV.getAddressSpace(),
-      GV.isExternallyInitialized());
+      GlobalValue::InternalLinkage, UndefValue::get(GV.getValueType()),
+      (GV.getName() + ".mfla").str(), nullptr, GV.getThreadLocalMode(),
+      GV.getAddressSpace(), GV.isExternallyInitialized());
   NewGV->copyAttributesFrom(&GV);
   NewGV->setLinkage(GlobalValue::InternalLinkage);
   NewGV->setName((GV.getName() + ".mfla").str());
-  VMap[&GV] = NewGV;
+  A.GlobalRemaps[&GV] = NewGV;
   A.RemappedGlobals.push_back(NewGV);
   return NewGV;
 }
 
-static void remapLocalBlockAddressGlobals(Function *OldF, Function &Mega,
-                                          DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-                                          ValueToValueMapTy &VMap,
-                                          MFLAArtifacts &A) {
-  for (GlobalVariable &GV : OldF->getParent()->globals())
-    remapGlobalInitializerForFunction(GV, OldF, Mega, BBMap, VMap, A);
+static bool prepareModuleBlockAddressGlobals(
+    Module &M, Function &Mega, ArrayRef<Function *> Candidates,
+    DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &FunctionBBMaps,
+    DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &AddrHelperForFunction,
+    MFLAArtifacts &A) {
+  DenseSet<Function *> CandidateSet;
+  for (Function *F : Candidates)
+    CandidateSet.insert(F);
+
+  SmallVector<GlobalVariable *, 8> Globals;
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
+        !constantContainsBlockAddress(GV.getInitializer()))
+      continue;
+
+    SmallPtrSet<Function *, 8> Owners;
+    collectBlockAddressOwners(GV.getInitializer(), Owners);
+    bool HasCandidateOwner = false;
+    bool HasNonCandidateOwner = false;
+    for (Function *Owner : Owners) {
+      if (CandidateSet.count(Owner))
+        HasCandidateOwner = true;
+      else
+        HasNonCandidateOwner = true;
+    }
+    if (!HasCandidateOwner)
+      continue;
+    if (HasNonCandidateOwner)
+      return false;
+    Globals.push_back(&GV);
+  }
+
+  for (GlobalVariable *GV : Globals)
+    createRemappedGlobalShell(*GV, Mega, A);
+
+  ValueToValueMapTy EmptyVMap;
+  for (GlobalVariable *GV : Globals) {
+    GlobalVariable *NewGV = A.GlobalRemaps.lookup(GV);
+    if (!NewGV)
+      return false;
+    Constant *Init = remapConstant(GV->getInitializer(), Mega, FunctionBBMaps,
+                                   AddrHelperForFunction, EmptyVMap,
+                                   &A.GlobalRemaps);
+    NewGV->setInitializer(Init);
+  }
+  return true;
+}
+
+static void commitModuleBlockAddressGlobals(MFLAArtifacts &A) {
+  for (auto &Entry : A.GlobalRemaps)
+    Entry.first->replaceAllUsesWith(Entry.second);
+  SmallVector<GlobalVariable *, 8> OldGlobals;
+  for (auto &Entry : A.GlobalRemaps)
+    OldGlobals.push_back(Entry.first);
+  for (GlobalVariable *GV : OldGlobals)
+    if (GV->use_empty())
+      GV->eraseFromParent();
+  A.GlobalRemaps.clear();
 }
 
 static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
                              const FunctionLayout &Layout, MFLAArtifacts &A,
                              Function *OldF = nullptr,
-                             DenseMap<BasicBlock *, BasicBlock *> *BBMap = nullptr) {
+                             DenseMap<BasicBlock *, BasicBlock *> *BBMap = nullptr,
+                             const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
   if (auto *C = dyn_cast<Constant>(V))
     if (OldF && BBMap)
-      return remapConstant(C, OldF, *A.Mega, *BBMap, VMap);
+      return remapConstant(C, OldF, *A.Mega, *BBMap, VMap,
+                           AddrHelperForOldBB, &A.GlobalRemaps);
   if (auto *Call = dyn_cast<CallInst>(V)) {
     auto It = Layout.CallResultOffsets.find(Call);
     if (It != Layout.CallResultOffsets.end())
@@ -615,11 +884,142 @@ static void storeSlot(IRBuilder<> &B, Value *V, MFLAArtifacts &A,
 }
 
 static Value *retContPtr(IRBuilder<> &B, GlobalVariable *RetCont,
-                         unsigned EntryID) {
+                         unsigned ContinuationSlotID) {
   auto *ContTy = cast<ArrayType>(RetCont->getValueType());
   Value *Zero = ConstantInt::get(Type::getInt32Ty(RetCont->getContext()), 0);
-  Value *Index = ConstantInt::get(Type::getInt32Ty(RetCont->getContext()), EntryID);
+  Value *Index = ConstantInt::get(Type::getInt32Ty(RetCont->getContext()), ContinuationSlotID);
   return B.CreateInBoundsGEP(ContTy, RetCont, {Zero, Index});
+}
+
+
+static Constant *constI64(LLVMContext &Ctx, uint64_t V) {
+  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
+}
+
+static Constant *keyForState(MFLAArtifacts &A, uint64_t State) {
+  return constI64(A.Mega->getContext(), yanso_mix64(State, A.StateKeySalt));
+}
+
+static Value *keyForState(IRBuilder<> &B, MFLAArtifacts &A, Value *State) {
+  return yanso_create_mix64_ir(State, constI64(A.Mega->getContext(), A.StateKeySalt),
+                              B.GetInsertBlock(), *A.Mega->getParent());
+}
+
+static Constant *blockDeltaPlusKey(Function &Mega, BasicBlock *Anchor,
+                                   BasicBlock *Target, Constant *Key) {
+  Type *I64 = Type::getInt64Ty(Mega.getContext());
+  auto *TargetI = ConstantExpr::getPtrToInt(BlockAddress::get(&Mega, Target), I64);
+  auto *AnchorI = ConstantExpr::getPtrToInt(BlockAddress::get(&Mega, Anchor), I64);
+  return ConstantExpr::getAdd(ConstantExpr::getSub(TargetI, AnchorI), Key);
+}
+
+static Constant *blockDeltaPlusKey(MFLAArtifacts &A, BasicBlock *Anchor,
+                                   BasicBlock *Target, uint64_t State) {
+  return blockDeltaPlusKey(*A.Mega, Anchor, Target, keyForState(A, State));
+}
+
+static Value *loadState(IRBuilder<> &B, MFLAArtifacts &A,
+                        StringRef Name = "mfla.state") {
+  return B.CreateLoad(Type::getInt64Ty(A.Mega->getContext()), A.State, Name);
+}
+
+static void storeState(IRBuilder<> &B, MFLAArtifacts &A, Value *State) {
+  B.CreateStore(State, A.State);
+}
+
+static Value *transitionState(IRBuilder<> &B, Value *CurState,
+                              uint64_t FromState, uint64_t ToState) {
+  LLVMContext &Ctx = B.getContext();
+  Value *Next = B.CreateXor(CurState, constI64(Ctx, FromState));
+  return B.CreateXor(Next, constI64(Ctx, ToState));
+}
+
+static Value *conditionalTransitionState(IRBuilder<> &B, Value *CurState,
+                                         uint64_t FromState,
+                                         uint64_t FalseState,
+                                         uint64_t TrueState, Value *Cond) {
+  LLVMContext &Ctx = B.getContext();
+  Value *Next = transitionState(B, CurState, FromState, FalseState);
+  Value *Mask = B.CreateSExt(Cond, Type::getInt64Ty(Ctx));
+  Value *Diff = B.CreateAnd(Mask, constI64(Ctx, TrueState ^ FalseState));
+  return B.CreateXor(Next, Diff);
+}
+
+static GlobalVariable *createEdgeConstant(MFLAArtifacts &A, BasicBlock *Anchor,
+                                          BasicBlock *Target, uint64_t State) {
+  Constant *Init = blockDeltaPlusKey(A, Anchor, Target, State);
+  auto *GV = new GlobalVariable(*A.Mega->getParent(), Type::getInt64Ty(A.Mega->getContext()),
+                                true, GlobalValue::PrivateLinkage, Init,
+                                "__yansollvm_mfla_edge");
+  GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  GV->setAlignment(Align(8));
+  A.EdgeConstants.push_back(GV);
+  return GV;
+}
+
+static Value *encodedTarget(IRBuilder<> &B, Function &Mega, BasicBlock *Anchor,
+                            Value *Encoded, Value *Key) {
+  Type *I64 = Type::getInt64Ty(Mega.getContext());
+  auto *AnchorI = ConstantExpr::getPtrToInt(BlockAddress::get(&Mega, Anchor), I64);
+  Value *Delta = B.CreateSub(Encoded, Key, "mfla.delta");
+  Value *Addr = B.CreateAdd(AnchorI, Delta, "mfla.addr");
+  return B.CreateIntToPtr(Addr, PointerType::get(Mega.getContext(), 0),
+                          "mfla.target");
+}
+
+static LoadInst *loadEdgeConstant(IRBuilder<> &B, MFLAArtifacts &A,
+                                  BasicBlock *Anchor, BasicBlock *Target,
+                                  uint64_t State, StringRef Name = "mfla.edge") {
+  return B.CreateLoad(Type::getInt64Ty(A.Mega->getContext()),
+                      createEdgeConstant(A, Anchor, Target, State), Name);
+}
+
+static Value *encodedTargetConst(IRBuilder<> &B, MFLAArtifacts &A,
+                                 BasicBlock *Anchor, BasicBlock *Target,
+                                 uint64_t State) {
+  Value *Enc = loadEdgeConstant(B, A, Anchor, Target, State);
+  return encodedTarget(B, *A.Mega, Anchor, Enc, keyForState(A, State));
+}
+
+
+struct MFLAStateAllocator {
+  YansoRNG RNG;
+  std::unordered_set<uint64_t> Used;
+
+  explicit MFLAStateAllocator(Module &M) : RNG(yanso_module_seed(M, PassName)) {}
+
+  uint64_t next() {
+    uint64_t State = 0;
+    do {
+      State = RNG.next64();
+    } while (!State || Used.count(State));
+    Used.insert(State);
+    return State;
+  }
+
+  uint64_t assign(BasicBlock *BB, DenseMap<BasicBlock *, uint64_t> &StateFor) {
+    auto It = StateFor.find(BB);
+    if (It != StateFor.end())
+      return It->second;
+    uint64_t State = next();
+    StateFor[BB] = State;
+    return State;
+  }
+};
+
+static BasicBlock *pickAnchor(ArrayRef<BasicBlock *> Anchors,
+                              MFLAStateAllocator &StateAlloc) {
+  if (Anchors.empty())
+    report_fatal_error("missing mfla anchor candidates");
+  return Anchors[StateAlloc.RNG.range(static_cast<uint32_t>(Anchors.size()))];
+}
+
+static uint64_t stateFor(BasicBlock *BB,
+                         DenseMap<BasicBlock *, uint64_t> &StateFor) {
+  auto It = StateFor.find(BB);
+  if (It == StateFor.end())
+    report_fatal_error("missing mfla state for basic block");
+  return It->second;
 }
 
 static bool reachesFunction(Function *From, Function *To,
@@ -638,6 +1038,7 @@ static bool reachesFunction(Function *From, Function *To,
   }
   return false;
 }
+
 
 static bool reachesFunction(Function *From, Function *To,
                             const CallGraphInfo &Graph) {
@@ -692,7 +1093,7 @@ static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
   for (unsigned I = 0, E = Candidates.size(); I != E; ++I) {
     Function *F = Candidates[I];
     FunctionLayout L;
-    L.EntryID = I;
+    L.ContinuationSlotID = I;
     L.Owner = F;
     uint64_t NextOffset = 0;
 
@@ -815,12 +1216,14 @@ static Instruction *cloneMapped(Instruction &I, IRBuilder<> &B,
                                 ValueToValueMapTy &VMap,
                                 const FunctionLayout &Layout, MFLAArtifacts &A,
                                 Function *OldF,
-                                DenseMap<BasicBlock *, BasicBlock *> &BBMap) {
+                                DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+                                const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
   Instruction *Clone = I.clone();
   RemapInstruction(Clone, VMap,
                    RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
   for (Use &U : I.operands()) {
-    Value *Mapped = mapValueForUse(U.get(), B, VMap, Layout, A, OldF, &BBMap);
+    Value *Mapped = mapValueForUse(U.get(), B, VMap, Layout, A, OldF, &BBMap,
+                                   AddrHelperForOldBB);
     if (Mapped)
       Clone->setOperand(U.getOperandNo(), Mapped);
   }
@@ -832,13 +1235,15 @@ static bool storeIncomingPhis(IRBuilder<> &B, BasicBlock *Pred,
                               BasicBlock *Succ, ValueToValueMapTy &VMap,
                               const FunctionLayout &Layout, MFLAArtifacts &A,
                               Function *OldF,
-                              DenseMap<BasicBlock *, BasicBlock *> &BBMap) {
+                              DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+                              const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
       break;
     Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap);
+    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap,
+                                   AddrHelperForOldBB);
     if (!Mapped)
       return false;
     auto It = Layout.PhiOffsets.find(Phi);
@@ -847,13 +1252,6 @@ static bool storeIncomingPhis(IRBuilder<> &B, BasicBlock *Pred,
     storeSlot(B, Mapped, A, It->second);
   }
   return true;
-}
-
-static IndirectBrInst *createStaticIndirectBr(Function &Mega, BasicBlock *From,
-                                              BasicBlock *To) {
-  auto *IB = IndirectBrInst::Create(BlockAddress::get(&Mega, To), 1, From);
-  IB->addDestination(To);
-  return IB;
 }
 
 static Value *muxInt(IRBuilder<> &B, Value *Cond, Value *TrueV, Value *FalseV) {
@@ -885,13 +1283,15 @@ static bool muxIncomingPhis(IRBuilder<> &B, const DataLayout &DL, BasicBlock *Pr
                             BasicBlock *Succ, Value *TakeEdge,
                             ValueToValueMapTy &VMap, const FunctionLayout &Layout,
                             MFLAArtifacts &A, Function *OldF,
-                            DenseMap<BasicBlock *, BasicBlock *> &BBMap) {
+                            DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+                            const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
       break;
     Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap);
+    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap,
+                                   AddrHelperForOldBB);
     if (!Mapped)
       return false;
     auto It = Layout.PhiOffsets.find(Phi);
@@ -908,34 +1308,70 @@ static bool hasPhiNodes(BasicBlock *BB) {
   return isa<PHINode>(&BB->front());
 }
 
+static void createAddressTakenHelper(Function &Mega, MFLAArtifacts &A,
+                                     BasicBlock *Helper, BasicBlock *RealTarget,
+                                     DenseMap<BasicBlock *, uint64_t> &StateFor,
+                                     MFLAStateAllocator &StateAlloc,
+                                     ArrayRef<BasicBlock *> AnchorCandidates) {
+  IRBuilder<> B(Helper);
+  uint64_t TargetState = stateFor(RealTarget, StateFor);
+  BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
+  storeState(B, A, constI64(Mega.getContext(), TargetState));
+  Value *Target = encodedTarget(
+      B, Mega, EdgeAnchor, loadEdgeConstant(B, A, EdgeAnchor, RealTarget, TargetState),
+      keyForState(A, TargetState));
+  auto *End = IndirectBrInst::Create(Target, 1, Helper);
+  End->addDestination(RealTarget);
+}
+
 static bool createThreadedTerminator(
     IRBuilder<> &B, Function &Mega, Instruction *OldTerm,
     ValueToValueMapTy &VMap, DenseMap<BasicBlock *, BasicBlock *> &BBMap,
     BasicBlock *Exit, MFLAArtifacts &A, const FunctionLayout &Layout,
     DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> &ReturnDispatches,
-    Function *OldF) {
+    DenseMap<BasicBlock *, uint64_t> &StateFor, MFLAStateAllocator &StateAlloc,
+    ArrayRef<BasicBlock *> AnchorCandidates, Function *OldF,
+    const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
   BasicBlock *Pred = OldTerm->getParent();
 
   if (auto *Ret = dyn_cast<ReturnInst>(OldTerm)) {
     if (Value *RV = Ret->getReturnValue()) {
-      Value *Mapped = mapValueForUse(RV, B, VMap, Layout, A, OldF, &BBMap);
+      Value *Mapped = mapValueForUse(RV, B, VMap, Layout, A, OldF, &BBMap,
+                                     AddrHelperForOldBB);
       if (!Mapped)
         return false;
       storeSlot(B, Mapped, A, Layout.RetOffset);
     }
-    Type *PtrTy = PointerType::get(Mega.getContext(), 0);
-    Value *ContSlot = retContPtr(B, A.RetCont, Layout.EntryID);
-    Value *Target = B.CreateLoad(PtrTy, ContSlot, "mfla.ret.cont");
-    Value *HasContinuation = B.CreateICmpNE(
-        Target, ConstantPointerNull::get(cast<PointerType>(PtrTy)));
+    Type *I64 = Type::getInt64Ty(Mega.getContext());
     BasicBlock *Cur = B.GetInsertBlock();
     BasicBlock *ReturnBB = BasicBlock::Create(
         Mega.getContext(), Cur->getName() + ".ret.cont", &Mega, Exit);
+    uint64_t ReturnState = stateFor(Cur, StateFor);
+    BasicBlock *MappedEntry = BBMap.lookup(&OldF->getEntryBlock());
+    if (!MappedEntry)
+      return false;
+    uint64_t CalleeEntryState = stateFor(MappedEntry, StateFor);
+    Value *ContXorSlot = retContPtr(B, A.RetContXor, Layout.ContinuationSlotID);
+    Value *ContXor = B.CreateLoad(I64, ContXorSlot, "mfla.ret.cont.xor");
+    Value *HasContinuation = B.CreateICmpNE(ContXor, constI64(Mega.getContext(), 0));
     B.CreateCondBr(HasContinuation, ReturnBB, Exit);
 
     IRBuilder<> ReturnB(ReturnBB);
-    ReturnB.CreateStore(ConstantPointerNull::get(cast<PointerType>(PtrTy)),
-                        retContPtr(ReturnB, A.RetCont, Layout.EntryID));
+    Value *ContEdge = ReturnB.CreateLoad(
+        I64, retContPtr(ReturnB, A.RetContEdge, Layout.ContinuationSlotID),
+        "mfla.ret.cont.edge");
+    ReturnB.CreateStore(constI64(Mega.getContext(), 0),
+                        retContPtr(ReturnB, A.RetContXor, Layout.ContinuationSlotID));
+    ReturnB.CreateStore(constI64(Mega.getContext(), 0),
+                        retContPtr(ReturnB, A.RetContEdge, Layout.ContinuationSlotID));
+    Value *ReturnCurState = loadState(ReturnB, A, "mfla.ret.cur.state");
+    Value *NextState = ReturnB.CreateXor(
+        ReturnCurState, constI64(Mega.getContext(),
+                                 CalleeEntryState ^ ReturnState));
+    NextState = ReturnB.CreateXor(NextState, ContXor, "mfla.ret.next.state");
+    storeState(ReturnB, A, NextState);
+    Value *Target = encodedTarget(ReturnB, Mega, MappedEntry, ContEdge,
+                                  keyForState(ReturnB, A, NextState));
     auto *End = IndirectBrInst::Create(Target, 0, ReturnBB);
     ReturnDispatches[Layout.Owner].push_back(End);
     return true;
@@ -944,18 +1380,34 @@ static bool createThreadedTerminator(
   auto *Br = dyn_cast<BranchInst>(OldTerm);
   if (!Br) {
     if (auto *IB = dyn_cast<IndirectBrInst>(OldTerm)) {
-      Value *Target = mapValueForUse(IB->getAddress(), B, VMap, Layout, A,
-                                     OldF, &BBMap);
-      if (!Target)
+      Value *RawTarget = mapValueForUse(IB->getAddress(), B, VMap, Layout, A,
+                                        OldF, &BBMap, AddrHelperForOldBB);
+      if (!RawTarget || !AddrHelperForOldBB)
         return false;
-      auto *End = IndirectBrInst::Create(Target, IB->getNumDestinations(),
-                                         B.GetInsertBlock());
+
+      Type *I64 = Type::getInt64Ty(Mega.getContext());
+      Value *RawI = B.CreatePtrToInt(RawTarget, I64, "mfla.ibr.target.i");
+      const DataLayout &DL = Mega.getParent()->getDataLayout();
+      SmallVector<BasicBlock *, 8> Helpers;
       for (unsigned I = 0, E = IB->getNumDestinations(); I != E; ++I) {
-        BasicBlock *NewDest = BBMap.lookup(IB->getDestination(I));
-        if (!NewDest)
+        BasicBlock *OldDest = IB->getDestination(I);
+        auto HelperIt = AddrHelperForOldBB->find(OldDest);
+        if (HelperIt == AddrHelperForOldBB->end())
           return false;
-        End->addDestination(NewDest);
+        BasicBlock *Helper = HelperIt->second;
+        if (llvm::find(Helpers, Helper) == Helpers.end())
+          Helpers.push_back(Helper);
+        Value *HelperI = ConstantExpr::getPtrToInt(BlockAddress::get(&Mega, Helper), I64);
+        Value *TakeDest = B.CreateICmpEQ(RawI, HelperI, "mfla.ibr.take");
+        if (!muxIncomingPhis(B, DL, Pred, OldDest, TakeDest, VMap, Layout, A,
+                             OldF, BBMap, AddrHelperForOldBB))
+          return false;
       }
+
+      auto *End = IndirectBrInst::Create(RawTarget, Helpers.size(),
+                                         B.GetInsertBlock());
+      for (BasicBlock *Helper : Helpers)
+        End->addDestination(Helper);
       return true;
     }
 
@@ -963,13 +1415,18 @@ static bool createThreadedTerminator(
     if (!Sw)
       return false;
     Value *Cond = mapValueForUse(Sw->getCondition(), B, VMap, Layout, A,
-                                 OldF, &BBMap);
+                                 OldF, &BBMap, AddrHelperForOldBB);
     BasicBlock *OldDefault = Sw->getDefaultDest();
     BasicBlock *NewDefault = BBMap.lookup(OldDefault);
     if (!Cond || !NewDefault)
       return false;
 
-    Value *Target = BlockAddress::get(&Mega, NewDefault);
+    BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
+    uint64_t FromState = stateFor(B.GetInsertBlock(), StateFor);
+    uint64_t DefaultState = stateFor(NewDefault, StateFor);
+    Value *CurState = loadState(B, A, "mfla.switch.cur.state");
+    Value *NextState = transitionState(B, CurState, FromState, DefaultState);
+    Value *Encoded = loadEdgeConstant(B, A, EdgeAnchor, NewDefault, DefaultState);
     SmallVector<std::pair<BasicBlock *, Value *>, 8> SuccConds;
     SuccConds.push_back({OldDefault, ConstantInt::getFalse(Mega.getContext())});
 
@@ -979,8 +1436,11 @@ static bool createThreadedTerminator(
       if (!NewSucc)
         return false;
       Value *TakeCase = B.CreateICmpEQ(Cond, Case.getCaseValue());
-      Target = muxPtr(B, Mega.getParent()->getDataLayout(), TakeCase,
-                      BlockAddress::get(&Mega, NewSucc), Target);
+      uint64_t CaseState = stateFor(NewSucc, StateFor);
+      Value *CaseNext = transitionState(B, CurState, FromState, CaseState);
+      Value *CaseEnc = loadEdgeConstant(B, A, EdgeAnchor, NewSucc, CaseState);
+      NextState = muxInt(B, TakeCase, CaseNext, NextState);
+      Encoded = muxInt(B, TakeCase, CaseEnc, Encoded);
 
       bool Found = false;
       for (auto &Entry : SuccConds) {
@@ -1024,11 +1484,14 @@ static bool createThreadedTerminator(
       if (hasPhiNodes(Entry.first)) {
         if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred,
                              Entry.first, Entry.second, VMap, Layout, A,
-                             OldF, BBMap))
+                             OldF, BBMap, AddrHelperForOldBB))
           return false;
       }
     }
 
+    storeState(B, A, NextState);
+    Value *Target = encodedTarget(B, Mega, EdgeAnchor, Encoded,
+                                  keyForState(B, A, NextState));
     auto *End = IndirectBrInst::Create(Target, Destinations.size(), B.GetInsertBlock());
     for (BasicBlock *Dest : Destinations)
       End->addDestination(Dest);
@@ -1039,14 +1502,24 @@ static bool createThreadedTerminator(
     BasicBlock *OldSucc = Br->getSuccessor(0);
     BasicBlock *NewSucc = BBMap.lookup(OldSucc);
     if (!NewSucc || !storeIncomingPhis(B, Pred, OldSucc, VMap, Layout, A,
-                                       OldF, BBMap))
+                                       OldF, BBMap, AddrHelperForOldBB))
       return false;
-    createStaticIndirectBr(Mega, B.GetInsertBlock(), NewSucc);
+    BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
+    uint64_t FromState = stateFor(B.GetInsertBlock(), StateFor);
+    uint64_t ToState = stateFor(NewSucc, StateFor);
+    Value *NextState = transitionState(B, loadState(B, A, "mfla.cur.state"),
+                                       FromState, ToState);
+    storeState(B, A, NextState);
+    Value *Target = encodedTarget(B, Mega, EdgeAnchor,
+                                  loadEdgeConstant(B, A, EdgeAnchor, NewSucc, ToState),
+                                  keyForState(B, A, NextState));
+    auto *End = IndirectBrInst::Create(Target, 1, B.GetInsertBlock());
+    End->addDestination(NewSucc);
     return true;
   }
 
   Value *Cond = mapValueForUse(Br->getCondition(), B, VMap, Layout, A,
-                               OldF, &BBMap);
+                               OldF, &BBMap, AddrHelperForOldBB);
   BasicBlock *OldTrue = Br->getSuccessor(0);
   BasicBlock *OldFalse = Br->getSuccessor(1);
   BasicBlock *TrueBB = BBMap.lookup(OldTrue);
@@ -1054,15 +1527,27 @@ static bool createThreadedTerminator(
   if (!Cond || !TrueBB || !FalseBB)
     return false;
 
-  Value *TrueAddr = BlockAddress::get(&Mega, TrueBB);
-  Value *FalseAddr = BlockAddress::get(&Mega, FalseBB);
-  Value *Target = muxPtr(B, Mega.getParent()->getDataLayout(), Cond, TrueAddr, FalseAddr);
+  BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
+  uint64_t FromState = stateFor(B.GetInsertBlock(), StateFor);
+  uint64_t TrueState = stateFor(TrueBB, StateFor);
+  uint64_t FalseState = stateFor(FalseBB, StateFor);
+  Value *CurState = loadState(B, A, "mfla.cond.cur.state");
+  Value *NextState = conditionalTransitionState(B, CurState, FromState,
+                                                FalseState, TrueState, Cond);
+  Value *TrueEnc = loadEdgeConstant(B, A, EdgeAnchor, TrueBB, TrueState);
+  Value *FalseEnc = loadEdgeConstant(B, A, EdgeAnchor, FalseBB, FalseState);
+  Value *Encoded = muxInt(B, Cond, TrueEnc, FalseEnc);
+  Value *Target = encodedTarget(B, Mega, EdgeAnchor, Encoded,
+                                keyForState(B, A, NextState));
+  storeState(B, A, NextState);
   if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldTrue,
-                       Cond, VMap, Layout, A, OldF, BBMap))
+                       Cond, VMap, Layout, A, OldF, BBMap,
+                       AddrHelperForOldBB))
     return false;
   Value *NotCond = B.CreateNot(Cond);
   if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldFalse,
-                       NotCond, VMap, Layout, A, OldF, BBMap))
+                       NotCond, VMap, Layout, A, OldF, BBMap,
+                       AddrHelperForOldBB))
     return false;
   auto *End = IndirectBrInst::Create(Target, 2, B.GetInsertBlock());
   End->addDestination(TrueBB);
@@ -1076,8 +1561,13 @@ struct LoweringContext {
   DenseMap<Function *, FunctionLayout> &Layouts;
   const DenseMap<Function *, unsigned> &CandidateIDs;
   DenseMap<Function *, BasicBlock *> &EntryBlockFor;
+  DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &AddrHelperForFunction;
+  DenseMap<BasicBlock *, uint64_t> &StateFor;
+  MFLAStateAllocator &StateAlloc;
+  BasicBlock *Anchor = nullptr;
   BasicBlock *Exit = nullptr;
   DenseMap<Function *, SmallVector<BasicBlock *, 4>> &ContinuationsByCallee;
+  ArrayRef<BasicBlock *> AnchorCandidates;
 };
 
 static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
@@ -1102,14 +1592,24 @@ static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
   BasicBlock *Cont = BasicBlock::Create(LCtx.Mega.getContext(),
                                         "mfla.call.cont", &LCtx.Mega,
                                         LCtx.Exit);
+  uint64_t ContState = LCtx.StateAlloc.assign(Cont, LCtx.StateFor);
   LCtx.ContinuationsByCallee[Callee].push_back(Cont);
-  Value *ContAddr = BlockAddress::get(&LCtx.Mega, Cont);
-  B.CreateStore(ContAddr,
-                retContPtr(B, LCtx.Artifacts.RetCont, CalleeLayout.EntryID));
-  auto *Jump = IndirectBrInst::Create(
-      BlockAddress::get(&LCtx.Mega, LCtx.EntryBlockFor[Callee]), 1,
-      B.GetInsertBlock());
-  Jump->addDestination(LCtx.EntryBlockFor[Callee]);
+  BasicBlock *CalleeEntry = LCtx.EntryBlockFor[Callee];
+  uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
+  uint64_t CalleeState = stateFor(CalleeEntry, LCtx.StateFor);
+  Value *CurState = loadState(B, LCtx.Artifacts, "mfla.call.cur.state");
+  Value *CallNextState = transitionState(B, CurState, FromState, CalleeState);
+  B.CreateStore(constI64(LCtx.Mega.getContext(), CalleeState ^ ContState),
+                retContPtr(B, LCtx.Artifacts.RetContXor, CalleeLayout.ContinuationSlotID));
+  B.CreateStore(loadEdgeConstant(B, LCtx.Artifacts, CalleeEntry, Cont, ContState),
+                retContPtr(B, LCtx.Artifacts.RetContEdge, CalleeLayout.ContinuationSlotID));
+  storeState(B, LCtx.Artifacts, CallNextState);
+  Value *CallTarget = encodedTarget(
+      B, LCtx.Mega, B.GetInsertBlock(),
+      loadEdgeConstant(B, LCtx.Artifacts, B.GetInsertBlock(), CalleeEntry, CalleeState),
+      keyForState(B, LCtx.Artifacts, CallNextState));
+  auto *Jump = IndirectBrInst::Create(CallTarget, 1, B.GetInsertBlock());
+  Jump->addDestination(CalleeEntry);
 
   B.SetInsertPoint(Cont);
   TerminatorBlockFor[&OldBB] = Cont;
@@ -1132,7 +1632,8 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   Function &Mega = *A.Mega;
   Module &M = *Mega.getParent();
   LLVMContext &Ctx = Mega.getContext();
-  Argument *EntryID = Mega.getArg(0);
+  Argument *EntryState = Mega.getArg(0);
+  Argument *EntryEdge = Mega.getArg(1);
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &Mega);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", &Mega);
   DenseMap<Function *, SmallVector<BasicBlock *, 4>> ContinuationsByCallee;
@@ -1144,6 +1645,7 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   SmallVector<BasicBlock *, 16> EntryRegions;
   DenseMap<Function *, BasicBlock *> EntryBlockFor;
   DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> FunctionBBMaps;
+  DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> AddrHelperForFunction;
 
   for (Function *F : Candidates) {
     DenseMap<BasicBlock *, BasicBlock *> &BBMap = FunctionBBMaps[F];
@@ -1160,31 +1662,62 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
     }
   }
 
+  DenseMap<BasicBlock *, uint64_t> StateFor;
+  SmallVector<BasicBlock *, 32> AnchorCandidates;
+  MFLAStateAllocator StateAlloc(M);
+  for (auto &FnEntry : FunctionBBMaps)
+    for (auto &BBEntry : FnEntry.second) {
+      StateAlloc.assign(BBEntry.second, StateFor);
+      AnchorCandidates.push_back(BBEntry.second);
+    }
+
+  for (Function *F : Candidates) {
+    DenseMap<BasicBlock *, BasicBlock *> &Helpers = AddrHelperForFunction[F];
+    for (BasicBlock *OldBB : collectAddressTakenBlocks(*F)) {
+      BasicBlock *RealTarget = FunctionBBMaps[F].lookup(OldBB);
+      if (!RealTarget)
+        return false;
+      std::string Name = (RealTarget->getName() + ".addr.helper").str();
+      BasicBlock *Helper = BasicBlock::Create(Ctx, Name, &Mega, Exit);
+      Helpers[OldBB] = Helper;
+      AnchorCandidates.push_back(Helper);
+    }
+  }
+  if (!prepareModuleBlockAddressGlobals(M, Mega, Candidates, FunctionBBMaps,
+                                        AddrHelperForFunction, A))
+    return false;
+
+  for (auto &FnEntry : AddrHelperForFunction)
+    for (auto &HelperEntry : FnEntry.second)
+      createAddressTakenHelper(Mega, A, HelperEntry.second,
+                               FunctionBBMaps[FnEntry.first][HelperEntry.first],
+                               StateFor, StateAlloc, AnchorCandidates);
+
+  BasicBlock *Anchor = pickAnchor(AnchorCandidates, StateAlloc);
   IRBuilder<> EntryB(Entry);
-  Type *PtrTy = PointerType::get(Ctx, 0);
-  auto *TableTy = ArrayType::get(PtrTy, EntryRegions.size());
-  std::vector<Constant *> Addrs;
-  for (BasicBlock *R : EntryRegions)
-    Addrs.push_back(BlockAddress::get(&Mega, R));
-  A.TargetTable = new GlobalVariable(
-      M, TableTy, true, GlobalValue::InternalLinkage,
-      ConstantArray::get(TableTy, Addrs), "__yansollvm_mfla_targets");
-  A.TargetTable->setAlignment(Align(8));
-  Value *Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
-  Value *Index = EntryB.CreateZExtOrTrunc(EntryID, Type::getInt32Ty(Ctx));
-  Value *GEP = EntryB.CreateInBoundsGEP(TableTy, A.TargetTable, {Zero, Index});
-  Value *Target = EntryB.CreateLoad(PtrTy, GEP);
+  storeState(EntryB, A, EntryState);
+  Value *Target = encodedTarget(EntryB, Mega, Anchor, EntryEdge,
+                                keyForState(EntryB, A, EntryState));
   auto *IB = IndirectBrInst::Create(Target, EntryRegions.size(), Entry);
   for (BasicBlock *R : EntryRegions)
     IB->addDestination(R);
 
-  LoweringContext LCtx{Mega, A, Layouts, CandidateIDs, EntryBlockFor, Exit,
-                       ContinuationsByCallee};
+  for (Function *F : Candidates) {
+    BasicBlock *EntryBlock = EntryBlockFor[F];
+    uint64_t EntryStateValue = stateFor(EntryBlock, StateFor);
+    A.EntryStateForFunction[F] = EntryStateValue;
+    A.EntryEdgeForFunction[F] =
+        createEdgeConstant(A, Anchor, EntryBlock, EntryStateValue);
+  }
+
+  LoweringContext LCtx{Mega, A, Layouts, CandidateIDs, EntryBlockFor,
+                       AddrHelperForFunction, StateFor, StateAlloc, Anchor, Exit,
+                       ContinuationsByCallee, AnchorCandidates};
 
   for (Function *F : Candidates) {
     ValueToValueMapTy VMap;
     DenseMap<BasicBlock *, BasicBlock *> &BBMap = FunctionBBMaps[F];
-    remapLocalBlockAddressGlobals(F, Mega, BBMap, VMap, A);
+    DenseMap<BasicBlock *, BasicBlock *> &AddrHelpers = AddrHelperForFunction[F];
     DenseMap<BasicBlock *, BasicBlock *> TerminatorBlockFor;
     const FunctionLayout &L = Layouts[F];
 
@@ -1213,7 +1746,8 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
             continue;
           }
         }
-        Instruction *Clone = cloneMapped(I, B, VMap, L, A, F, BBMap);
+        Instruction *Clone = cloneMapped(I, B, VMap, L, A, F, BBMap,
+                                         &AddrHelpers);
         B.Insert(Clone);
         if (!I.getType()->isVoidTy()) {
           auto It = L.SpilledValueOffsets.find(&I);
@@ -1232,7 +1766,9 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
         continue;
       IRBuilder<> B(NewBB);
       if (!createThreadedTerminator(B, Mega, BB.getTerminator(), VMap, BBMap,
-                                    Exit, A, L, ReturnDispatches, F))
+                                    Exit, A, L, ReturnDispatches, StateFor,
+                                    StateAlloc, AnchorCandidates, F,
+                                    &AddrHelpers))
         return false;
     }
   }
@@ -1270,7 +1806,8 @@ static void sanitizeWrapperAttributes(Function &F) {
 }
 
 static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
-                             const FunctionLayout &L) {
+                             const FunctionLayout &L, uint64_t EntryState,
+                             GlobalVariable *EntryEdge) {
   LLVMContext &Ctx = F.getContext();
   sanitizeWrapperAttributes(F);
   SmallVector<Argument *, 8> Args;
@@ -1285,10 +1822,13 @@ static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
   IRBuilder<> B(Entry);
   for (unsigned I = 0, E = Args.size(); I != E; ++I)
     storeSlot(B, Args[I], A, L.ArgOffsets[I]);
-  B.CreateStore(
-      ConstantPointerNull::get(PointerType::get(Ctx, 0)),
-      retContPtr(B, A.RetCont, L.EntryID));
-  B.CreateCall(A.Mega, {ConstantInt::get(Type::getInt32Ty(Ctx), L.EntryID)});
+  B.CreateStore(ConstantInt::get(Type::getInt64Ty(Ctx), 0),
+                retContPtr(B, A.RetContXor, L.ContinuationSlotID));
+  B.CreateStore(ConstantInt::get(Type::getInt64Ty(Ctx), 0),
+                retContPtr(B, A.RetContEdge, L.ContinuationSlotID));
+  Value *EntryEdgeValue =
+      B.CreateLoad(Type::getInt64Ty(Ctx), EntryEdge, "mfla.entry.edge");
+  B.CreateCall(A.Mega, {constI64(Ctx, EntryState), EntryEdgeValue});
   if (F.getReturnType()->isVoidTy())
     B.CreateRetVoid();
   else
@@ -1307,40 +1847,77 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     InitialCandidates.push_back(&F);
   }
 
-  CallGraphInfo InitialGraph = buildCandidateCallGraph(InitialCandidates);
-  SmallVector<SCCInfo, 8> InitialSCCs =
-      findCandidateSCCs(InitialCandidates, InitialGraph);
-  DenseSet<Function *> Recursive = recursiveMembers(InitialSCCs);
-  for (Function *F : InitialCandidates) {
-    if (Recursive.count(F))
-      YANSO_WARN_FUNCTION(PassName, *F, "recursive SCC not supported");
-  }
-  std::vector<Function *> NonRecursiveCandidates;
-  DenseMap<Function *, unsigned> NonRecursiveIDs;
-  for (Function *F : InitialCandidates) {
-    if (Recursive.count(F))
-      continue;
-    NonRecursiveIDs[F] = NonRecursiveCandidates.size();
-    NonRecursiveCandidates.push_back(F);
-  }
+  DenseSet<Function *> CandidateSet;
+  for (Function *F : InitialCandidates)
+    CandidateSet.insert(F);
 
+  CallGraphInfo FullGraph = buildCandidateCallGraph(InitialCandidates);
   std::vector<Function *> Candidates;
   DenseMap<Function *, unsigned> CandidateIDs;
-  for (Function *F : NonRecursiveCandidates) {
-    if (!supportsCurrentLowering(*F, NonRecursiveIDs))
+  CallGraphInfo InitialGraph;
+  CallGraphInfo CandidateGraph;
+  FramePlan Plan;
+
+  while (true) {
+    std::vector<Function *> CandidateList;
+    for (Function *F : InitialCandidates)
+      if (CandidateSet.count(F))
+        CandidateList.push_back(F);
+
+    InitialGraph = buildCandidateCallGraph(CandidateList);
+    SmallVector<SCCInfo, 8> InitialSCCs =
+        findCandidateSCCs(CandidateList, InitialGraph);
+    DenseSet<Function *> Recursive = recursiveMembers(InitialSCCs);
+    bool Changed = false;
+    for (Function *F : CandidateList) {
+      if (!Recursive.count(F))
+        continue;
+      YANSO_WARN_FUNCTION(PassName, *F, "recursive SCC not supported");
+      CandidateSet.erase(F);
+      Changed = true;
+    }
+    if (Changed)
       continue;
-    CandidateIDs[F] = Candidates.size();
-    Candidates.push_back(F);
+
+    std::vector<Function *> NonRecursiveCandidates;
+    DenseMap<Function *, unsigned> NonRecursiveIDs;
+    for (Function *F : CandidateList) {
+      NonRecursiveIDs[F] = NonRecursiveCandidates.size();
+      NonRecursiveCandidates.push_back(F);
+    }
+
+    for (Function *F : NonRecursiveCandidates) {
+      if (supportsCurrentLowering(*F, NonRecursiveIDs))
+        continue;
+      CandidateSet.erase(F);
+      Changed = true;
+    }
+    if (Changed)
+      continue;
+
+    if (pruneCandidatesForBlockAddressGlobals(M, CandidateSet))
+      continue;
+
+    Candidates.clear();
+    CandidateIDs.clear();
+    for (Function *F : InitialCandidates) {
+      if (!CandidateSet.count(F))
+        continue;
+      CandidateIDs[F] = Candidates.size();
+      Candidates.push_back(F);
+    }
+
+    if (Candidates.size() < 2) {
+      YANSO_WARN_MODULE(PassName, M, "fewer than two eligible functions");
+      return PreservedAnalyses::all();
+    }
+
+    CandidateGraph = buildCandidateCallGraph(Candidates);
+    Plan = makeFramePlan(Candidates, CandidateIDs, CandidateGraph, FullGraph,
+                         M.getDataLayout());
+    break;
   }
 
-  if (Candidates.size() < 2) {
-    YANSO_WARN_MODULE(PassName, M, "fewer than two eligible functions");
-    return PreservedAnalyses::all();
-  }
-
-  CallGraphInfo CandidateGraph = buildCandidateCallGraph(Candidates);
-  FramePlan Plan = makeFramePlan(Candidates, CandidateIDs, CandidateGraph,
-                                 InitialGraph, M.getDataLayout());
   MFLAArtifacts Artifacts = createArtifacts(M, Plan.FrameSize, Candidates.size());
   if (!buildStructuralMega(Artifacts, Candidates, Plan.Layouts, CandidateIDs)) {
     Artifacts.eraseFromParent();
@@ -1348,8 +1925,12 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
   }
   markNoUnwindIfNoThrowingCalls(*Artifacts.Mega);
 
+  commitModuleBlockAddressGlobals(Artifacts);
+
   for (Function *F : Candidates)
-    rewriteAsWrapper(*F, Artifacts, Plan.Layouts[F]);
+    rewriteAsWrapper(*F, Artifacts, Plan.Layouts[F],
+                     Artifacts.EntryStateForFunction[F],
+                     Artifacts.EntryEdgeForFunction.lookup(F));
 
   return PreservedAnalyses::none();
 }

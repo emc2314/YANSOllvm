@@ -5,7 +5,8 @@
 // RUN: %not grep 'switch i32' %t.mfla.ll
 // RUN: grep '@__yansollvm_mfla_frame = internal global' %t.mfla.ll
 // RUN: %not grep '@__yansollvm_mfla_frame = internal global \[4096 x i8\]' %t.mfla.ll
-// RUN: grep '@__yansollvm_mfla_ret_cont = internal global' %t.mfla.ll
+// RUN: grep '@__yansollvm_mfla_ret_cont_xor = internal global' %t.mfla.ll
+// RUN: grep '@__yansollvm_mfla_ret_cont_edge = internal global' %t.mfla.ll
 // RUN: %not grep '__yansollvm_mfla_ret_sp' %t.mfla.ll
 // RUN: %not grep '__yansollvm_mfla_ret_stack' %t.mfla.ll
 // RUN: %not grep 'select i1 .*blockaddress' %t.mfla.ll

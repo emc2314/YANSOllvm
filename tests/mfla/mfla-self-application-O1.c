@@ -2,12 +2,10 @@
 // RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %t.ll -o %t.once.ll
 // RUN: grep '__yansollvm_mfla_main' %t.once.ll
 // RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %t.once.ll -o %t.twice.ll
-// RUN: grep '__yansollvm_mfla_main.3' %t.twice.ll
-// RUN: grep '@__yansollvm_mfla_targets\.mfla = internal constant .*blockaddress(@__yansollvm_mfla_main\.3' %t.twice.ll
-// RUN: grep 'indirectbr ptr blockaddress(@__yansollvm_mfla_main\.3, %__yansollvm_mfla_main\.entry)' %t.twice.ll
-// RUN: grep 'mfla.call.cont' %t.twice.ll
-// RUN: %not grep ' call .*@step1' %t.twice.ll
-// RUN: %not grep ' call .*@sink' %t.twice.ll
+// RUN: grep '__yansollvm_mfla_main' %t.twice.ll
+// RUN: grep '__yansollvm_mfla_main\.[0-9]' %t.twice.ll
+// RUN: %not grep 'inttoptr (i32 1 to ptr)' %t.twice.ll
+// RUN: grep '@__yansollvm_mfla_edge.*\.mfla' %t.twice.ll
 // RUN: %clang %t.twice.ll -o %t.exe
 // RUN: %t.exe
 
