@@ -45,6 +45,7 @@ add_llvm_pass_plugin(yansollvm
 add_executable(ymba-catalog-selftest
   tests/ymba_catalog_selftest.cpp
   lib/Transforms/Obfuscate/YMBA.cpp
+  lib/Transforms/Obfuscate/CryptoUtils.cpp
 )
 target_include_directories(ymba-catalog-selftest PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/Obfuscate

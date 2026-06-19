@@ -21,20 +21,22 @@ public:
     Value *R = nullptr;
   };
 
-  static bool hasRewrite(unsigned LLVMOpcode, unsigned BitWidth);
+  static bool isSupportedBinaryOpcode(unsigned LLVMOpcode);
+  static Value *emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
+                           Value *X, Value *Y, unsigned Variant,
+                           uint64_t Seed);
+
+  // Catalog-only hooks kept for the standalone self-test/debugging. Normal VM
+  // emission should use emitBinary(), which owns catalog-vs-default fallback.
   static unsigned rewriteCount(unsigned LLVMOpcode, unsigned BitWidth);
   static Value *emitRewrite(IRBuilder<> &B, unsigned LLVMOpcode,
                             IntegerType *Ty, Value *X, Value *Y, unsigned Index,
                             uint64_t Seed);
 
-  static bool hasIntrinsicRewrite(Intrinsic::ID ID, unsigned BitWidth);
-  static unsigned intrinsicRewriteCount(Intrinsic::ID ID, unsigned BitWidth);
-  static Value *emitIntrinsicRewrite(IRBuilder<> &B, Intrinsic::ID ID,
-                                     IntegerType *Ty, ArrayRef<Value *> Args,
-                                     unsigned Index, uint64_t Seed);
+  static Value *emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
+                              ArrayRef<Value *> Args, unsigned Variant,
+                              uint64_t Seed);
 
-  static bool hasRelation(unsigned BitWidth);
-  static unsigned relationCount(unsigned BitWidth);
   static Relation emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
                                Value *Y, unsigned Index, uint64_t Seed);
 

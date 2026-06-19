@@ -1,4 +1,5 @@
 #include "YMBA.h"
+#include "CryptoUtils.h"
 
 #include "GeneratedYMBACatalog.inc"
 
@@ -7,14 +8,17 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
-
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <optional>
 
 using namespace llvm;
 
 namespace {
+// Fixed for now: not a runtime pass option, so the self-test can link YMBA
+// without pulling command-line option RTTI into the standalone binary.
+static constexpr double YMBACostTemperature = 16.0;
 
 // Postfix bytecode opcodes. Same-width integer stack only.
 enum : uint8_t {
@@ -180,15 +184,253 @@ static ConstantInt *loConst(IntegerType *Ty, uint64_t V) {
   return ConstantInt::get(Ty, V & Mask);
 }
 
+static Value *notV(IRBuilder<> &B, Value *V) { return B.CreateNot(V); }
+
+static Value *emitXorExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                          unsigned Variant) {
+  switch (Variant % 4) {
+  case 0:
+    return B.CreateXor(X, Y);
+  case 1:
+    return B.CreateSub(B.CreateOr(X, Y), B.CreateAnd(X, Y));
+  case 2: {
+    Value *A = B.CreateAdd(X, Y);
+    Value *C = B.CreateShl(B.CreateAnd(X, Y), loConst(Ty, 1));
+    return B.CreateSub(A, C);
+  }
+  default: {
+    Value *A = B.CreateAnd(X, notV(B, Y));
+    Value *C = B.CreateAnd(notV(B, X), Y);
+    return B.CreateOr(A, C);
+  }
+  }
+}
+
+static Value *emitAndExpr(IRBuilder<> &B, IntegerType *, Value *X, Value *Y,
+                          unsigned Variant) {
+  switch (Variant % 2) {
+  case 0:
+    return B.CreateAnd(X, Y);
+  default:
+    return notV(B, B.CreateOr(notV(B, X), notV(B, Y)));
+  }
+}
+
+static Value *emitOrExpr(IRBuilder<> &B, IntegerType *, Value *X, Value *Y,
+                         unsigned Variant) {
+  switch (Variant % 4) {
+  case 0:
+    return B.CreateOr(X, Y);
+  case 1:
+    return notV(B, B.CreateAnd(notV(B, X), notV(B, Y)));
+  case 2:
+    return B.CreateAdd(B.CreateXor(X, Y), B.CreateAnd(X, Y));
+  default:
+    return B.CreateSub(B.CreateAdd(X, Y), B.CreateAnd(X, Y));
+  }
+}
+
+static Value *emitAddExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                          unsigned Variant) {
+  switch (Variant % 4) {
+  case 0:
+    return B.CreateAdd(X, Y);
+  case 1:
+    return B.CreateAdd(B.CreateXor(X, Y),
+                       B.CreateShl(B.CreateAnd(X, Y), loConst(Ty, 1)));
+  case 2:
+    return B.CreateSub(X, B.CreateSub(loConst(Ty, 0), Y));
+  default: {
+    Value *R = B.CreateAdd(X, Y);
+    Value *Noise = B.CreateMul(B.CreateXor(X, Y), loConst(Ty, 3));
+    return B.CreateSub(B.CreateAdd(R, Noise), Noise);
+  }
+  }
+}
+
+static Value *emitSubExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
+                          unsigned Variant) {
+  switch (Variant % 3) {
+  case 0:
+    return B.CreateSub(X, Y);
+  case 1: {
+    Value *R = B.CreateAdd(X, notV(B, Y));
+    return B.CreateAdd(R, loConst(Ty, 1));
+  }
+  default: {
+    Value *R = B.CreateAdd(X, notV(B, Y));
+    R = B.CreateAdd(R, loConst(Ty, 1));
+    Value *Noise = B.CreateMul(emitOrExpr(B, Ty, X, Y, 0), loConst(Ty, 3));
+    return B.CreateSub(B.CreateAdd(R, Noise), Noise);
+  }
+  }
+}
+
+static Value *decorateIntegerResult(IRBuilder<> &B, IntegerType *Ty, Value *V,
+                                    unsigned Variant, uint64_t Seed,
+                                    StringRef NamePrefix) {
+  switch (Variant % 4) {
+  case 0:
+    return V;
+  case 1: {
+    Value *K = loConst(Ty, yanso_mix64(Seed, 0x6a09e667f3bcc909ULL));
+    return B.CreateXor(B.CreateXor(V, K, Twine(NamePrefix) + ".xor0"), K,
+                       Twine(NamePrefix) + ".xor1");
+  }
+  case 2: {
+    Value *N = B.CreateOr(
+        B.CreateAnd(V, loConst(Ty, yanso_mix64(Seed, 0xbb67ae8584caa73bULL))),
+        loConst(Ty, 1), Twine(NamePrefix) + ".noise");
+    return B.CreateSub(B.CreateAdd(V, N, Twine(NamePrefix) + ".add"), N,
+                       Twine(NamePrefix) + ".sub");
+  }
+  default: {
+    Value *K = loConst(Ty, yanso_mix64(Seed, 0x3c6ef372fe94f82bULL));
+    Value *M = B.CreateOr(V, K, Twine(NamePrefix) + ".mix");
+    return B.CreateXor(B.CreateXor(V, M, Twine(NamePrefix) + ".mixxor0"), M,
+                       Twine(NamePrefix) + ".mixxor1");
+  }
+  }
+}
+
+static Value *emitShiftExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
+                            Value *X, Value *Y, unsigned Variant) {
+  unsigned BW = Ty->getBitWidth();
+  switch (Variant % 3) {
+  case 0:
+    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X, Y);
+  case 1: {
+    Value *Noise = B.CreateMul(B.CreateXor(X, Y), loConst(Ty, 3));
+    Value *UseAmt = B.CreateSub(B.CreateAdd(Y, Noise), Noise);
+    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X,
+                         UseAmt);
+  }
+  default: {
+    Value *Salt = loConst(Ty, (BW * 13u) | 1u);
+    Value *Noise = B.CreateOr(B.CreateAnd(X, Y), Salt);
+    Value *UseAmt = B.CreateSub(B.CreateAdd(Y, Noise), Noise);
+    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X,
+                         UseAmt);
+  }
+  }
+}
+
+static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
+                             Value *X, Value *Y, unsigned Variant,
+                             uint64_t Seed) {
+  Value *UseX = X;
+  Value *UseY = Y;
+  switch (Variant % 4) {
+  case 0:
+    break;
+  case 1: {
+    Value *K = loConst(Ty, yanso_mix64(Seed, 0x510e527fade682d1ULL));
+    UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.xor0"), K,
+                       "vm.div.x.xor1");
+    break;
+  }
+  case 2: {
+    Value *N = B.CreateOr(
+        B.CreateAnd(X, loConst(Ty, yanso_mix64(Seed, 0x9b05688c2b3e6c1fULL))),
+        loConst(Ty, 1), "vm.div.y.noise");
+    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.add"), N,
+                       "vm.div.y.sub");
+    break;
+  }
+  default: {
+    Value *K = loConst(Ty, yanso_mix64(Seed, 0x1f83d9abfb41bd6bULL));
+    Value *N = B.CreateOr(B.CreateXor(X, K, "vm.div.xy.mix"), loConst(Ty, 1));
+    UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.mixxor0"), K,
+                       "vm.div.x.mixxor1");
+    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.mixadd"), N,
+                       "vm.div.y.mixsub");
+    break;
+  }
+  }
+  Value *R = B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), UseX,
+                           UseY, "vm.divrem.core");
+  return decorateIntegerResult(B, Ty, R, Variant + 1, Seed, "vm.divrem.out");
+}
+
+static void collectBuiltinBinaryCosts(unsigned Opcode,
+                                      SmallVectorImpl<unsigned> &Costs) {
+  switch (Opcode) {
+  case BinaryOperator::Add:
+    Costs.append({1, 4, 2, 5});
+    break;
+  case BinaryOperator::Sub:
+    Costs.append({1, 3, 6});
+    break;
+  case BinaryOperator::And:
+    Costs.append({1, 4});
+    break;
+  case BinaryOperator::Or:
+    Costs.append({1, 4, 3, 3});
+    break;
+  case BinaryOperator::Xor:
+    Costs.append({1, 3, 4, 4});
+    break;
+  case BinaryOperator::Mul:
+    Costs.append({1, 5, 5});
+    break;
+  case BinaryOperator::Shl:
+  case BinaryOperator::LShr:
+  case BinaryOperator::AShr:
+    Costs.append({1, 4, 4});
+    break;
+  case BinaryOperator::UDiv:
+  case BinaryOperator::SDiv:
+  case BinaryOperator::URem:
+  case BinaryOperator::SRem:
+    Costs.append({1, 3, 5, 7});
+    break;
+  default:
+    Costs.push_back(1);
+    break;
+  }
+}
+
+static Value *emitBuiltinBinary(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
+                                Value *X, Value *Y, unsigned Variant,
+                                uint64_t Seed) {
+  switch (Opcode) {
+  case BinaryOperator::Add:
+    return emitAddExpr(B, Ty, X, Y, Variant);
+  case BinaryOperator::Sub:
+    return emitSubExpr(B, Ty, X, Y, Variant);
+  case BinaryOperator::And:
+    return emitAndExpr(B, Ty, X, Y, Variant);
+  case BinaryOperator::Or:
+    return emitOrExpr(B, Ty, X, Y, Variant);
+  case BinaryOperator::Xor:
+    return emitXorExpr(B, Ty, X, Y, Variant);
+  case BinaryOperator::Mul:
+    if (Variant == 0)
+      return B.CreateMul(X, Y);
+    else {
+      Value *Base = B.CreateMul(X, Y);
+      Value *Noise = B.CreateMul(emitXorExpr(B, Ty, X, Y, Variant),
+                                 loConst(Ty, (Seed % 7) | 1));
+      return B.CreateSub(B.CreateAdd(Base, Noise), Noise);
+    }
+  case BinaryOperator::Shl:
+  case BinaryOperator::LShr:
+  case BinaryOperator::AShr:
+    return emitShiftExpr(B, Opcode, Ty, X, Y, Variant);
+  case BinaryOperator::UDiv:
+  case BinaryOperator::SDiv:
+  case BinaryOperator::URem:
+  case BinaryOperator::SRem:
+    return emitDivRemExpr(B, Opcode, Ty, X, Y, Variant, Seed);
+  default:
+    return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X, Y);
+  }
+}
+
 static FunctionCallee getIntrinsic(IRBuilder<> &B, Intrinsic::ID ID,
                                    IntegerType *Ty) {
   return Intrinsic::getOrInsertDeclaration(B.GetInsertBlock()->getModule(), ID,
                                            Ty);
-}
-
-static Value *emitBinaryIntrinsic(IRBuilder<> &B, Intrinsic::ID ID,
-                                  IntegerType *Ty, Value *L, Value *R) {
-  return B.CreateCall(getIntrinsic(B, ID, Ty), {L, R});
 }
 
 static Value *emitFunnelIntrinsic(IRBuilder<> &B, Intrinsic::ID ID,
@@ -214,6 +456,82 @@ static bool popValue(VecT &Stack, typename VecT::value_type &Out) {
   Out = Stack.back();
   Stack.pop_back();
   return true;
+}
+
+static Value *emitRotateRight(IRBuilder<> &B, IntegerType *Ty, Value *X,
+                              unsigned Amount) {
+  unsigned BW = Ty->getBitWidth();
+  Amount %= BW;
+  if (Amount == 0)
+    return X;
+  Value *Lo = B.CreateLShr(X, loConst(Ty, Amount));
+  Value *Hi = B.CreateShl(X, loConst(Ty, BW - Amount));
+  return B.CreateOr(Lo, Hi, "vm.rel.rot");
+}
+
+static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
+                                          Value *X, Value *Y, unsigned Variant,
+                                          uint64_t Seed) {
+  switch (Variant % 3) {
+  case 0: {
+    Value *A = (Variant & 8)
+                   ? emitRotateRight(B, Ty, X,
+                                     1 + ((Seed >> 21) % (Ty->getBitWidth() - 1)))
+                   : X;
+    Value *C = (Variant & 16)
+                   ? emitRotateRight(B, Ty, Y,
+                                     1 + ((Seed >> 29) % (Ty->getBitWidth() - 1)))
+                   : Y;
+    Value *PA = B.CreateUnaryIntrinsic(Intrinsic::ctpop, A);
+    Value *PC = B.CreateUnaryIntrinsic(Intrinsic::ctpop, C);
+    Value *PXor = B.CreateUnaryIntrinsic(
+        Intrinsic::ctpop, B.CreateXor(A, C, "vm.rel.popcarry.xor"));
+    Value *PAnd = B.CreateUnaryIntrinsic(
+        Intrinsic::ctpop, B.CreateAnd(A, C, "vm.rel.popcarry.and"));
+    Value *L = B.CreateAdd(PA, PC, "vm.rel.lhs");
+    Value *R = B.CreateAdd(PXor, B.CreateShl(PAnd, loConst(Ty, 1)),
+                           "vm.rel.rhs");
+    return {L, R};
+  }
+  case 1: {
+    Value *Mask = loConst(Ty, yanso_mix64(Seed, 0x8c3d37c819544da2ULL));
+    Value *A = (Variant & 8)
+                   ? emitRotateRight(B, Ty, X,
+                                     1 + ((Seed >> 17) % (Ty->getBitWidth() - 1)))
+                   : X;
+    Value *L = A;
+    Value *R = B.CreateOr(B.CreateAnd(A, Mask, "vm.rel.maskpart.lo"),
+                          B.CreateAnd(A, B.CreateNot(Mask),
+                                      "vm.rel.maskpart.hi"),
+                          "vm.rel.maskpart.rhs");
+    return {L, R};
+  }
+  default: {
+    uint64_t AConst = yanso_mix64(Seed, 0xd1b54a32d192ed03ULL) | 1ULL;
+    uint64_t CConst = yanso_mix64(Seed, 0x94d049bb133111ebULL);
+    Value *A = loConst(Ty, AConst);
+    Value *AInv = ConstantInt::get(
+        Ty, yanso_mod_inverse(APInt(Ty->getBitWidth(), AConst, false, true)));
+    Value *C = loConst(Ty, CConst);
+    Value *Base = (Variant & 8) ? X : B.CreateXor(X, Y, "vm.rel.aff.base");
+    Value *Enc = B.CreateAdd(B.CreateMul(Base, A, "vm.rel.aff.mul"), C,
+                             "vm.rel.aff.enc");
+    Value *Dec = B.CreateMul(B.CreateSub(Enc, C, "vm.rel.aff.sub"), AInv,
+                             "vm.rel.aff.dec");
+    return {Base, Dec};
+  }
+  }
+}
+
+static unsigned builtinRelationCost(unsigned Variant) {
+  switch (Variant % 3) {
+  case 0:
+    return 6;
+  case 1:
+    return (Variant & 8) ? 5 : 3;
+  default:
+    return 5;
+  }
 }
 
 class Catalog {
@@ -263,37 +581,37 @@ public:
     return Bucket[Index % Bucket.size()];
   }
 
-  unsigned relationCount(unsigned BitWidth) const {
+  void collectRewrites(uint16_t Opcode, unsigned BitWidth,
+                       SmallVectorImpl<const RewriteRecord *> &Bucket) const {
     if (!Valid)
-      return 0;
+      return;
     uint16_t WM = widthMaskFor(BitWidth);
     if (!WM)
-      return 0;
-    return std::count_if(
-        Relations.begin(), Relations.end(), [&](const auto &R) {
-          return (R.WidthMask & WM) && R.LExpr < Exprs.size() &&
-                 R.RExpr < Exprs.size() && (Exprs[R.LExpr].WidthMask & WM) &&
-                 (Exprs[R.RExpr].WidthMask & WM);
-        });
+      return;
+    for (const RewriteRecord &R : Rewrites)
+      if (R.Opcode == Opcode && (R.WidthMask & WM) && R.Expr < Exprs.size() &&
+          (Exprs[R.Expr].WidthMask & WM))
+        Bucket.push_back(&R);
   }
 
-  const RelationRecord *selectRelation(unsigned BitWidth,
-                                       unsigned Index) const {
+  unsigned exprCost(uint32_t ExprIndex) const {
+    if (!Valid || ExprIndex >= Exprs.size())
+      return 0;
+    return Exprs[ExprIndex].Cost;
+  }
+
+  void collectRelations(unsigned BitWidth,
+                        SmallVectorImpl<const RelationRecord *> &Bucket) const {
     if (!Valid)
-      return nullptr;
+      return;
     uint16_t WM = widthMaskFor(BitWidth);
     if (!WM)
-      return nullptr;
-    SmallVector<const RelationRecord *, 32> Bucket;
-    for (const RelationRecord &R : Relations) {
+      return;
+    for (const RelationRecord &R : Relations)
       if ((R.WidthMask & WM) && R.LExpr < Exprs.size() &&
           R.RExpr < Exprs.size() && (Exprs[R.LExpr].WidthMask & WM) &&
           (Exprs[R.RExpr].WidthMask & WM))
         Bucket.push_back(&R);
-    }
-    if (Bucket.empty())
-      return nullptr;
-    return Bucket[Index % Bucket.size()];
   }
 
   Value *emitExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
@@ -597,8 +915,96 @@ static const Catalog &catalog() {
 
 } // namespace
 
-bool YMBA::hasRewrite(unsigned LLVMOpcode, unsigned BitWidth) {
-  return rewriteCount(LLVMOpcode, BitWidth) != 0;
+static double unitDouble(uint64_t X) {
+  return static_cast<double>(X >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed) {
+  assert(!Costs.empty());
+  double T = YMBACostTemperature;
+  if (T <= 0.0) {
+    unsigned Best = 0;
+    for (unsigned I = 1, E = Costs.size(); I != E; ++I)
+      if (Costs[I] < Costs[Best])
+        Best = I;
+    return Best;
+  }
+
+  double Total = 0.0;
+  SmallVector<double, 16> Weights;
+  Weights.reserve(Costs.size());
+  for (unsigned C : Costs) {
+    double W = std::exp(-static_cast<double>(C) / T);
+    Weights.push_back(W);
+    Total += W;
+  }
+  if (!(Total > 0.0))
+    return yanso_mix64(Seed, 0xd6e8feb86659fd93ULL) % Costs.size();
+
+  double Pick = unitDouble(yanso_mix64(Seed, 0xa4093822299f31d0ULL)) * Total;
+  for (unsigned I = 0, E = Weights.size(); I != E; ++I) {
+    if (Pick < Weights[I])
+      return I;
+    Pick -= Weights[I];
+  }
+  return Weights.size() - 1;
+}
+
+static const RewriteRecord *selectWeightedRewrite(
+    ArrayRef<const RewriteRecord *> Rewrites, ArrayRef<unsigned> BuiltinCosts,
+    uint64_t Seed, unsigned &BuiltinIndex) {
+  SmallVector<unsigned, 32> Costs;
+  Costs.reserve(Rewrites.size() + BuiltinCosts.size());
+  for (const RewriteRecord *R : Rewrites)
+    Costs.push_back(std::max(1U, catalog().exprCost(R->Expr)));
+  Costs.append(BuiltinCosts.begin(), BuiltinCosts.end());
+
+  unsigned Pick = selectWeightedIndex(Costs, Seed);
+  if (Pick < Rewrites.size())
+    return Rewrites[Pick];
+  BuiltinIndex = Pick - Rewrites.size();
+  return nullptr;
+}
+
+static const RelationRecord *selectWeightedRelation(
+    ArrayRef<const RelationRecord *> Relations, ArrayRef<unsigned> BuiltinCosts,
+    uint64_t Seed, unsigned &BuiltinIndex) {
+  SmallVector<unsigned, 32> Costs;
+  Costs.reserve(Relations.size() + BuiltinCosts.size());
+  for (const RelationRecord *R : Relations) {
+    unsigned LCost = catalog().exprCost(R->LExpr);
+    unsigned RCost = catalog().exprCost(R->RExpr);
+    Costs.push_back(std::max(1U, LCost + RCost));
+  }
+  Costs.append(BuiltinCosts.begin(), BuiltinCosts.end());
+
+  unsigned Pick = selectWeightedIndex(Costs, Seed);
+  if (Pick < Relations.size())
+    return Relations[Pick];
+  BuiltinIndex = Pick - Relations.size();
+  return nullptr;
+}
+
+
+bool YMBA::isSupportedBinaryOpcode(unsigned LLVMOpcode) {
+  switch (LLVMOpcode) {
+  case BinaryOperator::Add:
+  case BinaryOperator::Sub:
+  case BinaryOperator::Mul:
+  case BinaryOperator::UDiv:
+  case BinaryOperator::SDiv:
+  case BinaryOperator::URem:
+  case BinaryOperator::SRem:
+  case BinaryOperator::Shl:
+  case BinaryOperator::LShr:
+  case BinaryOperator::AShr:
+  case BinaryOperator::And:
+  case BinaryOperator::Or:
+  case BinaryOperator::Xor:
+    return true;
+  default:
+    return false;
+  }
 }
 
 unsigned YMBA::rewriteCount(unsigned LLVMOpcode, unsigned BitWidth) {
@@ -620,15 +1026,24 @@ Value *YMBA::emitRewrite(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
   return catalog().emitExpr(B, Ty, X, Y, R->Expr);
 }
 
-bool YMBA::hasIntrinsicRewrite(Intrinsic::ID ID, unsigned BitWidth) {
-  return intrinsicRewriteCount(ID, BitWidth) != 0;
-}
+Value *YMBA::emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
+                        Value *X, Value *Y, unsigned Variant, uint64_t Seed) {
+  auto Op = toYMBAOpcode(LLVMOpcode);
+  SmallVector<const RewriteRecord *, 16> Rewrites;
+  if (Op)
+    catalog().collectRewrites(*Op, Ty->getBitWidth(), Rewrites);
+  SmallVector<unsigned, 8> BuiltinCosts;
+  collectBuiltinBinaryCosts(LLVMOpcode, BuiltinCosts);
 
-unsigned YMBA::intrinsicRewriteCount(Intrinsic::ID ID, unsigned BitWidth) {
-  auto Op = intrinsicToYMBAOpcode(ID);
-  if (!Op)
-    return 0;
-  return catalog().rewriteCount(*Op, BitWidth);
+  unsigned BuiltinIndex = Variant;
+  if (!BuiltinCosts.empty()) {
+    if (const RewriteRecord *R =
+            selectWeightedRewrite(Rewrites, BuiltinCosts, Seed, BuiltinIndex))
+      if (Value *V = catalog().emitExpr(B, Ty, X, Y, R->Expr))
+        return V;
+  }
+
+  return emitBuiltinBinary(B, LLVMOpcode, Ty, X, Y, BuiltinIndex, Seed);
 }
 
 static bool isSupportedIntrinsicRewriteShape(Intrinsic::ID ID,
@@ -646,38 +1061,53 @@ static bool isSupportedIntrinsicRewriteShape(Intrinsic::ID ID,
   }
 }
 
-Value *YMBA::emitIntrinsicRewrite(IRBuilder<> &B, Intrinsic::ID ID,
-                                  IntegerType *Ty, ArrayRef<Value *> Args,
-                                  unsigned Index, uint64_t) {
+Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
+                           ArrayRef<Value *> Args, unsigned Variant,
+                           uint64_t Seed) {
   auto Op = intrinsicToYMBAOpcode(ID);
-  if (!Op || Args.empty() || !isSupportedIntrinsicRewriteShape(ID, Args))
-    return nullptr;
-  const RewriteRecord *R =
-      catalog().selectRewrite(*Op, Ty->getBitWidth(), Index);
-  if (!R)
-    return nullptr;
-  Value *X = Args[0];
-  Value *Y = Args.size() >= 2 ? Args[1] : ConstantInt::get(Ty, 0);
-  // fshl/fshr have three LLVM operands. YMBA models rotate amount as Y.
-  if ((ID == Intrinsic::fshl || ID == Intrinsic::fshr) && Args.size() >= 3)
-    Y = Args[2];
-  return catalog().emitExpr(B, Ty, X, Y, R->Expr);
+  SmallVector<const RewriteRecord *, 16> Rewrites;
+  if (Op && isSupportedIntrinsicRewriteShape(ID, Args))
+    catalog().collectRewrites(*Op, Ty->getBitWidth(), Rewrites);
+  unsigned BuiltinIndex = Variant;
+  if (!Rewrites.empty()) {
+    unsigned SelectedBuiltin = 0;
+    if (const RewriteRecord *R =
+            selectWeightedRewrite(Rewrites, ArrayRef<unsigned>(1U),
+                                  Seed, SelectedBuiltin)) {
+      Value *X = Args.empty() ? ConstantInt::get(Ty, 0) : Args[0];
+      Value *Y = Args.size() >= 2 ? Args[1] : ConstantInt::get(Ty, 0);
+      // fshl/fshr have three LLVM operands. YMBA models rotate amount as Y.
+      if ((ID == Intrinsic::fshl || ID == Intrinsic::fshr) && Args.size() >= 3)
+        Y = Args[2];
+      if (Value *V = catalog().emitExpr(B, Ty, X, Y, R->Expr))
+        return V;
+    }
+    BuiltinIndex = SelectedBuiltin;
+  }
+
+  FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(
+      B.GetInsertBlock()->getModule(), ID, {Ty});
+  Value *R = B.CreateCall(Intr, Args, "vm.intr.core");
+  return decorateIntegerResult(B, Ty, R, BuiltinIndex, Seed, "vm.intr.out");
 }
 
-bool YMBA::hasRelation(unsigned BitWidth) {
-  return relationCount(BitWidth) != 0;
-}
-
-unsigned YMBA::relationCount(unsigned BitWidth) {
-  return catalog().relationCount(BitWidth);
-}
 
 YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                                  Value *Y, unsigned Index, uint64_t) {
-  const RelationRecord *R = catalog().selectRelation(Ty->getBitWidth(), Index);
-  if (!R)
-    return {};
-  Value *L = catalog().emitExpr(B, Ty, X, Y, R->LExpr);
-  Value *RV = catalog().emitExpr(B, Ty, X, Y, R->RExpr);
-  return {L, RV};
+                                  Value *Y, unsigned Index, uint64_t Seed) {
+  SmallVector<const RelationRecord *, 32> Relations;
+  catalog().collectRelations(Ty->getBitWidth(), Relations);
+  SmallVector<unsigned, 8> BuiltinCosts;
+  for (unsigned I = 0; I != 3; ++I)
+    BuiltinCosts.push_back(builtinRelationCost(I));
+
+  unsigned BuiltinIndex = Index;
+  if (const RelationRecord *R =
+          selectWeightedRelation(Relations, BuiltinCosts, Seed, BuiltinIndex)) {
+    Value *L = catalog().emitExpr(B, Ty, X, Y, R->LExpr);
+    Value *RV = catalog().emitExpr(B, Ty, X, Y, R->RExpr);
+    if (L && RV)
+      return {L, RV};
+  }
+
+  return emitBuiltinRelation(B, Ty, X, Y, BuiltinIndex, Seed);
 }

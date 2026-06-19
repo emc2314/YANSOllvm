@@ -28,13 +28,6 @@ namespace llvm {
 class VMVariantEmitter {
 public:
   enum class MutationKind : uint8_t { None, BitRebuild, DataMux };
-  enum class RelationKind : uint8_t {
-    None,
-    PopcountCarry,
-    MaskedPartition,
-    AffineRoundTrip,
-    YMBA
-  };
   enum class ProjectorKind : uint8_t { LowBit, Parity, KeyedBit };
   enum class RelationApplication : uint8_t {
     DiffFold,
@@ -45,11 +38,9 @@ public:
 
   struct BinaryVariant {
     unsigned ExprVariant = 0;
-    bool UseMBARewrite = false;
-    unsigned MBARewriteVariant = 0;
     MutationKind Mutation = MutationKind::None;
     unsigned MutationVariant = 0;
-    RelationKind Relation = RelationKind::None;
+    bool ApplyRelation = false;
     ProjectorKind Projector = ProjectorKind::LowBit;
     RelationApplication RelationApp = RelationApplication::DiffFold;
     unsigned RelationVariant = 0;
@@ -69,9 +60,7 @@ public:
 
   struct ScalarVariant {
     unsigned ExprVariant = 0;
-    bool UseMBARewrite = false;
-    unsigned MBARewriteVariant = 0;
-    RelationKind Relation = RelationKind::None;
+    bool ApplyRelation = false;
     ProjectorKind Projector = ProjectorKind::LowBit;
     RelationApplication RelationApp = RelationApplication::DiffFold;
     unsigned RelationVariant = 0;
@@ -135,39 +124,12 @@ private:
   static Value *loConst(IntegerType *Ty, uint64_t V);
   static Value *notV(IRBuilder<> &B, Value *V);
 
-  static Value *emitXorExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                            unsigned Variant);
-  static Value *emitAndExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                            unsigned Variant);
-  static Value *emitOrExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                           unsigned Variant);
-  static Value *emitAddExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                            unsigned Variant);
-  static Value *emitSubExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                            unsigned Variant);
-  static Value *emitShiftExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                              Value *X, Value *Y, unsigned Variant);
-  static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                               Value *X, Value *Y, unsigned Variant,
-                               uint64_t Seed);
-  static Value *emitBinaryExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                               Value *X, Value *Y, unsigned ExprVariant,
-                               uint64_t Seed);
-  static Value *emitSelectedBinaryExpr(IRBuilder<> &B, unsigned Opcode,
-                                       IntegerType *Ty, Value *X, Value *Y,
-                                       const BinaryVariant &Variant,
-                                       uint64_t Seed);
-  static unsigned binaryExprVariantCount(unsigned Opcode);
-  static bool isSupportedBinaryOpcode(unsigned Opcode);
   static Value *decorateIntegerResult(IRBuilder<> &B, IntegerType *Ty, Value *V,
                                       unsigned Variant, uint64_t Seed,
                                       StringRef NamePrefix);
 
-  static Value *emitRotateRight(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                                unsigned Amount);
   static Relation emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                               Value *Y, RelationKind Kind, unsigned Variant,
-                               uint64_t Seed);
+                               Value *Y, unsigned Variant, uint64_t Seed);
   static Value *emitProjector(IRBuilder<> &B, IntegerType *Ty, Value *V,
                               ProjectorKind Kind, uint64_t Seed,
                               StringRef Name);
