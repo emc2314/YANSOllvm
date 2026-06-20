@@ -26,7 +26,7 @@ PreservedAnalyses IndirectGlobalVariablePass::run(Module &M,
     }
 
     if (Options && Options->skipFunction(Fn.getName())) {
-      YANSO_WARN_FUNCTION("igv", Fn, "not selected by filter");
+      YANSO_WARN_SKIP_FUNCTION("igv", Fn, "not selected by filter");
       continue;
     }
 
@@ -39,7 +39,8 @@ PreservedAnalyses IndirectGlobalVariablePass::run(Module &M,
     NumberGlobalVariable(Fn);
 
     if (GlobalVariables.empty()) {
-      YANSO_WARN_FUNCTION("igv", Fn, "no eligible global variable operands");
+      YANSO_WARN_SKIP_FUNCTION("igv", Fn,
+                               "no eligible global variable operands");
       continue;
     }
 

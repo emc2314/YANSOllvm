@@ -191,12 +191,12 @@ static const Region::Entry &entryFor(const FlattenPlan &P, EntryKey Key) {
 
 static bool shouldFlatten(Function &F) {
   if (F.isVarArg()) {
-    YANSO_WARN_FUNCTION("fla", F, "vararg function");
+    YANSO_WARN_SKIP_FUNCTION("fla", F, "vararg function");
     return false;
   }
 
   if (F.hasFnAttribute(Attribute::Cold)) {
-    YANSO_WARN_FUNCTION("fla", F, "cold function");
+    YANSO_WARN_SKIP_FUNCTION("fla", F, "cold function");
     return false;
   }
 
@@ -205,7 +205,7 @@ static bool shouldFlatten(Function &F) {
 
   Instruction *EntryTerm = F.getEntryBlock().getTerminator();
   if (EntryTerm->getNumSuccessors() == 0) {
-    YANSO_WARN_FUNCTION("fla", F, "entry terminator has no successor");
+    YANSO_WARN_SKIP_FUNCTION("fla", F, "entry terminator has no successor");
     return false;
   }
 
@@ -213,7 +213,7 @@ static bool shouldFlatten(Function &F) {
   // mutation, flattenImpl returns Changed and run() preserves no analyses.
   for (BasicBlock &BB : F) {
     if (isa<IndirectBrInst>(BB.getTerminator())) {
-      YANSO_ERROR_FUNCTION("fla", F, "contains indirectbr");
+      YANSO_ERROR_SKIP_FUNCTION("fla", F, "contains indirectbr");
       return false;
     }
   }
@@ -222,7 +222,7 @@ static bool shouldFlatten(Function &F) {
   // machine explode enough to look hung under lit/test-suite. Keep them as
   // explicit, diagnosed coverage skips until region construction is cheaper.
   if (F.size() > 32) {
-    YANSO_WARN_FUNCTION("fla", F, "function has too many basic blocks");
+    YANSO_WARN_SKIP_FUNCTION("fla", F, "function has too many basic blocks");
     return false;
   }
 
@@ -318,7 +318,7 @@ static bool collectConstraints(FlattenPlan &P) {
   for (BasicBlock *BB : P.Blocks) {
     Instruction *Term = BB->getTerminator();
     if (isa<IndirectBrInst>(Term)) {
-      YANSO_ERROR_FUNCTION("fla", P.F, "contains indirectbr");
+      YANSO_ERROR_SKIP_FUNCTION("fla", P.F, "contains indirectbr");
       return false;
     }
 
@@ -520,8 +520,8 @@ static void analyzeStateSources(FlattenPlan &P) {
 
 static bool validateFlattenPlan(const FlattenPlan &P) {
   if (!P.EntryTarget || !inDomain(P, P.EntryTarget)) {
-    YANSO_ERROR_FUNCTION("fla", P.F,
-                         "initial target is outside flatten domain");
+    YANSO_ERROR_SKIP_FUNCTION("fla", P.F,
+                              "initial target is outside flatten domain");
     return false;
   }
   return true;

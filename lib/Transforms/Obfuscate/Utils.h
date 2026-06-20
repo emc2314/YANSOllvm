@@ -30,17 +30,17 @@ extern llvm::LLVMContext *CONTEXT;
 extern bool obf_function_name_cmd;
 #define YANSO_WARN_STREAM llvm::errs()
 #define YANSO_ERROR_STREAM llvm::errs()
-#define YANSO_WARN_FUNCTION(PASS, F, REASON)                                   \
+#define YANSO_WARN_SKIP_FUNCTION(PASS, F, REASON)                              \
   do {                                                                         \
-    YANSO_WARN_STREAM                                                          \
-        << "yansollvm: warning: " << (PASS) << ": skip function '"           \
-        << (F).getName() << "': " << (REASON) << "\n";                       \
+    YANSO_WARN_STREAM << "yansollvm: warning: " << (PASS)                      \
+                      << ": skip function '" << (F).getName()                  \
+                      << "': " << (REASON) << "\n";                            \
   } while (false)
-#define YANSO_ERROR_FUNCTION(PASS, F, REASON)                                  \
+#define YANSO_ERROR_SKIP_FUNCTION(PASS, F, REASON)                             \
   do {                                                                         \
-    YANSO_ERROR_STREAM                                                         \
-        << "yansollvm: error: " << (PASS) << ": skip function '"             \
-        << (F).getName() << "': " << (REASON) << "\n";                       \
+    YANSO_ERROR_STREAM << "yansollvm: error: " << (PASS)                       \
+                       << ": skip function '" << (F).getName()                 \
+                       << "': " << (REASON) << "\n";                           \
   } while (false)
 #define YANSO_WARN_MODULE(PASS, M, REASON)                                     \
   do {                                                                         \

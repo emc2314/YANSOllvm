@@ -704,40 +704,43 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
   for (Function &F : M) {
     if (F.isDeclaration()) {
       if (!F.use_empty() && !F.isIntrinsic())
-        YANSO_WARN_FUNCTION("merge", F, "declaration has no body");
+        YANSO_WARN_SKIP_FUNCTION("merge", F, "declaration has no body");
       continue;
     }
     if (F.isVarArg()) {
-      YANSO_WARN_FUNCTION("merge", F, "vararg functions are not supported");
+      YANSO_WARN_SKIP_FUNCTION("merge", F,
+                               "vararg functions are not supported");
       continue;
     }
     if (!(F.getReturnType()->isIntOrPtrTy() || F.getReturnType()->isVoidTy())) {
-      YANSO_WARN_FUNCTION("merge", F, "unsupported return type");
+      YANSO_WARN_SKIP_FUNCTION("merge", F, "unsupported return type");
       continue;
     }
     if (F.hasAvailableExternallyLinkage()) {
-      YANSO_WARN_FUNCTION("merge", F,
-                          "available_externally definitions are not emitted");
+      YANSO_WARN_SKIP_FUNCTION(
+          "merge", F, "available_externally definitions are not emitted");
       continue;
     }
     if (F.hasComdat()) {
-      YANSO_WARN_FUNCTION("merge", F, "COMDAT functions are not supported yet");
+      YANSO_WARN_SKIP_FUNCTION("merge", F,
+                               "COMDAT functions are not supported yet");
       continue;
     }
     if (!hasSupportedLinkage(F)) {
-      YANSO_WARN_FUNCTION("merge", F, "unsupported linkage");
+      YANSO_WARN_SKIP_FUNCTION("merge", F, "unsupported linkage");
       continue;
     }
     if (F.getName() == "main" || F.getName() == "wmain") {
-      YANSO_WARN_FUNCTION("merge", F,
-                          "entry-point functions are not supported");
+      YANSO_WARN_SKIP_FUNCTION("merge", F,
+                               "entry-point functions are not supported");
       continue;
     }
 
     std::vector<CallInst *> Calls;
     collectDirectCalls(&F, Calls);
     if (Calls.empty() && F.hasLocalLinkage()) {
-      YANSO_WARN_FUNCTION("merge", F, "local function has no direct callsites");
+      YANSO_WARN_SKIP_FUNCTION("merge", F,
+                               "local function has no direct callsites");
       continue;
     }
 
@@ -790,7 +793,7 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
   std::vector<MergeGroup> Groups = planMergeGroups(Infos);
   for (FunctionInfo &Info : Infos)
     if (!Info.InGroup)
-      YANSO_WARN_FUNCTION(
+      YANSO_WARN_SKIP_FUNCTION(
           "merge", *Info.F,
           "not merged: left without an available merge partner");
   if (Groups.empty()) {

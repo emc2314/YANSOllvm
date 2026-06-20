@@ -307,7 +307,7 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
     return false;
   }
   if (Options && Options->skipFunction(F->getName())) {
-    YANSO_WARN_FUNCTION("sobf", *F, "not selected by filter");
+    YANSO_WARN_SKIP_FUNCTION("sobf", *F, "not selected by filter");
     return false;
   }
   LowerConstantExpr(*F);

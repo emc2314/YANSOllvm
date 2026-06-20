@@ -23,7 +23,7 @@ PreservedAnalyses IndirectCallPass::run(Function &F,
 
 bool IndirectCallPass::doIndirctCall(Function &Fn) {
   if (Options && Options->skipFunction(Fn.getName())) {
-    YANSO_WARN_FUNCTION("icall", Fn, "not selected by filter");
+    YANSO_WARN_SKIP_FUNCTION("icall", Fn, "not selected by filter");
     return false;
   }
 
@@ -36,7 +36,8 @@ bool IndirectCallPass::doIndirctCall(Function &Fn) {
   NumberCallees(Fn);
 
   if (Callees.empty()) {
-    YANSO_WARN_FUNCTION("icall", Fn, "no direct non-intrinsic call targets");
+    YANSO_WARN_SKIP_FUNCTION("icall", Fn,
+                             "no direct non-intrinsic call targets");
     return false;
   }
 

@@ -648,7 +648,7 @@ PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
     return PreservedAnalyses::all();
 
   if (F.hasPersonalityFn()) {
-    YANSO_WARN_FUNCTION("bb2func", F, "EH/personality function");
+    YANSO_WARN_SKIP_FUNCTION("bb2func", F, "EH/personality function");
     return PreservedAnalyses::all();
   }
 

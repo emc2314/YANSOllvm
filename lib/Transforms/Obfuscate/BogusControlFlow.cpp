@@ -173,7 +173,7 @@ PreservedAnalyses BogusControlFlowPass::run(Function &F,
     return PreservedAnalyses::all();
   }
   if (F.isVarArg()) {
-    YANSO_WARN_FUNCTION("bcf", F, "vararg function");
+    YANSO_WARN_SKIP_FUNCTION("bcf", F, "vararg function");
     return PreservedAnalyses::all();
   }
   // If bcf annotations

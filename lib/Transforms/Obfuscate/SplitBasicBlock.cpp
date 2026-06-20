@@ -56,7 +56,7 @@ PreservedAnalyses SplitBasicBlockPass::run(Function &F,
  */
 bool SplitBasicBlockPass::split(Function *f) {
   if (f->isVarArg()) {
-    YANSO_WARN_FUNCTION("split", *f, "vararg function");
+    YANSO_WARN_SKIP_FUNCTION("split", *f, "vararg function");
     return false;
   }
   YansoRNG RNG(yanso_function_seed(*f, "split"));

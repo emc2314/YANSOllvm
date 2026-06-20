@@ -145,7 +145,10 @@ static uint64_t alignOffset(uint64_t Offset, Type *Ty, const DataLayout &DL) {
 }
 
 static uint64_t slotSize(Type *Ty, const DataLayout &DL) {
-  return DL.getTypeStoreSize(Ty);
+  // MFLA stores values in one byte-addressed frame and independently aligns
+  // each slot. Reserve only the bytes a typed store may overwrite; padding up
+  // to the ABI allocation size can be reused by later suitably-aligned slots.
+  return DL.getTypeStoreSize(Ty).getFixedValue();
 }
 
 static uint64_t reserveSlot(uint64_t &NextOffset, Type *Ty,
@@ -310,7 +313,7 @@ static bool pruneCandidatesForBlockAddressGlobals(
                                : (Twine("blockaddress global '") + GV.getName() +
                                   "' is used by non-candidate code")
                                      .str();
-      YANSO_WARN_FUNCTION(PassName, *Owner, Reason);
+      YANSO_WARN_SKIP_FUNCTION(PassName, *Owner, Reason);
     }
   }
 
@@ -412,28 +415,26 @@ static bool isCandidate(Function &F) {
   if (F.isDeclaration())
     return false;
   if (F.isVarArg()) {
-    YANSO_WARN_FUNCTION(PassName, F, "vararg function");
+    YANSO_WARN_SKIP_FUNCTION(PassName, F, "vararg function");
     return false;
   }
   if (hasUnsupportedABIAttrs(F)) {
-    YANSO_WARN_FUNCTION(PassName, F, "unsupported ABI parameter attribute");
+    YANSO_WARN_SKIP_FUNCTION(PassName, F,
+                             "unsupported ABI parameter attribute");
     return false;
   }
   if (hasUnsupportedCallBr(F)) {
-    YANSO_ERROR_FUNCTION(PassName, F, "contains callbr");
+    YANSO_ERROR_SKIP_FUNCTION(PassName, F, "contains callbr");
     return false;
   }
   if (!hasSupportedBlockAddressDomain(F)) {
-    YANSO_WARN_FUNCTION(PassName, F, "unsupported blockaddress use");
+    YANSO_WARN_SKIP_FUNCTION(PassName, F, "unsupported blockaddress use");
     return false;
   }
   if (yansollvm_has_dynamic_stack_state(F)) {
-    YANSO_WARN_FUNCTION(PassName, F, "dynamic stack state");
+    YANSO_WARN_SKIP_FUNCTION(PassName, F, "dynamic stack state");
     return false;
   }
-  if (!F.hasLocalLinkage())
-    YANSO_WARN_FUNCTION(PassName, F,
-                        "non-local function will be rewritten as ABI-preserving wrapper");
   if (F.empty())
     return false;
   return true;
@@ -443,13 +444,14 @@ static bool supportsCurrentLowering(
     Function &F, const DenseMap<Function *, unsigned> &CandidateIDs) {
   Type *RetTy = F.getReturnType();
   if (!RetTy->isVoidTy() && !isFrameScalar(RetTy)) {
-    YANSO_WARN_FUNCTION(PassName, F,
-                        "current lowering supports only scalar return functions");
+    YANSO_WARN_SKIP_FUNCTION(
+        PassName, F, "current lowering supports only scalar return functions");
     return false;
   }
   for (Argument &Arg : F.args()) {
     if (!isFrameScalar(Arg.getType())) {
-      YANSO_WARN_FUNCTION(PassName, F, "current lowering supports only scalar arguments");
+      YANSO_WARN_SKIP_FUNCTION(
+          PassName, F, "current lowering supports only scalar arguments");
       return false;
     }
   }
@@ -458,8 +460,8 @@ static bool supportsCurrentLowering(
       if (isa<PHINode>(&I)) {
         auto *Phi = cast<PHINode>(&I);
         if (!isFrameScalar(Phi->getType())) {
-          YANSO_WARN_FUNCTION(PassName, F,
-                              "current lowering supports only scalar PHI nodes");
+          YANSO_WARN_SKIP_FUNCTION(
+              PassName, F, "current lowering supports only scalar PHI nodes");
           return false;
         }
         continue;
@@ -468,23 +470,23 @@ static bool supportsCurrentLowering(
         Function *RawCallee = Call->getCalledFunction();
         if (RawCallee && CandidateIDs.count(RawCallee) &&
             RawCallee->getReturnType() != Call->getType()) {
-          YANSO_WARN_FUNCTION(PassName, F,
-                              "callee wrapper return type changed");
+          YANSO_WARN_SKIP_FUNCTION(PassName, F,
+                                   "callee wrapper return type changed");
           return false;
         }
         if (Function *Callee = directCalledFunction(Call)) {
           if (CandidateIDs.count(Callee)) {
             if (!Call->getType()->isVoidTy() &&
                 !isFrameScalar(Call->getType())) {
-              YANSO_WARN_FUNCTION(
-                  PassName, F,
-                  "current lowering supports only void or scalar internal call results");
+              YANSO_WARN_SKIP_FUNCTION(PassName, F,
+                                       "current lowering supports only void or "
+                                       "scalar internal call results");
               return false;
             }
             if (Call->mayThrow() &&
                 !Callee->hasFnAttribute(Attribute::NoUnwind) &&
                 !F.hasFnAttribute(Attribute::NoUnwind)) {
-              YANSO_WARN_FUNCTION(
+              YANSO_WARN_SKIP_FUNCTION(
                   PassName, F,
                   "current lowering does not support throwing internal calls");
               return false;
@@ -493,23 +495,24 @@ static bool supportsCurrentLowering(
         }
       }
       if (!I.getType()->isVoidTy() && !isFrameScalar(I.getType())) {
-        YANSO_WARN_FUNCTION(PassName, F,
-                            "current lowering supports only scalar instruction results");
+        YANSO_WARN_SKIP_FUNCTION(
+            PassName, F,
+            "current lowering supports only scalar instruction results");
         return false;
       }
       if (isa<LandingPadInst>(&I) || isa<CatchPadInst>(&I) ||
           isa<CleanupPadInst>(&I)) {
-        YANSO_WARN_FUNCTION(PassName, F,
-                            "current lowering keeps EH for a later region pass");
+        YANSO_WARN_SKIP_FUNCTION(
+            PassName, F, "current lowering keeps EH for a later region pass");
         return false;
       }
     }
     Instruction *Term = BB.getTerminator();
     if (!isa<ReturnInst>(Term) && !isa<BranchInst>(Term) &&
         !isa<SwitchInst>(Term) && !isa<IndirectBrInst>(Term)) {
-      YANSO_WARN_FUNCTION(
-          PassName, F,
-          "current lowering supports only branch, switch, indirectbr, and return terminators");
+      YANSO_WARN_SKIP_FUNCTION(PassName, F,
+                               "current lowering supports only branch, switch, "
+                               "indirectbr, and return terminators");
       return false;
     }
   }
@@ -651,8 +654,8 @@ static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
 static Value *framePtr(IRBuilder<> &B, GlobalVariable *Frame, uint64_t Offset) {
   auto *FrameTy = cast<ArrayType>(Frame->getValueType());
   LLVMContext &Ctx = Frame->getContext();
-  Value *Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
-  Value *Off = ConstantInt::get(Type::getInt32Ty(Ctx), Offset);
+  Value *Zero = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
+  Value *Off = ConstantInt::get(Type::getInt64Ty(Ctx), Offset);
   return B.CreateInBoundsGEP(FrameTy, Frame, {Zero, Off});
 }
 
@@ -1071,22 +1074,17 @@ static void addBaseToLayout(FunctionLayout &L, uint64_t Base) {
     addBaseToRef(Entry.second, Base);
 }
 
-static bool isInternalCallee(CallInst *Call,
-                             const DenseMap<Function *, unsigned> &CandidateIDs) {
+static bool
+isCPSLoweredCall(CallInst *Call,
+                 const DenseMap<Function *, unsigned> &CandidateIDs) {
   Function *Callee = directCalledFunction(Call);
   return Callee && CandidateIDs.count(Callee);
 }
 
-static bool isCPSLoweredCall(CallInst *Call,
-                             const DenseMap<Function *, unsigned> &CandidateIDs) {
-  return isInternalCallee(Call, CandidateIDs);
-}
-
-static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
-                               const DenseMap<Function *, unsigned> &CandidateIDs,
-                               CallGraphInfo CandidateGraph,
-                               const CallGraphInfo &FullGraph,
-                               const DataLayout &DL) {
+static FramePlan
+makeFramePlan(ArrayRef<Function *> Candidates,
+              const DenseMap<Function *, unsigned> &CandidateIDs,
+              const CallGraphInfo &CandidateGraph, const DataLayout &DL) {
   FramePlan Plan;
   SmallVector<StaticLocalPlan, 8> Locals;
 
@@ -1134,32 +1132,6 @@ static FramePlan makeFramePlan(ArrayRef<Function *> Candidates,
     Local.Layout = std::move(L);
     Local.LocalSize = std::max<uint64_t>(1, llvm::alignTo(NextOffset, 16));
     Locals.push_back(std::move(Local));
-  }
-
-  DenseSet<Function *> CandidateSet;
-  for (Function *F : Candidates)
-    CandidateSet.insert(F);
-  for (StaticLocalPlan &Local : Locals) {
-    bool HasNativeInternalCall = false;
-    auto It = FullGraph.Succs.find(Local.F);
-    if (It != FullGraph.Succs.end()) {
-      for (Function *Callee : It->second) {
-        if (!CandidateSet.count(Callee)) {
-          HasNativeInternalCall = true;
-          break;
-        }
-      }
-    }
-    if (!HasNativeInternalCall)
-      continue;
-    for (Function *Other : Candidates) {
-      if (Other == Local.F)
-        continue;
-      if (functionsInterfere(Local.F, Other, CandidateGraph))
-        continue;
-      if (reachesFunction(Local.F, Other, FullGraph))
-        CandidateGraph.Succs[Local.F].push_back(Other);
-    }
   }
 
   llvm::sort(Locals, [](const StaticLocalPlan &A, const StaticLocalPlan &B) {
@@ -1231,29 +1203,6 @@ static Instruction *cloneMapped(Instruction &I, IRBuilder<> &B,
   return Clone;
 }
 
-static bool storeIncomingPhis(IRBuilder<> &B, BasicBlock *Pred,
-                              BasicBlock *Succ, ValueToValueMapTy &VMap,
-                              const FunctionLayout &Layout, MFLAArtifacts &A,
-                              Function *OldF,
-                              DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-                              const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
-  for (Instruction &I : *Succ) {
-    auto *Phi = dyn_cast<PHINode>(&I);
-    if (!Phi)
-      break;
-    Value *Incoming = Phi->getIncomingValueForBlock(Pred);
-    Value *Mapped = mapValueForUse(Incoming, B, VMap, Layout, A, OldF, &BBMap,
-                                   AddrHelperForOldBB);
-    if (!Mapped)
-      return false;
-    auto It = Layout.PhiOffsets.find(Phi);
-    if (It == Layout.PhiOffsets.end())
-      return false;
-    storeSlot(B, Mapped, A, It->second);
-  }
-  return true;
-}
-
 static Value *muxInt(IRBuilder<> &B, Value *Cond, Value *TrueV, Value *FalseV) {
   Type *Ty = TrueV->getType();
   Value *Mask = B.CreateSExt(Cond, Ty);
@@ -1279,12 +1228,12 @@ static Value *muxValue(IRBuilder<> &B, const DataLayout &DL, Value *Cond,
   return B.CreateSelect(Cond, TrueV, FalseV);
 }
 
-static bool muxIncomingPhis(IRBuilder<> &B, const DataLayout &DL, BasicBlock *Pred,
-                            BasicBlock *Succ, Value *TakeEdge,
-                            ValueToValueMapTy &VMap, const FunctionLayout &Layout,
-                            MFLAArtifacts &A, Function *OldF,
-                            DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-                            const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
+static bool writeIncomingPhis(
+    IRBuilder<> &B, const DataLayout &DL, BasicBlock *Pred, BasicBlock *Succ,
+    Value *TakeEdge, ValueToValueMapTy &VMap, const FunctionLayout &Layout,
+    MFLAArtifacts &A, Function *OldF,
+    DenseMap<BasicBlock *, BasicBlock *> &BBMap,
+    const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
@@ -1297,15 +1246,18 @@ static bool muxIncomingPhis(IRBuilder<> &B, const DataLayout &DL, BasicBlock *Pr
     auto It = Layout.PhiOffsets.find(Phi);
     if (It == Layout.PhiOffsets.end())
       return false;
-    Value *Old = loadSlot(B, Phi->getType(), A, It->second, "mfla.phi.old");
-    Value *New = muxValue(B, DL, TakeEdge, Mapped, Old);
-    storeSlot(B, New, A, It->second);
+    Value *ToStore = Mapped;
+    if (TakeEdge) {
+      Value *Old = loadSlot(B, Phi->getType(), A, It->second, "mfla.phi.old");
+      ToStore = muxValue(B, DL, TakeEdge, Mapped, Old);
+    }
+    storeSlot(B, ToStore, A, It->second);
   }
   return true;
 }
 
 static bool hasPhiNodes(BasicBlock *BB) {
-  return isa<PHINode>(&BB->front());
+  return BB && !BB->empty() && isa<PHINode>(&BB->front());
 }
 
 static void createAddressTakenHelper(Function &Mega, MFLAArtifacts &A,
@@ -1324,14 +1276,42 @@ static void createAddressTakenHelper(Function &Mega, MFLAArtifacts &A,
   End->addDestination(RealTarget);
 }
 
-static bool createThreadedTerminator(
-    IRBuilder<> &B, Function &Mega, Instruction *OldTerm,
-    ValueToValueMapTy &VMap, DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-    BasicBlock *Exit, MFLAArtifacts &A, const FunctionLayout &Layout,
-    DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> &ReturnDispatches,
-    DenseMap<BasicBlock *, uint64_t> &StateFor, MFLAStateAllocator &StateAlloc,
-    ArrayRef<BasicBlock *> AnchorCandidates, Function *OldF,
-    const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
+struct LoweringContext {
+  Function &Mega;
+  MFLAArtifacts &Artifacts;
+  DenseMap<Function *, FunctionLayout> &Layouts;
+  const DenseMap<Function *, unsigned> &CandidateIDs;
+  DenseMap<Function *, BasicBlock *> &EntryBlockFor;
+  DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>>
+      &AddrHelperForFunction;
+  DenseMap<BasicBlock *, uint64_t> &StateFor;
+  MFLAStateAllocator &StateAlloc;
+  BasicBlock *Anchor = nullptr;
+  BasicBlock *Exit = nullptr;
+  DenseMap<Function *, SmallVector<BasicBlock *, 4>> &ContinuationsByCallee;
+  ArrayRef<BasicBlock *> AnchorCandidates;
+};
+
+struct FunctionTerminatorContext {
+  Function *OldF = nullptr;
+  ValueToValueMapTy &VMap;
+  DenseMap<BasicBlock *, BasicBlock *> &BBMap;
+  const FunctionLayout &Layout;
+  DenseMap<Function *, SmallVector<IndirectBrInst *, 4>> &ReturnDispatches;
+  const DenseMap<BasicBlock *, BasicBlock *> *AddrHelpers = nullptr;
+};
+
+static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
+                                     LoweringContext &LCtx,
+                                     FunctionTerminatorContext &FCtx) {
+  Function &Mega = LCtx.Mega;
+  MFLAArtifacts &A = LCtx.Artifacts;
+  const FunctionLayout &Layout = FCtx.Layout;
+  ValueToValueMapTy &VMap = FCtx.VMap;
+  DenseMap<BasicBlock *, BasicBlock *> &BBMap = FCtx.BBMap;
+  Function *OldF = FCtx.OldF;
+  const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB =
+      FCtx.AddrHelpers;
   BasicBlock *Pred = OldTerm->getParent();
 
   if (auto *Ret = dyn_cast<ReturnInst>(OldTerm)) {
@@ -1345,16 +1325,16 @@ static bool createThreadedTerminator(
     Type *I64 = Type::getInt64Ty(Mega.getContext());
     BasicBlock *Cur = B.GetInsertBlock();
     BasicBlock *ReturnBB = BasicBlock::Create(
-        Mega.getContext(), Cur->getName() + ".ret.cont", &Mega, Exit);
-    uint64_t ReturnState = stateFor(Cur, StateFor);
+        Mega.getContext(), Cur->getName() + ".ret.cont", &Mega, LCtx.Exit);
+    uint64_t ReturnState = stateFor(Cur, LCtx.StateFor);
     BasicBlock *MappedEntry = BBMap.lookup(&OldF->getEntryBlock());
     if (!MappedEntry)
       return false;
-    uint64_t CalleeEntryState = stateFor(MappedEntry, StateFor);
+    uint64_t CalleeEntryState = stateFor(MappedEntry, LCtx.StateFor);
     Value *ContXorSlot = retContPtr(B, A.RetContXor, Layout.ContinuationSlotID);
     Value *ContXor = B.CreateLoad(I64, ContXorSlot, "mfla.ret.cont.xor");
     Value *HasContinuation = B.CreateICmpNE(ContXor, constI64(Mega.getContext(), 0));
-    B.CreateCondBr(HasContinuation, ReturnBB, Exit);
+    B.CreateCondBr(HasContinuation, ReturnBB, LCtx.Exit);
 
     IRBuilder<> ReturnB(ReturnBB);
     Value *ContEdge = ReturnB.CreateLoad(
@@ -1373,7 +1353,7 @@ static bool createThreadedTerminator(
     Value *Target = encodedTarget(ReturnB, Mega, MappedEntry, ContEdge,
                                   keyForState(ReturnB, A, NextState));
     auto *End = IndirectBrInst::Create(Target, 0, ReturnBB);
-    ReturnDispatches[Layout.Owner].push_back(End);
+    FCtx.ReturnDispatches[Layout.Owner].push_back(End);
     return true;
   }
 
@@ -1399,8 +1379,8 @@ static bool createThreadedTerminator(
           Helpers.push_back(Helper);
         Value *HelperI = ConstantExpr::getPtrToInt(BlockAddress::get(&Mega, Helper), I64);
         Value *TakeDest = B.CreateICmpEQ(RawI, HelperI, "mfla.ibr.take");
-        if (!muxIncomingPhis(B, DL, Pred, OldDest, TakeDest, VMap, Layout, A,
-                             OldF, BBMap, AddrHelperForOldBB))
+        if (!writeIncomingPhis(B, DL, Pred, OldDest, TakeDest, VMap, Layout, A,
+                               OldF, BBMap, AddrHelperForOldBB))
           return false;
       }
 
@@ -1421,9 +1401,9 @@ static bool createThreadedTerminator(
     if (!Cond || !NewDefault)
       return false;
 
-    BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
-    uint64_t FromState = stateFor(B.GetInsertBlock(), StateFor);
-    uint64_t DefaultState = stateFor(NewDefault, StateFor);
+    BasicBlock *EdgeAnchor = pickAnchor(LCtx.AnchorCandidates, LCtx.StateAlloc);
+    uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
+    uint64_t DefaultState = stateFor(NewDefault, LCtx.StateFor);
     Value *CurState = loadState(B, A, "mfla.switch.cur.state");
     Value *NextState = transitionState(B, CurState, FromState, DefaultState);
     Value *Encoded = loadEdgeConstant(B, A, EdgeAnchor, NewDefault, DefaultState);
@@ -1436,7 +1416,7 @@ static bool createThreadedTerminator(
       if (!NewSucc)
         return false;
       Value *TakeCase = B.CreateICmpEQ(Cond, Case.getCaseValue());
-      uint64_t CaseState = stateFor(NewSucc, StateFor);
+      uint64_t CaseState = stateFor(NewSucc, LCtx.StateFor);
       Value *CaseNext = transitionState(B, CurState, FromState, CaseState);
       Value *CaseEnc = loadEdgeConstant(B, A, EdgeAnchor, NewSucc, CaseState);
       NextState = muxInt(B, TakeCase, CaseNext, NextState);
@@ -1482,9 +1462,9 @@ static bool createThreadedTerminator(
 
     for (auto &Entry : SuccConds) {
       if (hasPhiNodes(Entry.first)) {
-        if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred,
-                             Entry.first, Entry.second, VMap, Layout, A,
-                             OldF, BBMap, AddrHelperForOldBB))
+        if (!writeIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred,
+                               Entry.first, Entry.second, VMap, Layout, A, OldF,
+                               BBMap, AddrHelperForOldBB))
           return false;
       }
     }
@@ -1501,12 +1481,13 @@ static bool createThreadedTerminator(
   if (Br->isUnconditional()) {
     BasicBlock *OldSucc = Br->getSuccessor(0);
     BasicBlock *NewSucc = BBMap.lookup(OldSucc);
-    if (!NewSucc || !storeIncomingPhis(B, Pred, OldSucc, VMap, Layout, A,
+    if (!NewSucc || !writeIncomingPhis(B, Mega.getParent()->getDataLayout(),
+                                       Pred, OldSucc, nullptr, VMap, Layout, A,
                                        OldF, BBMap, AddrHelperForOldBB))
       return false;
-    BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
-    uint64_t FromState = stateFor(B.GetInsertBlock(), StateFor);
-    uint64_t ToState = stateFor(NewSucc, StateFor);
+    BasicBlock *EdgeAnchor = pickAnchor(LCtx.AnchorCandidates, LCtx.StateAlloc);
+    uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
+    uint64_t ToState = stateFor(NewSucc, LCtx.StateFor);
     Value *NextState = transitionState(B, loadState(B, A, "mfla.cur.state"),
                                        FromState, ToState);
     storeState(B, A, NextState);
@@ -1527,10 +1508,10 @@ static bool createThreadedTerminator(
   if (!Cond || !TrueBB || !FalseBB)
     return false;
 
-  BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
-  uint64_t FromState = stateFor(B.GetInsertBlock(), StateFor);
-  uint64_t TrueState = stateFor(TrueBB, StateFor);
-  uint64_t FalseState = stateFor(FalseBB, StateFor);
+  BasicBlock *EdgeAnchor = pickAnchor(LCtx.AnchorCandidates, LCtx.StateAlloc);
+  uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
+  uint64_t TrueState = stateFor(TrueBB, LCtx.StateFor);
+  uint64_t FalseState = stateFor(FalseBB, LCtx.StateFor);
   Value *CurState = loadState(B, A, "mfla.cond.cur.state");
   Value *NextState = conditionalTransitionState(B, CurState, FromState,
                                                 FalseState, TrueState, Cond);
@@ -1540,35 +1521,20 @@ static bool createThreadedTerminator(
   Value *Target = encodedTarget(B, Mega, EdgeAnchor, Encoded,
                                 keyForState(B, A, NextState));
   storeState(B, A, NextState);
-  if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldTrue,
-                       Cond, VMap, Layout, A, OldF, BBMap,
-                       AddrHelperForOldBB))
+  if (!writeIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldTrue,
+                         Cond, VMap, Layout, A, OldF, BBMap,
+                         AddrHelperForOldBB))
     return false;
   Value *NotCond = B.CreateNot(Cond);
-  if (!muxIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldFalse,
-                       NotCond, VMap, Layout, A, OldF, BBMap,
-                       AddrHelperForOldBB))
+  if (!writeIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred, OldFalse,
+                         NotCond, VMap, Layout, A, OldF, BBMap,
+                         AddrHelperForOldBB))
     return false;
   auto *End = IndirectBrInst::Create(Target, 2, B.GetInsertBlock());
   End->addDestination(TrueBB);
   End->addDestination(FalseBB);
   return true;
 }
-
-struct LoweringContext {
-  Function &Mega;
-  MFLAArtifacts &Artifacts;
-  DenseMap<Function *, FunctionLayout> &Layouts;
-  const DenseMap<Function *, unsigned> &CandidateIDs;
-  DenseMap<Function *, BasicBlock *> &EntryBlockFor;
-  DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &AddrHelperForFunction;
-  DenseMap<BasicBlock *, uint64_t> &StateFor;
-  MFLAStateAllocator &StateAlloc;
-  BasicBlock *Anchor = nullptr;
-  BasicBlock *Exit = nullptr;
-  DenseMap<Function *, SmallVector<BasicBlock *, 4>> &ContinuationsByCallee;
-  ArrayRef<BasicBlock *> AnchorCandidates;
-};
 
 static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
                               ValueToValueMapTy &VMap,
@@ -1765,10 +1731,9 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
       if (NewBB->getTerminator())
         continue;
       IRBuilder<> B(NewBB);
-      if (!createThreadedTerminator(B, Mega, BB.getTerminator(), VMap, BBMap,
-                                    Exit, A, L, ReturnDispatches, StateFor,
-                                    StateAlloc, AnchorCandidates, F,
-                                    &AddrHelpers))
+      FunctionTerminatorContext TermCtx{
+          F, VMap, BBMap, L, ReturnDispatches, &AddrHelpers};
+      if (!createThreadedTerminator(B, BB.getTerminator(), LCtx, TermCtx))
         return false;
     }
   }
@@ -1851,7 +1816,6 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
   for (Function *F : InitialCandidates)
     CandidateSet.insert(F);
 
-  CallGraphInfo FullGraph = buildCandidateCallGraph(InitialCandidates);
   std::vector<Function *> Candidates;
   DenseMap<Function *, unsigned> CandidateIDs;
   CallGraphInfo InitialGraph;
@@ -1872,7 +1836,7 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     for (Function *F : CandidateList) {
       if (!Recursive.count(F))
         continue;
-      YANSO_WARN_FUNCTION(PassName, *F, "recursive SCC not supported");
+      YANSO_WARN_SKIP_FUNCTION(PassName, *F, "recursive SCC not supported");
       CandidateSet.erase(F);
       Changed = true;
     }
@@ -1913,7 +1877,7 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     }
 
     CandidateGraph = buildCandidateCallGraph(Candidates);
-    Plan = makeFramePlan(Candidates, CandidateIDs, CandidateGraph, FullGraph,
+    Plan = makeFramePlan(Candidates, CandidateIDs, CandidateGraph,
                          M.getDataLayout());
     break;
   }
