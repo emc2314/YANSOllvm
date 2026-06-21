@@ -37,13 +37,13 @@ struct ParamShape {
 
 struct FunctionInfo {
   Function *F = nullptr;
+  Constant *Personality = nullptr;
   ParamShape Shape;
   unsigned RetBits = 64;
   unsigned StaticCost = 0;
   unsigned CallCount = 0;
   uint64_t WeightedCallCount = 0;
   double CallWeight = 1.0;
-  bool NeedsWrapper = false;
   bool InGroup = false;
   Function *Dispatcher = nullptr;
   uint32_t FuncID = 0;
@@ -56,8 +56,32 @@ struct FunctionInfo {
 struct MergeGroup {
   std::vector<FunctionInfo *> Members;
   ParamShape Shape;
+  Constant *Personality = nullptr;
   unsigned RetBits = 64;
 };
+
+static bool functionMayUnwind(Function &F) {
+  if (F.hasFnAttribute(Attribute::NoUnwind))
+    return false;
+  for (BasicBlock &BB : F) {
+    if (isa<InvokeInst>(BB.getTerminator()))
+      return true;
+    for (Instruction &I : BB)
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->mayThrow())
+          return true;
+  }
+  return false;
+}
+
+static bool allMembersNoUnwind(ArrayRef<FunctionInfo *> Members) {
+  for (FunctionInfo *Info : Members) {
+    Function *F = Info ? Info->F : nullptr;
+    if (!F || functionMayUnwind(*F))
+      return false;
+  }
+  return true;
+}
 
 static double finiteOr(double X, double Fallback = 0.0) {
   return std::isfinite(X) ? X : Fallback;
@@ -85,10 +109,6 @@ static uint64_t saturatingAdd(uint64_t A, uint64_t B) {
   return A + B;
 }
 
-static bool hasSupportedLinkage(Function &F) {
-  return F.hasLocalLinkage() || F.hasExternalLinkage();
-}
-
 static bool isReusableI32(Type *Ty) {
   if (Ty->isFloatTy())
     return true;
@@ -101,6 +121,11 @@ static bool isReusableI64(Type *Ty) {
     return true;
   auto *IT = dyn_cast<IntegerType>(Ty);
   return IT && IT->getBitWidth() > 32 && IT->getBitWidth() <= 64;
+}
+
+static bool isSupportedReturnType(Type *Ty) {
+  return Ty->isIntOrPtrTy() || Ty->isVoidTy() || Ty->isFloatTy() ||
+         Ty->isDoubleTy();
 }
 
 static bool isReusableScalarOrPtr(Type *Ty) {
@@ -127,10 +152,28 @@ static ParamShape computeParamShape(Function *F) {
   return S;
 }
 
+static bool hasUnsupportedABIAttrs(Function &F) {
+  auto BadParamAttr = [](const Argument &Arg) {
+    return Arg.hasAttribute(Attribute::StructRet) ||
+           Arg.hasAttribute(Attribute::ByVal) ||
+           Arg.hasAttribute(Attribute::InAlloca) ||
+           Arg.hasAttribute(Attribute::SwiftError) ||
+           Arg.hasAttribute(Attribute::SwiftSelf) ||
+           Arg.hasAttribute(Attribute::Preallocated);
+  };
+
+  for (const Argument &Arg : F.args())
+    if (BadParamAttr(Arg))
+      return true;
+  return false;
+}
+
 static unsigned returnBits(Type *RetTy) {
   if (auto *IT = dyn_cast<IntegerType>(RetTy))
     return std::max<unsigned>(64,
                               IT->getBitWidth() == 1 ? 8 : IT->getBitWidth());
+  if (RetTy->isFloatTy() || RetTy->isDoubleTy() || RetTy->isPointerTy())
+    return 64;
   return 64;
 }
 
@@ -161,12 +204,22 @@ static void computeSemantic(FunctionInfo &Info) {
   }
 }
 
-static void collectDirectCalls(Function *F, std::vector<CallInst *> &Calls) {
+static void collectDirectCallsites(Function *F,
+                                   std::vector<CallBase *> &Callsites) {
   for (Use &U : F->uses()) {
-    auto *Call = dyn_cast<CallInst>(U.getUser());
-    if (Call && Call->getCalledFunction() == F)
-      Calls.push_back(Call);
+    auto *Call = dyn_cast<CallBase>(U.getUser());
+    if (!Call || Call->getCalledFunction() != F)
+      continue;
+    if (isa<CallInst>(Call) || isa<InvokeInst>(Call))
+      Callsites.push_back(Call);
   }
+}
+
+static uint64_t selectorKeyFor(YansoRNG &RNG, uint32_t FuncID) {
+  uint32_t SelectorHi = RNG.next32();
+  uint32_t SelectorLo = SelectorHi ^ FuncID;
+  return (static_cast<uint64_t>(SelectorHi) << 32) |
+         static_cast<uint64_t>(SelectorLo);
 }
 
 static int callsiteDistance(const FunctionInfo &A, const FunctionInfo &B) {
@@ -181,6 +234,18 @@ static int callsiteDistance(const FunctionInfo &A, const FunctionInfo &B) {
   int Span = std::max({0, A.LastCallOrder, B.LastCallOrder}) -
              std::min(A.FirstCallOrder, B.FirstCallOrder);
   return std::min(10000, Best + Span / 4);
+}
+
+static bool hasCompatiblePersonality(ArrayRef<FunctionInfo *> Group,
+                                     const FunctionInfo &Candidate) {
+  Constant *CandidatePersonality = Candidate.Personality;
+  for (FunctionInfo *Info : Group) {
+    Constant *GroupPersonality = Info->Personality;
+    if (GroupPersonality && CandidatePersonality &&
+        GroupPersonality != CandidatePersonality)
+      return false;
+  }
+  return true;
 }
 
 static int semanticDistance(const FunctionInfo &A, const FunctionInfo &B) {
@@ -355,6 +420,8 @@ planMergeGroups(std::vector<FunctionInfo> &Infos) {
       for (size_t I : Order) {
         if (Used[I])
           continue;
+        if (!hasCompatiblePersonality(G.Members, Infos[I]))
+          continue;
         double Score = mergeScore(G.Members, &Infos[I]);
         if (Score > BestScore) {
           BestScore = Score;
@@ -372,6 +439,8 @@ planMergeGroups(std::vector<FunctionInfo> &Infos) {
       G.Shape = mergedShape(G.Members);
       for (FunctionInfo *Info : G.Members) {
         Info->InGroup = true;
+        if (!G.Personality && Info->Personality)
+          G.Personality = Info->Personality;
         G.RetBits = std::max(G.RetBits, Info->RetBits);
       }
       Groups.push_back(std::move(G));
@@ -495,9 +564,26 @@ static Value *convertMergedReturn(IRBuilder<> &B, Value *V, Type *RetTy,
                                   unsigned MergedRetBits, bool ToMergedRet) {
   if (RetTy->isVoidTy())
     return nullptr;
+  LLVMContext &Ctx = RetTy->getContext();
+  IntegerType *I32 = IntegerType::get(Ctx, 32);
+  IntegerType *I64 = IntegerType::get(Ctx, 64);
+  IntegerType *MergedTy = IntegerType::get(Ctx, MergedRetBits);
+  if (RetTy->isFloatTy()) {
+    if (ToMergedRet)
+      return B.CreateZExt(B.CreateBitCast(V, I32), MergedTy);
+    if (V->getType() != I32)
+      V = B.CreateTrunc(V, I32);
+    return B.CreateBitCast(V, RetTy);
+  }
+  if (RetTy->isDoubleTy()) {
+    if (ToMergedRet)
+      return B.CreateBitCast(V, I64);
+    if (V->getType() != I64)
+      V = B.CreateZExt(V, I64);
+    return B.CreateBitCast(V, RetTy);
+  }
   if (RetTy->isPointerTy())
-    return ToMergedRet ? B.CreatePtrToInt(V, IntegerType::get(RetTy->getContext(),
-                                                             MergedRetBits))
+    return ToMergedRet ? B.CreatePtrToInt(V, MergedTy)
                        : B.CreateIntToPtr(V, RetTy);
   auto *RetIntTy = dyn_cast<IntegerType>(RetTy);
   if (!RetIntTy)
@@ -523,10 +609,7 @@ static void rewriteFunctionAsWrapper(FunctionInfo &TargetInfo,
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
   IRBuilder<> B(Entry);
 
-  uint32_t SelectorHi = RNG.next32();
-  uint32_t SelectorLo = SelectorHi ^ TargetInfo.FuncID;
-  uint64_t SelectorKey = (static_cast<uint64_t>(SelectorHi) << 32) |
-                         static_cast<uint64_t>(SelectorLo);
+  uint64_t SelectorKey = selectorKeyFor(RNG, TargetInfo.FuncID);
 
   SmallVector<Value *, 8> ActualArgs;
   for (Argument &Arg : F->args())
@@ -541,6 +624,8 @@ static void rewriteFunctionAsWrapper(FunctionInfo &TargetInfo,
   else
     B.CreateRet(convertMergedReturn(B, Call, RetTy, Group.RetBits,
                                     /*ToMergedRet=*/false));
+  if (Dispatcher->hasFnAttribute(Attribute::NoUnwind))
+    F->addFnAttr(Attribute::NoUnwind);
 }
 
 static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
@@ -568,7 +653,12 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
   FunctionType *FuncTy = FunctionType::get(RetTy, ParamTy, false);
   Function *NewFunction = Function::Create(FuncTy, GlobalValue::InternalLinkage,
                                            FuncName + "merge", M);
+  if (Group.Personality)
+    NewFunction->setPersonalityFn(Group.Personality);
   NewFunction->addFnAttr(Attribute::NoInline);
+  bool GroupNoUnwind = allMembersNoUnwind(Group.Members);
+  if (GroupNoUnwind)
+    NewFunction->addFnAttr(Attribute::NoUnwind);
   for (size_t I = 0; I < Group.Members.size(); ++I) {
     Group.Members[I]->Dispatcher = NewFunction;
     Group.Members[I]->FuncID = FuncID[I];
@@ -577,28 +667,59 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
   for (size_t I = 0; I < Group.Members.size(); I++) {
     FunctionInfo *TargetInfo = Group.Members[I];
     Function *Target = TargetInfo->F;
-    if (TargetInfo->NeedsWrapper)
-      continue;
 
-    std::vector<CallInst *> VecCall;
-    collectDirectCalls(Target, VecCall);
+    std::vector<CallBase *> Callsites;
+    collectDirectCallsites(Target, Callsites);
+    for (CallBase *Callsite : Callsites) {
+      uint64_t SelectorKey = selectorKeyFor(RNG, FuncID[I]);
 
-    for (CallInst *Call : VecCall) {
-      IRBuilder<> B(Call);
-      uint32_t SelectorHi = RNG.next32();
-      uint32_t SelectorLo = SelectorHi ^ FuncID[I];
-      uint64_t SelectorKey = (static_cast<uint64_t>(SelectorHi) << 32) |
-                             static_cast<uint64_t>(SelectorLo);
+      if (auto *Call = dyn_cast<CallInst>(Callsite)) {
+        IRBuilder<> B(Call);
+        SmallVector<Value *, 8> ActualArgs(Call->args());
+        SmallVector<Value *, 8> CallArgs =
+            buildMergedCallArgs(B, *TargetInfo, Group, ActualArgs, SelectorKey);
+        CallInst *NewCall = B.CreateCall(NewFunction, CallArgs);
+        if (GroupNoUnwind)
+          NewCall->setDoesNotThrow();
+        if (!Target->getReturnType()->isVoidTy())
+          Call->replaceAllUsesWith(convertMergedReturn(
+              B, NewCall, Target->getReturnType(), Group.RetBits,
+              /*ToMergedRet=*/false));
+        Call->eraseFromParent();
+        continue;
+      }
 
-      SmallVector<Value *, 8> ActualArgs(Call->args());
+      auto *Invoke = cast<InvokeInst>(Callsite);
+      BasicBlock *NormalDest = Invoke->getNormalDest();
+      BasicBlock *UnwindDest = Invoke->getUnwindDest();
+      BasicBlock *ConvertBB = nullptr;
+      if (!Target->getReturnType()->isVoidTy()) {
+        ConvertBB = BasicBlock::Create(Ctx,
+                                       Invoke->getName().empty()
+                                           ? "merge.invoke.ret"
+                                           : Invoke->getName() + ".merge.ret",
+                                       Invoke->getFunction(), NormalDest);
+      }
+
+      IRBuilder<> B(Invoke);
+      SmallVector<Value *, 8> ActualArgs(Invoke->args());
       SmallVector<Value *, 8> CallArgs =
           buildMergedCallArgs(B, *TargetInfo, Group, ActualArgs, SelectorKey);
-      CallInst *NewCall = B.CreateCall(NewFunction, CallArgs);
-      if (!Target->getReturnType()->isVoidTy())
-        Call->replaceAllUsesWith(convertMergedReturn(
-            B, NewCall, Target->getReturnType(), Group.RetBits,
-            /*ToMergedRet=*/false));
-      Call->eraseFromParent();
+      InvokeInst *NewInvoke =
+          B.CreateInvoke(NewFunction, ConvertBB ? ConvertBB : NormalDest,
+                         UnwindDest, CallArgs);
+      if (GroupNoUnwind)
+        NewInvoke->setDoesNotThrow();
+
+      if (!Target->getReturnType()->isVoidTy()) {
+        IRBuilder<> ConvertB(ConvertBB);
+        Value *Converted = convertMergedReturn(
+            ConvertB, NewInvoke, Target->getReturnType(), Group.RetBits,
+            /*ToMergedRet=*/false);
+        Invoke->replaceAllUsesWith(Converted);
+        ConvertB.CreateBr(NormalDest);
+      }
+      Invoke->eraseFromParent();
     }
   }
 
@@ -652,6 +773,8 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
     }
 
     CallInst *CallI = B.CreateCall(Target, CallArgs);
+    if (GroupNoUnwind)
+      CallI->setDoesNotThrow();
     if (Target->getReturnType()->isVoidTy())
       B.CreateRet(ConstantInt::get(RetTy, 0));
     else
@@ -664,14 +787,13 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
   }
 
   for (FunctionInfo *Info : Group.Members)
-    if (Info->NeedsWrapper)
-      rewriteFunctionAsWrapper(*Info, Group, RNG);
+    rewriteFunctionAsWrapper(*Info, Group, RNG);
 
   return NewFunction;
 }
 
 static uint64_t blockFrequencyForCall(
-    CallInst *Call, FunctionAnalysisManager &FAM,
+    CallBase *Call, FunctionAnalysisManager &FAM,
     std::unordered_map<Function *, BlockFrequencyInfo *> &BFICache) {
   Function *Caller = Call->getFunction();
   if (!Caller)
@@ -712,8 +834,15 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
                                "vararg functions are not supported");
       continue;
     }
-    if (!(F.getReturnType()->isIntOrPtrTy() || F.getReturnType()->isVoidTy())) {
+    if (!isSupportedReturnType(F.getReturnType())) {
       YANSO_WARN_SKIP_FUNCTION("merge", F, "unsupported return type");
+      continue;
+    }
+    if (hasUnsupportedABIAttrs(F)) {
+      YANSO_WARN_SKIP_FUNCTION(
+          "merge", F,
+          "sret/byval/inalloca/preallocated/swift ABI parameter "
+          "attributes are not supported");
       continue;
     }
     if (F.hasAvailableExternallyLinkage()) {
@@ -726,32 +855,21 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
                                "COMDAT functions are not supported yet");
       continue;
     }
-    if (!hasSupportedLinkage(F)) {
-      YANSO_WARN_SKIP_FUNCTION("merge", F, "unsupported linkage");
-      continue;
-    }
-    if (F.getName() == "main" || F.getName() == "wmain") {
-      YANSO_WARN_SKIP_FUNCTION("merge", F,
-                               "entry-point functions are not supported");
-      continue;
-    }
-
-    std::vector<CallInst *> Calls;
-    collectDirectCalls(&F, Calls);
-    if (Calls.empty() && F.hasLocalLinkage()) {
-      YANSO_WARN_SKIP_FUNCTION("merge", F,
-                               "local function has no direct callsites");
+    std::vector<CallBase *> Callsites;
+    collectDirectCallsites(&F, Callsites);
+    if (Callsites.empty() && F.hasLocalLinkage() && F.use_empty()) {
+      YANSO_WARN_SKIP_FUNCTION("merge", F, "local function has no uses");
       continue;
     }
 
     FunctionInfo Info;
     Info.F = &F;
-    Info.NeedsWrapper = !F.hasLocalLinkage();
+    Info.Personality = F.hasPersonalityFn() ? F.getPersonalityFn() : nullptr;
     Info.Shape = computeParamShape(&F);
     Info.RetBits = returnBits(F.getReturnType());
     Info.StaticCost = countInstructions(&F);
-    Info.CallCount = static_cast<unsigned>(Calls.size());
-    for (CallInst *Call : Calls)
+    Info.CallCount = static_cast<unsigned>(Callsites.size());
+    for (CallBase *Call : Callsites)
       Info.WeightedCallCount = saturatingAdd(
           Info.WeightedCallCount, blockFrequencyForCall(Call, FAM, BFICache));
     Info.CallWeight = std::max(1.0, safeLog2p1(Info.WeightedCallCount));
@@ -760,9 +878,10 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
   }
 
   if (Infos.size() < 2) {
-    YANSO_WARN_MODULE("merge", M,
-                      "fewer than two eligible mergeable non-vararg "
-                      "int/pointer/void-return function definitions");
+    YANSO_WARN_MODULE(
+        "merge", M,
+        "fewer than two eligible mergeable non-vararg "
+        "int/pointer/float/double/void-return function definitions");
     return PreservedAnalyses::all();
   }
 
@@ -774,9 +893,10 @@ PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
   for (Function &F : M) {
     for (BasicBlock &BB : F) {
       for (Instruction &I : BB) {
-        if (auto *Call = dyn_cast<CallInst>(&I)) {
+        if (auto *Call = dyn_cast<CallBase>(&I)) {
           auto It = InfoByFunction.find(Call->getCalledFunction());
-          if (It != InfoByFunction.end()) {
+          if (It != InfoByFunction.end() &&
+              (isa<CallInst>(Call) || isa<InvokeInst>(Call))) {
             FunctionInfo &Info = *It->second;
             Info.CallOrders.push_back(Order);
             Info.FirstCallOrder = std::min(Info.FirstCallOrder, Order);

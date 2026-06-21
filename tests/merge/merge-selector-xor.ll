@@ -1,5 +1,5 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=merge,verify -S %s -o %t.out.ll
-; RUN: grep 'define internal i64 @foo.bar.merge(i64' %t.out.ll
+; RUN: grep 'define internal i64 @foo.main.bar.merge(i64' %t.out.ll
 ; RUN: grep 'lshr i64 %0, 32' %t.out.ll
 ; RUN: grep 'and i64 %0, 4294967295' %t.out.ll
 ; RUN: grep 'xor i64' %t.out.ll
