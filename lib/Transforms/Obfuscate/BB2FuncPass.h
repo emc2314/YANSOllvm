@@ -7,7 +7,7 @@ namespace llvm {
 struct BB2FuncPass : PassInfoMixin<BB2FuncPass> {
   bool Enabled;
   explicit BB2FuncPass(bool Enabled = true) : Enabled(Enabled) {}
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
 } // namespace llvm

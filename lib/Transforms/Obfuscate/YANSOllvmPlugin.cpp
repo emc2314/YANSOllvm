@@ -98,7 +98,7 @@ ModulePassManager buildModulePipeline() {
 
   FunctionPassManager FPM;
   FPM.addPass(IndirectCallPass(EnableIndirectCall));
-  FPM.addPass(BB2FuncPass(EnableBB2Func));
+  MPM.addPass(BB2FuncPass(EnableBB2Func));
   FPM.addPass(SplitBasicBlockPass(EnableSplit));
   FPM.addPass(FlatteningPass(EnableFlattening));
   FPM.addPass(ConnectPass(EnableConnect));
@@ -126,7 +126,7 @@ bool addNamedPass(StringRef Name, ModulePassManager &MPM) {
   else if (Name == "icall")
     addFunctionPass(MPM, IndirectCallPass(true));
   else if (Name == "bb2func")
-    addFunctionPass(MPM, BB2FuncPass(true));
+    MPM.addPass(BB2FuncPass(true));
   else if (Name == "split")
     addFunctionPass(MPM, SplitBasicBlockPass(true));
   else if (Name == "fla")

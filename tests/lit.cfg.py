@@ -7,7 +7,7 @@ config.test_format = lit.formats.ShTest(True)
 config.suffixes = ['.c', '.cpp', '.ll']
 # Keep the standalone C++ catalog self-test out of lit discovery; it is built and
 # executed by the check-yansollvm CMake target before llvm-lit runs.
-config.excludes = ['ymba_catalog_selftest.cpp']
+config.excludes = ['ymba_catalog_selftest.cpp', 'mfla-two-module-driver.c']
 config.test_source_root = os.path.dirname(__file__)
 # Keep all lit-generated %t/%T files under one ignored tree.  If test_exec_root
 # is the source tree, tests in subdirectories create sibling Output/ directories

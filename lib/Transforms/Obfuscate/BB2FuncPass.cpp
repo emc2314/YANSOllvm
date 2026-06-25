@@ -641,15 +641,13 @@ void prioritizeCandidates(SmallVectorImpl<RegionCandidate> &Candidates,
     return A.Score > B.Score;
   });
 }
-} // namespace
-
-PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
-  if (!Enabled || F.getEntryBlock().getName() == "newFuncRoot")
-    return PreservedAnalyses::all();
+static bool runBB2FuncOnFunction(Function &F) {
+  if (F.isDeclaration())
+    return false;
 
   if (F.hasPersonalityFn()) {
     YANSO_WARN_SKIP_FUNCTION("bb2func", F, "EH/personality function");
-    return PreservedAnalyses::all();
+    return false;
   }
 
   bool Modified = false;
@@ -684,6 +682,26 @@ PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
       Modified = true;
       ++Extracted;
     }
+  }
+
+  return Modified;
+}
+} // namespace
+
+PreservedAnalyses BB2FuncPass::run(Module &M, ModuleAnalysisManager &) {
+  if (!Enabled)
+    return PreservedAnalyses::all();
+
+  SmallVector<Function *, 32> Worklist;
+  for (Function &F : M)
+    if (!F.isDeclaration())
+      Worklist.push_back(&F);
+
+  bool Modified = false;
+  for (Function *F : Worklist) {
+    if (!F->getParent())
+      continue;
+    Modified |= runBB2FuncOnFunction(*F);
   }
 
   return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();

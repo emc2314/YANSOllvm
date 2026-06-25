@@ -18,19 +18,41 @@ struct ContinuationSlot {
   unsigned ID = 0;
 };
 
+inline constexpr uint64_t FrameFreeNextOffsetValue = 0;
+inline constexpr uint64_t FrameMetadataBytes = 16;
+
+enum class StorageKind {
+  Argument,
+  ReturnValue,
+  Phi,
+  Spill,
+  CallResult,
+  FixedAllocaObject,
+  ContinuationRecord,
+  FrameMetadata,
+  PageTableMetadata,
+};
+
 struct StorageRef {
   llvm::Type *Ty = nullptr;
   uint64_t Offset = 0;
+  uint64_t SizeBytes = 0;
+  llvm::Align Alignment = llvm::Align(1);
+  StorageKind Kind = StorageKind::Spill;
 };
 
 inline StorageRef staticRef(llvm::Type *Ty, uint64_t Offset) {
-  return {Ty, Offset};
+  return {Ty, Offset, 0, llvm::Align(1), StorageKind::Spill};
 }
+
+enum class FramePageBackendKind {
+  Static,
+  Malloc,
+};
 
 struct FrameRef {
   llvm::Function *Owner = nullptr;
   llvm::Value *Token = nullptr;
-  bool Dynamic = false;
 };
 
 struct ContinuationRecord {
@@ -47,9 +69,17 @@ struct MFLAArtifacts {
   uint64_t FrameOffset = 0;
   uint64_t CurrentFrameOffset = 0;
   uint64_t FrameTopOffset = 0;
+  uint64_t FrameFreeHeadOffset = 0;
+  uint64_t FramePageTableHeadOffset = 0;
   uint64_t FrameArenaOffset = 0;
   uint64_t FrameStride = 0;
-  uint64_t MaxFrames = 0;
+  uint64_t StaticFramePages = 0;
+  FramePageBackendKind FrameBackend = FramePageBackendKind::Static;
+  uint64_t FramesPerPage = 0;
+  uint64_t FramePageSize = 0;
+  uint64_t PageTableBlockEntries = 0;
+  uint64_t PageTableBlockBytes = 0;
+  llvm::Function *FramePageResolver = nullptr;
   uint64_t ContinuationOffset = 0;
   uint64_t ContinuationStride = 0;
   uint64_t ContinuationSlots = 0;
@@ -77,6 +107,19 @@ struct FunctionLayout {
   llvm::DenseMap<llvm::Instruction *, StorageRef> SpilledValueOffsets;
 };
 
+struct FrameLayoutBuilder {
+  const llvm::DataLayout &DL;
+  uint64_t NextOffset = 0;
+
+  explicit FrameLayoutBuilder(const llvm::DataLayout &DL) : DL(DL) {}
+  StorageRef reserve(StorageKind Kind, llvm::Type *Ty);
+  StorageRef reserveValue(llvm::Type *Ty);
+  StorageRef reserveFixedObject(llvm::Type *PtrTy, llvm::Type *ObjectTy,
+                                llvm::Align Alignment);
+  uint64_t frameSize() const;
+};
+
+void addBaseToLayout(FunctionLayout &L, uint64_t Base);
 llvm::Constant *keyForState(MFLAArtifacts &A, uint64_t State);
 llvm::Argument *ctxArg(MFLAArtifacts &A);
 llvm::Value *ctxBytePtr(llvm::IRBuilder<> &B, llvm::Value *Ctx,
@@ -84,11 +127,6 @@ llvm::Value *ctxBytePtr(llvm::IRBuilder<> &B, llvm::Value *Ctx,
 llvm::Value *ctxBytePtr(llvm::IRBuilder<> &B, MFLAArtifacts &A,
                         uint64_t Offset);
 
-llvm::Value *storagePtr(llvm::IRBuilder<> &B, MFLAArtifacts &A,
-                        StorageRef Ref);
-llvm::Value *storagePtr(llvm::IRBuilder<> &B, MFLAArtifacts &A,
-                        llvm::Value *Ctx, StorageRef Ref);
-FrameRef currentFrame(const FunctionLayout &L);
 FrameRef currentFrame(llvm::IRBuilder<> &B, MFLAArtifacts &A,
                       const FunctionLayout &L);
 FrameRef frameWithToken(const FunctionLayout &L, llvm::Value *Token);
@@ -100,6 +138,26 @@ void storeCurrentFrameToken(llvm::IRBuilder<> &B, MFLAArtifacts &A,
 llvm::Value *loadFrameTop(llvm::IRBuilder<> &B, MFLAArtifacts &A,
                           llvm::StringRef Name = "mfla.frame.top");
 void storeFrameTop(llvm::IRBuilder<> &B, MFLAArtifacts &A, llvm::Value *Top);
+llvm::Value *loadFrameFreeHead(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                               llvm::StringRef Name = "mfla.frame.free.head");
+void storeFrameFreeHead(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                        llvm::Value *Head);
+llvm::Value *loadFramePageTableHead(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                                    llvm::Value *Ctx,
+                                    llvm::StringRef Name = "mfla.frame.pages");
+llvm::Value *loadFramePageTableHead(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                                    llvm::StringRef Name = "mfla.frame.pages");
+void storeFramePageTableHead(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                             llvm::Value *Head);
+llvm::Value *resolveFramePage(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                              llvm::Value *PageIndex);
+llvm::Value *resolveFramePage(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                              llvm::Value *Ctx, llvm::Value *PageIndex);
+llvm::Value *loadFrameFreeNext(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                               llvm::Value *Token,
+                               llvm::StringRef Name = "mfla.frame.free.next");
+void storeFrameFreeNext(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                        llvm::Value *Token, llvm::Value *Next);
 FrameRef pushFrame(llvm::IRBuilder<> &B, MFLAArtifacts &A,
                    const FunctionLayout &L);
 void restoreFrame(llvm::IRBuilder<> &B, MFLAArtifacts &A, llvm::Value *Token);
@@ -122,6 +180,8 @@ void storeFrameSlot(llvm::IRBuilder<> &B, llvm::Value *V, MFLAArtifacts &A,
                     FrameRef Frame, StorageRef Ref);
 void storeFrameSlot(llvm::IRBuilder<> &B, llvm::Value *V, MFLAArtifacts &A,
                     llvm::Value *Ctx, FrameRef Frame, StorageRef Ref);
+void cleanupFrameStorage(llvm::IRBuilder<> &B, MFLAArtifacts &A,
+                         llvm::Value *Ctx);
 uint64_t continuationRecordOffset(MFLAArtifacts &A, ContinuationRecord Rec);
 uint64_t continuationXorOffset(MFLAArtifacts &A, ContinuationRecord Rec);
 uint64_t continuationEdgeOffset(MFLAArtifacts &A, ContinuationRecord Rec);

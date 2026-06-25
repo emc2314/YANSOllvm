@@ -21,6 +21,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Alignment.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
@@ -33,6 +34,16 @@ using namespace yansollvm::mfla;
 
 namespace {
 constexpr StringLiteral PassName = "mfla";
+
+static cl::opt<unsigned> MFLAStaticFramePages(
+    "mfla-static-frame-pages", cl::init(1), cl::Hidden,
+    cl::desc("Preallocated frame pages for the MFLA static page backend"));
+static cl::opt<unsigned> MFLAFramesPerPage(
+    "mfla-frames-per-page", cl::init(16), cl::Hidden,
+    cl::desc("Logical frame records per MFLA frame page"));
+static cl::opt<unsigned> MFLAPageTableBlockEntries(
+    "mfla-page-table-block-entries", cl::init(16), cl::Hidden,
+    cl::desc("Page pointer entries per linked MFLA page-table block"));
 
 struct FramePlan {
   DenseMap<Function *, FunctionLayout> Layouts;
@@ -55,6 +66,10 @@ struct SCCInfo {
   SmallVector<Function *, 4> Members;
   bool Recursive = false;
 };
+
+static Constant *constI64(LLVMContext &Ctx, uint64_t V) {
+  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
+}
 
 static bool hasUnsupportedCallBr(Function &F) {
   for (BasicBlock &BB : F)
@@ -79,22 +94,8 @@ static bool isFrameScalar(Type *Ty) {
   return VTy && isFrameScalar(VTy->getElementType());
 }
 
-static uint64_t alignOffset(uint64_t Offset, Type *Ty, const DataLayout &DL) {
-  return llvm::alignTo(Offset, DL.getABITypeAlign(Ty).value());
-}
-
-static uint64_t slotSize(Type *Ty, const DataLayout &DL) {
-  // MFLA stores values in one byte-addressed frame and independently aligns
-  // each slot. Reserve only the bytes a typed store may overwrite; padding up
-  // to the ABI allocation size can be reused by later suitably-aligned slots.
-  return DL.getTypeStoreSize(Ty).getFixedValue();
-}
-
-static uint64_t reserveSlot(uint64_t &NextOffset, Type *Ty,
-                            const DataLayout &DL) {
-  uint64_t Offset = alignOffset(NextOffset, Ty, DL);
-  NextOffset = Offset + slotSize(Ty, DL);
-  return Offset;
+static uint64_t alignOffset(uint64_t Offset, Align Alignment) {
+  return llvm::alignTo(Offset, Alignment.value());
 }
 
 static bool constantContainsBlockAddress(Constant *C) {
@@ -555,36 +556,226 @@ static DenseSet<Function *> recursiveMembers(ArrayRef<SCCInfo> SCCs) {
   return Recursive;
 }
 
+static void emitTrapBlock(IRBuilder<> &B, Function &F, BasicBlock *InsertBefore,
+                          StringRef OkName, StringRef TrapName,
+                          Value *ShouldTrap,
+                          function_ref<void(BasicBlock *)> AssignOk = nullptr) {
+  LLVMContext &Ctx = F.getContext();
+  BasicBlock *TrapBB = BasicBlock::Create(Ctx, TrapName, &F, InsertBefore);
+  BasicBlock *OkBB = BasicBlock::Create(Ctx, OkName, &F, InsertBefore);
+  if (AssignOk)
+    AssignOk(OkBB);
+  B.CreateCondBr(ShouldTrap, TrapBB, OkBB);
+
+  IRBuilder<> TrapB(TrapBB);
+  Function *Trap = Intrinsic::getOrInsertDeclaration(F.getParent(), Intrinsic::trap);
+  TrapB.CreateCall(Trap);
+  TrapB.CreateUnreachable();
+
+  B.SetInsertPoint(OkBB);
+}
+
+static FunctionCallee getOrInsertNoUnwindFunc(Module &M, StringRef Name,
+                                             FunctionType *FTy) {
+  FunctionCallee Callee = M.getOrInsertFunction(Name, FTy);
+  if (auto *F = dyn_cast<Function>(Callee.getCallee()))
+    F->addFnAttr(Attribute::NoUnwind);
+  return Callee;
+}
+
+static void buildFramePageResolver(Module &M, MFLAArtifacts &A) {
+  if (A.FrameBackend != FramePageBackendKind::Malloc)
+    return;
+
+  LLVMContext &Ctx = M.getContext();
+  Type *I8 = Type::getInt8Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  Type *PtrTy = PointerType::get(Ctx, 0);
+  FunctionType *FTy = FunctionType::get(PtrTy, {PtrTy, I64}, false);
+  Function *F = Function::Create(FTy, GlobalValue::InternalLinkage,
+                                 "__yansollvm_mfla_resolve_frame_page", M);
+  F->addFnAttr(Attribute::NoInline);
+  F->setName("__yansollvm_mfla_resolve_frame_page");
+  A.FramePageResolver = F;
+
+  FunctionType *MallocTy = FunctionType::get(PtrTy, {I64}, false);
+  FunctionCallee Malloc = getOrInsertNoUnwindFunc(M, "malloc", MallocTy);
+  auto emitMalloc = [&](IRBuilder<> &IB, uint64_t Size, Twine Name) -> Value * {
+    return IB.CreateCall(Malloc, {constI64(Ctx, Size)}, Name);
+  };
+
+  Argument *CtxArg = F->getArg(0);
+  Argument *PageIndexArg = F->getArg(1);
+  CtxArg->setName("ctx");
+  PageIndexArg->setName("page.index");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *AllocHeadBB = BasicBlock::Create(Ctx, "alloc.head", F);
+  BasicBlock *WalkBB = BasicBlock::Create(Ctx, "walk", F);
+  BasicBlock *FoundBB = BasicBlock::Create(Ctx, "found.block", F);
+  BasicBlock *AllocNextBB = BasicBlock::Create(Ctx, "alloc.next.block", F);
+  BasicBlock *AdvanceBB = BasicBlock::Create(Ctx, "advance.block", F);
+  BasicBlock *AllocPageBB = BasicBlock::Create(Ctx, "alloc.page", F);
+  BasicBlock *ReturnBB = BasicBlock::Create(Ctx, "return", F);
+
+  IRBuilder<> B(Entry);
+  Value *HeadPtr = ctxBytePtr(B, CtxArg, A.FramePageTableHeadOffset);
+  Value *Head = B.CreateLoad(PtrTy, HeadPtr, "mfla.pages.head");
+  Value *NeedHead = B.CreateICmpEQ(
+      Head, ConstantPointerNull::get(cast<PointerType>(PtrTy)),
+      "mfla.pages.need.head");
+  B.CreateCondBr(NeedHead, AllocHeadBB, WalkBB);
+
+  IRBuilder<> AllocB(AllocHeadBB);
+  Value *HeadBlockPtr = emitMalloc(AllocB, A.PageTableBlockBytes,
+                                  "mfla.page.table.block.ptr");
+  Value *HeadNull = AllocB.CreateICmpEQ(
+      HeadBlockPtr, ConstantPointerNull::get(cast<PointerType>(PtrTy)),
+      "mfla.page.table.block.null");
+  emitTrapBlock(AllocB, *F, WalkBB, "mfla.page.table.block.ok",
+                "mfla.page.table.block.oom", HeadNull);
+  BasicBlock *HeadOkBB = AllocB.GetInsertBlock();
+  AllocB.CreateMemSet(HeadBlockPtr, ConstantInt::get(I8, 0),
+                      A.PageTableBlockBytes, Align(16));
+  AllocB.CreateStore(HeadBlockPtr, HeadPtr);
+  AllocB.CreateBr(WalkBB);
+
+  IRBuilder<> WalkB(WalkBB);
+  PHINode *Block = WalkB.CreatePHI(PtrTy, 3, "mfla.page.table.block");
+  PHINode *BlockIndex = WalkB.CreatePHI(I64, 3, "mfla.page.table.index");
+  Block->addIncoming(Head, Entry);
+  Block->addIncoming(HeadBlockPtr, HeadOkBB);
+  BlockIndex->addIncoming(constI64(Ctx, 0), Entry);
+  BlockIndex->addIncoming(constI64(Ctx, 0), HeadOkBB);
+  Value *TargetBlock = WalkB.CreateUDiv(
+      PageIndexArg, constI64(Ctx, A.PageTableBlockEntries),
+      "mfla.page.table.target");
+  Value *AtBlock = WalkB.CreateICmpEQ(BlockIndex, TargetBlock,
+                                      "mfla.page.table.at.block");
+  WalkB.CreateCondBr(AtBlock, FoundBB, AllocNextBB);
+
+  IRBuilder<> NextB(AllocNextBB);
+  Value *NextPtr = NextB.CreateLoad(PtrTy, Block, "mfla.page.table.next");
+  Value *NeedNext = NextB.CreateICmpEQ(
+      NextPtr, ConstantPointerNull::get(cast<PointerType>(PtrTy)),
+      "mfla.page.table.need.next");
+  BasicBlock *AllocNextRealBB = BasicBlock::Create(Ctx, "alloc.next.real", F);
+  NextB.CreateCondBr(NeedNext, AllocNextRealBB, AdvanceBB);
+
+  IRBuilder<> AllocNextB(AllocNextRealBB);
+  Value *NextBlockPtr = emitMalloc(AllocNextB, A.PageTableBlockBytes,
+                                   "mfla.page.table.next.block.ptr");
+  Value *NextNull = AllocNextB.CreateICmpEQ(
+      NextBlockPtr, ConstantPointerNull::get(cast<PointerType>(PtrTy)),
+      "mfla.page.table.next.block.null");
+  emitTrapBlock(AllocNextB, *F, AdvanceBB, "mfla.page.table.next.block.ok",
+                "mfla.page.table.next.block.oom", NextNull);
+  BasicBlock *NextOkBB = AllocNextB.GetInsertBlock();
+  AllocNextB.CreateMemSet(NextBlockPtr, ConstantInt::get(I8, 0),
+                          A.PageTableBlockBytes, Align(16));
+  AllocNextB.CreateStore(NextBlockPtr, Block);
+  AllocNextB.CreateBr(AdvanceBB);
+
+  IRBuilder<> AdvanceB(AdvanceBB);
+  PHINode *NextBlock = AdvanceB.CreatePHI(PtrTy, 2,
+                                          "mfla.page.table.next.block");
+  NextBlock->addIncoming(NextPtr, AllocNextBB);
+  NextBlock->addIncoming(NextBlockPtr, NextOkBB);
+  Value *NextBlockIndex = AdvanceB.CreateAdd(BlockIndex, constI64(Ctx, 1),
+                                             "mfla.page.table.index.next");
+  AdvanceB.CreateBr(WalkBB);
+  Block->addIncoming(NextBlock, AdvanceBB);
+  BlockIndex->addIncoming(NextBlockIndex, AdvanceBB);
+
+  IRBuilder<> SlotB(FoundBB);
+  Value *Slot = SlotB.CreateURem(PageIndexArg,
+                                 constI64(Ctx, A.PageTableBlockEntries),
+                                 "mfla.page.table.slot");
+  Value *SlotByteOff = SlotB.CreateAdd(
+      constI64(Ctx, 8),
+      SlotB.CreateMul(Slot, constI64(Ctx, M.getDataLayout().getPointerSize()),
+                      "mfla.page.table.slot.off"));
+  Value *SlotPtr = SlotB.CreateInBoundsGEP(I8, Block, SlotByteOff,
+                                           "mfla.page.ptr.slot");
+  Value *Page = SlotB.CreateLoad(PtrTy, SlotPtr, "mfla.page.ptr");
+  Value *NeedPage = SlotB.CreateICmpEQ(
+      Page, ConstantPointerNull::get(cast<PointerType>(PtrTy)),
+      "mfla.page.need");
+  SlotB.CreateCondBr(NeedPage, AllocPageBB, ReturnBB);
+
+  IRBuilder<> AllocPageB(AllocPageBB);
+  Value *NewPage = emitMalloc(AllocPageB, A.FramePageSize,
+                              "mfla.frame.page.new");
+  Value *PageNull = AllocPageB.CreateICmpEQ(
+      NewPage, ConstantPointerNull::get(cast<PointerType>(PtrTy)),
+      "mfla.frame.page.null");
+  emitTrapBlock(AllocPageB, *F, ReturnBB, "mfla.frame.page.ok",
+                "mfla.frame.page.oom", PageNull);
+  BasicBlock *PageOkBB = AllocPageB.GetInsertBlock();
+  AllocPageB.CreateStore(NewPage, SlotPtr);
+  AllocPageB.CreateBr(ReturnBB);
+
+  IRBuilder<> ReturnB(ReturnBB);
+  PHINode *Result = ReturnB.CreatePHI(PtrTy, 2, "mfla.frame.page.result");
+  Result->addIncoming(Page, FoundBB);
+  Result->addIncoming(NewPage, PageOkBB);
+  ReturnB.CreateRet(Result);
+}
+
+static bool isEffectivelyNoUnwind(CallBase &CB) {
+  if (!CB.mayThrow())
+    return true;
+  if (Function *Callee = CB.getCalledFunction()) {
+    if (Callee->hasFnAttribute(Attribute::NoUnwind))
+      return true;
+    StringRef Name = Callee->getName();
+    if (Name == "malloc" || Name == "free")
+      return true;
+  }
+  return false;
+}
+
 static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
-                                     unsigned NumFunctions,
-                                     bool EnableDynamicFrames) {
+                                     unsigned NumFunctions) {
   LLVMContext &Ctx = M.getContext();
   const DataLayout &DL = M.getDataLayout();
   MFLAArtifacts A;
 
-  auto *I8 = Type::getInt8Ty(Ctx);
   auto *I64 = Type::getInt64Ty(Ctx);
-  uint64_t NextOffset = 0;
-  A.FrameOffset = alignOffset(NextOffset, I8, DL);
-  NextOffset = A.FrameOffset + FrameSize;
-  A.CurrentFrameOffset = alignOffset(NextOffset, I64, DL);
-  NextOffset = A.CurrentFrameOffset + slotSize(I64, DL);
-  A.FrameTopOffset = alignOffset(NextOffset, I64, DL);
-  NextOffset = A.FrameTopOffset + slotSize(I64, DL);
-  A.FrameStride = std::max<uint64_t>(16, llvm::alignTo(FrameSize, 16));
-  A.MaxFrames = EnableDynamicFrames ? 128 : 1;
-  A.FrameArenaOffset = alignOffset(NextOffset, I8, DL);
-  NextOffset = A.FrameArenaOffset + A.FrameStride * A.MaxFrames;
-  A.ContinuationOffset = alignOffset(NextOffset, I64, DL);
+  FrameLayoutBuilder CtxLayout(DL);
+  A.CurrentFrameOffset =
+      CtxLayout.reserve(StorageKind::FrameMetadata, I64).Offset;
+  A.FrameTopOffset =
+      CtxLayout.reserve(StorageKind::FrameMetadata, I64).Offset;
+  A.FrameStride = std::max<uint64_t>(
+      16, llvm::alignTo(FrameSize + FrameMetadataBytes, 16));
+  A.FrameBackend = FramePageBackendKind::Malloc;
+  A.StaticFramePages = std::max<unsigned>(1, MFLAStaticFramePages);
+  A.FramesPerPage = std::max<unsigned>(1, MFLAFramesPerPage);
   A.ContinuationStride = 24;
   A.ContinuationSlots = std::max<uint64_t>(1, NumFunctions);
-  NextOffset = A.ContinuationOffset +
-               A.ContinuationStride * A.ContinuationSlots * A.MaxFrames;
-  A.ReturnedFrameOffset = alignOffset(NextOffset, I64, DL);
-  NextOffset = A.ReturnedFrameOffset + slotSize(I64, DL);
-  A.StateOffset = alignOffset(NextOffset, I64, DL);
-  NextOffset = A.StateOffset + slotSize(I64, DL);
-  A.CtxSize = std::max<uint64_t>(1, llvm::alignTo(NextOffset, 16));
+  uint64_t ContinuationBytes = A.ContinuationStride * A.ContinuationSlots;
+  A.PageTableBlockEntries = std::max<unsigned>(1, MFLAPageTableBlockEntries);
+  A.PageTableBlockBytes =
+      8 + A.PageTableBlockEntries * DL.getPointerSize();
+  A.FrameFreeHeadOffset = CtxLayout.reserve(StorageKind::FrameMetadata, I64).Offset;
+  A.FramePageTableHeadOffset =
+      CtxLayout.reserve(StorageKind::PageTableMetadata,
+                        PointerType::get(Ctx, 0)).Offset;
+  A.FrameArenaOffset = CtxLayout.frameSize();
+  A.ContinuationOffset = alignOffset(A.FrameStride * A.FramesPerPage, Align(16));
+  A.FramePageSize =
+      llvm::alignTo(A.ContinuationOffset + ContinuationBytes * A.FramesPerPage,
+                    16);
+  if (A.FrameBackend == FramePageBackendKind::Static)
+    CtxLayout.NextOffset =
+        A.FrameArenaOffset + A.FramePageSize * A.StaticFramePages;
+  else
+    CtxLayout.NextOffset = A.FrameArenaOffset;
+  A.ReturnedFrameOffset =
+      CtxLayout.reserve(StorageKind::FrameMetadata, I64).Offset;
+  A.StateOffset = CtxLayout.reserve(StorageKind::FrameMetadata, I64).Offset;
+  A.CtxSize = CtxLayout.frameSize();
 
   YansoRNG SaltRNG(yanso_hash_string("state-key-salt",
                                       yanso_module_seed(M, PassName)));
@@ -598,6 +789,7 @@ static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
   A.Mega = Function::Create(FTy, GlobalValue::InternalLinkage,
                             "__yansollvm_mfla_main", M);
   A.Mega->addFnAttr(Attribute::NoInline);
+  buildFramePageResolver(M, A);
   return A;
 }
 
@@ -827,10 +1019,6 @@ static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
   return Mapped;
 }
 
-static Constant *constI64(LLVMContext &Ctx, uint64_t V) {
-  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
-}
-
 static Value *keyForState(IRBuilder<> &B, MFLAArtifacts &A, Value *State) {
   return yanso_create_mix64_ir(State, constI64(A.Mega->getContext(), A.StateKeySalt),
                               B.GetInsertBlock(), *A.Mega->getParent());
@@ -976,23 +1164,6 @@ static bool functionsInterfere(Function *A, Function *B,
   return reachesFunction(A, B, Graph) || reachesFunction(B, A, Graph);
 }
 
-static void addBaseToRef(StorageRef &Ref, uint64_t Base) { Ref.Offset += Base; }
-
-static void addBaseToLayout(FunctionLayout &L, uint64_t Base) {
-  for (StorageRef &Ref : L.ArgOffsets)
-    addBaseToRef(Ref, Base);
-  for (auto &Entry : L.ArgOffsetFor)
-    addBaseToRef(Entry.second, Base);
-  if (L.RetOffset.Ty)
-    addBaseToRef(L.RetOffset, Base);
-  for (auto &Entry : L.PhiOffsets)
-    addBaseToRef(Entry.second, Base);
-  for (auto &Entry : L.CallResultOffsets)
-    addBaseToRef(Entry.second, Base);
-  for (auto &Entry : L.SpilledValueOffsets)
-    addBaseToRef(Entry.second, Base);
-}
-
 enum class CallDomain {
   InternalEnter,
   NativeOperation,
@@ -1086,36 +1257,30 @@ makeFramePlan(ArrayRef<Function *> Candidates,
     FunctionLayout L;
     L.ContSlot = {I};
     L.Owner = F;
-    uint64_t NextOffset = 0;
+    FrameLayoutBuilder Builder(DL);
     for (Argument &Arg : F->args()) {
-      uint64_t Offset = reserveSlot(NextOffset, Arg.getType(), DL);
-      StorageRef Ref = staticRef(Arg.getType(), Offset);
+      StorageRef Ref = Builder.reserve(StorageKind::Argument, Arg.getType());
       L.ArgOffsets.push_back(Ref);
       L.ArgOffsetFor[&Arg] = Ref;
     }
-    if (!F->getReturnType()->isVoidTy()) {
-      uint64_t Offset = reserveSlot(NextOffset, F->getReturnType(), DL);
-      L.RetOffset = staticRef(F->getReturnType(), Offset);
-    }
+    if (!F->getReturnType()->isVoidTy())
+      L.RetOffset = Builder.reserve(StorageKind::ReturnValue, F->getReturnType());
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
         if (auto *AI = dyn_cast<AllocaInst>(&I)) {
           TypeSize Size = DL.getTypeAllocSize(AI->getAllocatedType());
           if (Size.isScalable())
             continue;
-          Align Alignment = std::max(AI->getAlign(), DL.getABITypeAlign(AI->getAllocatedType()));
-          uint64_t Offset = llvm::alignTo(NextOffset, Alignment.value());
-          NextOffset = Offset + Size.getFixedValue();
-          L.SpilledValueOffsets[AI] = staticRef(AI->getType(), Offset);
+          L.SpilledValueOffsets[AI] = Builder.reserveFixedObject(
+              AI->getType(), AI->getAllocatedType(), AI->getAlign());
           continue;
         }
         if (auto *Call = dyn_cast<CallInst>(&I)) {
           if (!Call->getType()->isVoidTy()) {
             Type *ResultTy = Call->getType();
-            if (isFrameScalar(ResultTy)) {
-              uint64_t Offset = reserveSlot(NextOffset, ResultTy, DL);
-              L.CallResultOffsets[Call] = staticRef(ResultTy, Offset);
-            }
+            if (isFrameScalar(ResultTy))
+              L.CallResultOffsets[Call] =
+                  Builder.reserve(StorageKind::CallResult, ResultTy);
             continue;
           }
         }
@@ -1130,21 +1295,18 @@ makeFramePlan(ArrayRef<Function *> Candidates,
         }
         auto *Phi = dyn_cast<PHINode>(&I);
         if (Phi) {
-          uint64_t Offset = reserveSlot(NextOffset, Phi->getType(), DL);
-          L.PhiOffsets[Phi] = staticRef(Phi->getType(), Offset);
+          L.PhiOffsets[Phi] = Builder.reserve(StorageKind::Phi, Phi->getType());
           continue;
         }
-        if (!I.getType()->isVoidTy()) {
-          uint64_t Offset = reserveSlot(NextOffset, I.getType(), DL);
-          L.SpilledValueOffsets[&I] = staticRef(I.getType(), Offset);
-        }
+        if (!I.getType()->isVoidTy())
+          L.SpilledValueOffsets[&I] = Builder.reserve(StorageKind::Spill, I.getType());
       }
     }
 
     StaticLocalPlan Local;
     Local.F = F;
     Local.Layout = std::move(L);
-    Local.LocalSize = std::max<uint64_t>(1, llvm::alignTo(NextOffset, 16));
+    Local.LocalSize = Builder.frameSize();
     Locals.push_back(std::move(Local));
   }
 
@@ -1344,39 +1506,36 @@ static bool lowerSelfTailEnter(CallInst *Call, IRBuilder<> &B,
 
 static void emitFrameOverflowGuard(IRBuilder<> &B, LoweringContext &LCtx) {
   MFLAArtifacts &A = LCtx.Artifacts;
-  if (A.MaxFrames <= 1)
+  if (A.FrameBackend != FramePageBackendKind::Static)
     return;
 
   LLVMContext &Ctx = LCtx.Mega.getContext();
+  Value *FreeHead = loadFrameFreeHead(B, A, "mfla.frame.guard.free");
+  Value *HasFree = B.CreateICmpNE(FreeHead, constI64(Ctx, 0),
+                                  "mfla.frame.guard.has.free");
   Value *Token = loadFrameTop(B, A, "mfla.frame.guard.top");
-  Value *TooDeep =
-      B.CreateICmpUGE(Token, constI64(Ctx, A.MaxFrames), "mfla.frame.too.deep");
-  BasicBlock *Overflow = BasicBlock::Create(Ctx, "mfla.frame.overflow",
-                                            &LCtx.Mega, LCtx.Exit);
-  BasicBlock *Ok = BasicBlock::Create(Ctx, "mfla.frame.push.ok",
-                                      &LCtx.Mega, LCtx.Exit);
-  LCtx.StateAlloc.assign(Ok, LCtx.StateFor);
-  B.CreateCondBr(TooDeep, Overflow, Ok);
-
-  IRBuilder<> TrapB(Overflow);
-  Function *Trap = Intrinsic::getOrInsertDeclaration(LCtx.Mega.getParent(),
-                                                     Intrinsic::trap);
-  TrapB.CreateCall(Trap);
-  TrapB.CreateUnreachable();
-
-  B.SetInsertPoint(Ok);
+  Value *Capacity = constI64(Ctx, A.StaticFramePages * A.FramesPerPage);
+  Value *AtCapacity =
+      B.CreateICmpUGE(Token, Capacity, "mfla.frame.at.cap");
+  Value *TooDeep = B.CreateAnd(B.CreateNot(HasFree), AtCapacity,
+                               "mfla.frame.too.deep");
+  emitTrapBlock(B, LCtx.Mega, LCtx.Exit, "mfla.frame.push.ok",
+                "mfla.frame.overflow", TooDeep,
+                [&](BasicBlock *Ok) { LCtx.StateAlloc.assign(Ok, LCtx.StateFor); });
 }
 
 static void releaseReturnedFrame(IRBuilder<> &B, MFLAArtifacts &A,
                                  Value *ReturnedToken, Value *CallerFrame) {
-  if (A.MaxFrames <= 1)
-    return;
-  Value *OldTop = loadFrameTop(B, A, "mfla.frame.top.old");
   Value *DidPushFrame =
       B.CreateICmpNE(ReturnedToken, CallerFrame, "mfla.frame.did.push");
-  storeFrameTop(B, A,
-                B.CreateSelect(DidPushFrame, ReturnedToken, OldTop,
-                               "mfla.frame.top.next"));
+  Value *OldFreeHead = loadFrameFreeHead(B, A, "mfla.frame.free.old");
+  Value *FreeNext = B.CreateSelect(DidPushFrame, OldFreeHead,
+                                   constI64(B.getContext(), 0),
+                                   "mfla.frame.release.next");
+  storeFrameFreeNext(B, A, ReturnedToken, FreeNext);
+  storeFrameFreeHead(B, A,
+                     B.CreateSelect(DidPushFrame, ReturnedToken, OldFreeHead,
+                                    "mfla.frame.free.new"));
 }
 
 static PushedContinuation pushContinuation(
@@ -1725,10 +1884,7 @@ static bool lowerInternalEnter(CallInst *Call, IRBuilder<> &B,
     emitFrameOverflowGuard(B, LCtx);
   FrameRef CalleeFrame = usesDynamicFrame(Plan)
                              ? pushFrame(B, LCtx.Artifacts, CalleeLayout)
-                             : (LCtx.Artifacts.MaxFrames > 1
-                                    ? frameWithToken(CalleeLayout,
-                                                     CallerFrame.Token)
-                                    : currentFrame(CalleeLayout));
+                             : frameWithToken(CalleeLayout, CallerFrame.Token);
   unsigned ArgNo = 0;
   for (Value *Arg : Call->args()) {
     Value *MappedArg =
@@ -1760,9 +1916,8 @@ static bool lowerInternalEnter(CallInst *Call, IRBuilder<> &B,
   TerminatorBlockFor[&OldBB] = Pushed.ResumeBlock;
   LocalMap.clear();
   CurrentFrame = currentFrame(B, LCtx.Artifacts, CallerLayout);
-  if (LCtx.Artifacts.MaxFrames > 1)
-    CalleeFrame = frameWithToken(CalleeLayout,
-                                 loadReturnedFrameToken(B, LCtx.Artifacts));
+  CalleeFrame = frameWithToken(CalleeLayout,
+                               loadReturnedFrameToken(B, LCtx.Artifacts));
   if (Pushed.Record.HasResultSlot) {
     Value *RetVal = loadFrameSlot(B, Call->getType(), LCtx.Artifacts,
                                   CalleeFrame, CalleeLayout.RetOffset,
@@ -1849,9 +2004,6 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   storeState(EntryB, A, EntryState);
   Value *Target = encodedTarget(EntryB, Mega, Anchor, EntryEdge,
                                 keyForState(EntryB, A, EntryState));
-  storeCurrentFrameToken(EntryB, A, constI64(Ctx, 0));
-  storeFrameTop(EntryB, A, constI64(Ctx, 1));
-  storeReturnedFrameToken(EntryB, A, constI64(Ctx, 0));
   auto *IB = IndirectBrInst::Create(Target, EntryRegions.size(), Entry);
   for (BasicBlock *R : EntryRegions)
     IB->addDestination(R);
@@ -1970,7 +2122,7 @@ static void markNoUnwindIfNoThrowingCalls(Function &F) {
   for (BasicBlock &BB : F)
     for (Instruction &I : BB)
       if (auto *CB = dyn_cast<CallBase>(&I))
-        if (CB->mayThrow())
+        if (!isEffectivelyNoUnwind(*CB))
           return;
   F.addFnAttr(Attribute::NoUnwind);
 }
@@ -2014,18 +2166,29 @@ static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
   Value *CtxPtr = B.CreateInBoundsGEP(
       CtxTy, CtxStorage, {constI64(Ctx, 0), constI64(Ctx, 0)}, "mfla.ctx.ptr");
 
+  B.CreateStore(constI64(Ctx, 0), ctxBytePtr(B, CtxPtr, A.CurrentFrameOffset));
+  B.CreateStore(constI64(Ctx, 1), ctxBytePtr(B, CtxPtr, A.FrameTopOffset));
+  B.CreateStore(constI64(Ctx, 0), ctxBytePtr(B, CtxPtr, A.FrameFreeHeadOffset));
+  B.CreateStore(ConstantPointerNull::get(PointerType::get(Ctx, 0)),
+                ctxBytePtr(B, CtxPtr, A.FramePageTableHeadOffset));
+  B.CreateStore(constI64(Ctx, 0), ctxBytePtr(B, CtxPtr, A.ReturnedFrameOffset));
+
   FrameRef CurFrame = rootFrame(L, Ctx);
   for (unsigned I = 0, E = Args.size(); I != E; ++I)
     storeFrameSlot(B, Args[I], A, CtxPtr, CurFrame, L.ArgOffsets[I]);
-  initializeContinuation(B, A, CtxPtr, continuationRecord(L));
+  initializeContinuation(B, A, CtxPtr, continuationRecord(L, CurFrame));
   Value *EntryEdgeValue =
       B.CreateLoad(Type::getInt64Ty(Ctx), EntryEdge, "mfla.entry.edge");
   B.CreateCall(A.Mega, {CtxPtr, constI64(Ctx, EntryState), EntryEdgeValue});
-  if (F.getReturnType()->isVoidTy())
+  if (F.getReturnType()->isVoidTy()) {
+    cleanupFrameStorage(B, A, CtxPtr);
     B.CreateRetVoid();
-  else
-    B.CreateRet(
-        loadFrameSlot(B, F.getReturnType(), A, CtxPtr, CurFrame, L.RetOffset, ""));
+  } else {
+    Value *RetVal =
+        loadFrameSlot(B, F.getReturnType(), A, CtxPtr, CurFrame, L.RetOffset, "");
+    cleanupFrameStorage(B, A, CtxPtr);
+    B.CreateRet(RetVal);
+  }
 }
 } // namespace
 
@@ -2105,14 +2268,13 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
                                  CandidateGraph, RecursiveMembers,
                                  M.getDataLayout());
 
-  bool EnableDynamicFrames = !RecursiveMembers.empty();
-  MFLAArtifacts Artifacts = createArtifacts(M, Plan.FrameSize, Candidates.size(),
-                                            EnableDynamicFrames);
+  MFLAArtifacts Artifacts = createArtifacts(M, Plan.FrameSize, Candidates.size());
   if (!buildStructuralMega(Artifacts, Candidates, Plan.Layouts, CandidateIDs,
                            CallsitePlans)) {
     Artifacts.eraseFromParent();
     return PreservedAnalyses::none();
   }
+  markNoUnwindIfNoThrowingCalls(*Artifacts.FramePageResolver);
   markNoUnwindIfNoThrowingCalls(*Artifacts.Mega);
 
   commitModuleBlockAddressGlobals(Artifacts);
