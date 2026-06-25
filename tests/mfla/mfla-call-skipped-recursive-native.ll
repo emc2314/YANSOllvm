@@ -1,13 +1,12 @@
-; RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %s -o %t.out.ll 2>&1 | %FileCheck %s
+; RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %s -o %t.out.ll
 ; RUN: grep '__yansollvm_mfla_main' %t.out.ll
 ; RUN: grep 'call i32 @rec' %t.out.ll
 ; RUN: grep 'call void @__yansollvm_mfla_main' %t.out.ll
+; RUN: %not grep 'recursive SCC not supported' %t.out.ll
 
-; CHECK: yansollvm: warning: mfla: skip function 'rec': recursive SCC not supported
-
-; A recursive callee is skipped. A non-recursive caller that invokes it should
-; still be transformable: the call to @rec must remain a native call in the
-; cloned mega body rather than being treated as an internal CPS-lowered call.
+; Recursive callees are transformable now. A caller that invokes one should
+; still be transformable; recursive calls are left as native wrapper calls in the
+; cloned mega body rather than being CPS-lowered through singleton ret-cont slots.
 
 define internal i32 @rec(i32 %x) nounwind {
 entry:

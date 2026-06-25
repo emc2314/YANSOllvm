@@ -1,5 +1,6 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %s -o %t.out.ll
-; RUN: grep '@__yansollvm_mfla_frame = internal global \[96 x i8\]' %t.out.ll
+; RUN: %not grep '@__yansollvm_mfla_frame = internal global' %t.out.ll
+; RUN: grep 'alloca \[.* x i8\], align 16' %t.out.ll
 ; RUN: grep '__yansollvm_mfla_main' %t.out.ll
 
 ; A may call B or C, but B and C cannot be active at the same time.

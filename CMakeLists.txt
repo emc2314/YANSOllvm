@@ -35,6 +35,7 @@ add_llvm_pass_plugin(yansollvm
   lib/Transforms/Obfuscate/YMBA.cpp
   lib/Transforms/Obfuscate/VMPass.cpp
   lib/Transforms/Obfuscate/MergePass.cpp
+  lib/Transforms/Obfuscate/MFLAStorage.cpp
   lib/Transforms/Obfuscate/MFLAPass.cpp
   lib/Transforms/Obfuscate/Func2ModPass.cpp
   lib/Transforms/Obfuscate/BB2FuncPass.cpp

@@ -1,5 +1,6 @@
 #include "MFLAPass.h"
 #include "CryptoUtils.h"
+#include "MFLAInternal.h"
 #include "Utils.h"
 #include "YANSOllvmCommon.h"
 #include "YANSOllvmSeed.h"
@@ -21,80 +22,15 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include <cassert>
 #include <unordered_set>
 #include <vector>
 
 using namespace llvm;
+using namespace yansollvm::mfla;
 
 namespace {
 constexpr StringLiteral PassName = "mfla";
-
-struct StorageRef {
-  Type *Ty = nullptr;
-  uint64_t Offset = 0;
-};
-
-static StorageRef staticRef(Type *Ty, uint64_t Offset) { return {Ty, Offset}; }
-
-struct MFLAArtifacts {
-  Function *Mega = nullptr;
-  GlobalVariable *Frame = nullptr;
-  GlobalVariable *RetContXor = nullptr;
-  GlobalVariable *RetContEdge = nullptr;
-  GlobalVariable *State = nullptr;
-  uint64_t StateKeySalt = 0;
-  DenseMap<Function *, uint64_t> EntryStateForFunction;
-  DenseMap<Function *, GlobalVariable *> EntryEdgeForFunction;
-  DenseMap<GlobalVariable *, GlobalVariable *> GlobalRemaps;
-  SmallVector<GlobalVariable *, 8> EdgeConstants;
-  SmallVector<GlobalVariable *, 8> RemappedGlobals;
-
-  void eraseFromParent() {
-    if (Mega) {
-      Mega->eraseFromParent();
-      Mega = nullptr;
-    }
-    for (GlobalVariable *GV : reverse(EdgeConstants)) {
-      if (GV)
-        GV->eraseFromParent();
-    }
-    EdgeConstants.clear();
-    for (GlobalVariable *GV : reverse(RemappedGlobals)) {
-      if (GV)
-        GV->eraseFromParent();
-    }
-    RemappedGlobals.clear();
-    if (State) {
-      State->eraseFromParent();
-      State = nullptr;
-    }
-    if (RetContEdge) {
-      RetContEdge->eraseFromParent();
-      RetContEdge = nullptr;
-    }
-    GlobalRemaps.clear();
-    EntryEdgeForFunction.clear();
-    if (Frame) {
-      Frame->eraseFromParent();
-      Frame = nullptr;
-    }
-    if (RetContXor) {
-      RetContXor->eraseFromParent();
-      RetContXor = nullptr;
-    }
-  }
-};
-
-struct FunctionLayout {
-  unsigned ContinuationSlotID = 0;
-  Function *Owner = nullptr;
-  SmallVector<StorageRef, 4> ArgOffsets;
-  DenseMap<Argument *, StorageRef> ArgOffsetFor;
-  StorageRef RetOffset;
-  DenseMap<PHINode *, StorageRef> PhiOffsets;
-  DenseMap<CallInst *, StorageRef> CallResultOffsets;
-  DenseMap<Instruction *, StorageRef> SpilledValueOffsets;
-};
 
 struct FramePlan {
   DenseMap<Function *, FunctionLayout> Layouts;
@@ -483,8 +419,7 @@ static bool supportsCurrentLowering(
                                        "scalar internal call results");
               return false;
             }
-            if (Call->mayThrow() &&
-                !Callee->hasFnAttribute(Attribute::NoUnwind) &&
+            if (Call->mayThrow() && !Callee->hasFnAttribute(Attribute::NoUnwind) &&
                 !F.hasFnAttribute(Attribute::NoUnwind)) {
               YANSO_WARN_SKIP_FUNCTION(
                   PassName, F,
@@ -612,65 +547,34 @@ static DenseSet<Function *> recursiveMembers(ArrayRef<SCCInfo> SCCs) {
 static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
                                      unsigned NumFunctions) {
   LLVMContext &Ctx = M.getContext();
+  const DataLayout &DL = M.getDataLayout();
   MFLAArtifacts A;
 
   auto *I8 = Type::getInt8Ty(Ctx);
   auto *I64 = Type::getInt64Ty(Ctx);
-  auto *FrameTy = ArrayType::get(I8, FrameSize);
-  auto *RetContTy = ArrayType::get(I64, NumFunctions);
+  uint64_t NextOffset = 0;
+  A.FrameOffset = alignOffset(NextOffset, I8, DL);
+  NextOffset = A.FrameOffset + FrameSize;
+  A.ContinuationOffset = alignOffset(NextOffset, I64, DL);
+  A.ContinuationStride = 2 * slotSize(I64, DL);
+  NextOffset = A.ContinuationOffset + NumFunctions * A.ContinuationStride;
+  A.StateOffset = alignOffset(NextOffset, I64, DL);
+  NextOffset = A.StateOffset + slotSize(I64, DL);
+  A.CtxSize = std::max<uint64_t>(1, llvm::alignTo(NextOffset, 16));
 
-  A.Frame = new GlobalVariable(M, FrameTy, false, GlobalValue::InternalLinkage,
-                               Constant::getNullValue(FrameTy),
-                               "__yansollvm_mfla_frame");
-  A.Frame->setAlignment(Align(16));
-
-  A.RetContXor = new GlobalVariable(
-      M, RetContTy, false, GlobalValue::InternalLinkage,
-      Constant::getNullValue(RetContTy), "__yansollvm_mfla_ret_cont_xor");
-  A.RetContXor->setAlignment(Align(8));
-
-  A.RetContEdge = new GlobalVariable(
-      M, RetContTy, false, GlobalValue::InternalLinkage,
-      Constant::getNullValue(RetContTy), "__yansollvm_mfla_ret_cont_edge");
-  A.RetContEdge->setAlignment(Align(8));
-
-  A.State = new GlobalVariable(M, I64, false, GlobalValue::InternalLinkage,
-                               Constant::getNullValue(I64),
-                               "__yansollvm_mfla_state");
-  A.State->setAlignment(Align(8));
   YansoRNG SaltRNG(yanso_hash_string("state-key-salt",
                                       yanso_module_seed(M, PassName)));
   do {
     A.StateKeySalt = SaltRNG.next64();
   } while (!A.StateKeySalt);
 
-  FunctionType *FTy = FunctionType::get(Type::getVoidTy(Ctx), {I64, I64}, false);
+  FunctionType *FTy = FunctionType::get(Type::getVoidTy(Ctx),
+                                        {PointerType::get(Ctx, 0), I64, I64},
+                                        false);
   A.Mega = Function::Create(FTy, GlobalValue::InternalLinkage,
                             "__yansollvm_mfla_main", M);
   A.Mega->addFnAttr(Attribute::NoInline);
   return A;
-}
-
-static Value *framePtr(IRBuilder<> &B, GlobalVariable *Frame, uint64_t Offset) {
-  auto *FrameTy = cast<ArrayType>(Frame->getValueType());
-  LLVMContext &Ctx = Frame->getContext();
-  Value *Zero = ConstantInt::get(Type::getInt64Ty(Ctx), 0);
-  Value *Off = ConstantInt::get(Type::getInt64Ty(Ctx), Offset);
-  return B.CreateInBoundsGEP(FrameTy, Frame, {Zero, Off});
-}
-
-static Value *storagePtr(IRBuilder<> &B, MFLAArtifacts &A, StorageRef Ref) {
-  return framePtr(B, A.Frame, Ref.Offset);
-}
-
-static LoadInst *loadSlot(IRBuilder<> &B, Type *Ty, GlobalVariable *Frame,
-                          uint64_t Offset, StringRef Name = "") {
-  return B.CreateLoad(Ty, framePtr(B, Frame, Offset), Name);
-}
-
-static LoadInst *loadSlot(IRBuilder<> &B, Type *Ty, MFLAArtifacts &A,
-                          StorageRef Ref, StringRef Name = "") {
-  return B.CreateLoad(Ty, storagePtr(B, A, Ref), Name);
 }
 
 static Constant *remapConstantWithBlockAddressMapper(
@@ -876,31 +780,8 @@ static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
   return MapValue(V, VMap, RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
 }
 
-static void storeSlot(IRBuilder<> &B, Value *V, GlobalVariable *Frame,
-                      uint64_t Offset) {
-  B.CreateStore(V, framePtr(B, Frame, Offset));
-}
-
-static void storeSlot(IRBuilder<> &B, Value *V, MFLAArtifacts &A,
-                      StorageRef Ref) {
-  B.CreateStore(V, storagePtr(B, A, Ref));
-}
-
-static Value *retContPtr(IRBuilder<> &B, GlobalVariable *RetCont,
-                         unsigned ContinuationSlotID) {
-  auto *ContTy = cast<ArrayType>(RetCont->getValueType());
-  Value *Zero = ConstantInt::get(Type::getInt32Ty(RetCont->getContext()), 0);
-  Value *Index = ConstantInt::get(Type::getInt32Ty(RetCont->getContext()), ContinuationSlotID);
-  return B.CreateInBoundsGEP(ContTy, RetCont, {Zero, Index});
-}
-
-
 static Constant *constI64(LLVMContext &Ctx, uint64_t V) {
   return ConstantInt::get(Type::getInt64Ty(Ctx), V);
-}
-
-static Constant *keyForState(MFLAArtifacts &A, uint64_t State) {
-  return constI64(A.Mega->getContext(), yanso_mix64(State, A.StateKeySalt));
 }
 
 static Value *keyForState(IRBuilder<> &B, MFLAArtifacts &A, Value *State) {
@@ -919,15 +800,6 @@ static Constant *blockDeltaPlusKey(Function &Mega, BasicBlock *Anchor,
 static Constant *blockDeltaPlusKey(MFLAArtifacts &A, BasicBlock *Anchor,
                                    BasicBlock *Target, uint64_t State) {
   return blockDeltaPlusKey(*A.Mega, Anchor, Target, keyForState(A, State));
-}
-
-static Value *loadState(IRBuilder<> &B, MFLAArtifacts &A,
-                        StringRef Name = "mfla.state") {
-  return B.CreateLoad(Type::getInt64Ty(A.Mega->getContext()), A.State, Name);
-}
-
-static void storeState(IRBuilder<> &B, MFLAArtifacts &A, Value *State) {
-  B.CreateStore(State, A.State);
 }
 
 static Value *transitionState(IRBuilder<> &B, Value *CurState,
@@ -1074,16 +946,81 @@ static void addBaseToLayout(FunctionLayout &L, uint64_t Base) {
     addBaseToRef(Entry.second, Base);
 }
 
-static bool
-isCPSLoweredCall(CallInst *Call,
-                 const DenseMap<Function *, unsigned> &CandidateIDs) {
+enum class CallDomain {
+  InternalEnter,
+  NativeOperation,
+};
+
+enum class ContinuationPolicy {
+  PushContinuation,
+  TailReuse,
+};
+
+struct CallsitePlan {
+  CallDomain Domain = CallDomain::NativeOperation;
+  ContinuationPolicy ContPolicy = ContinuationPolicy::PushContinuation;
+  Function *Callee = nullptr;
+};
+
+static bool isTailReturnCall(CallInst *Call) {
+  if (!Call || (!Call->isMustTailCall() && !Call->isTailCall()))
+    return false;
+  auto *Ret = dyn_cast<ReturnInst>(Call->getParent()->getTerminator());
+  return Ret && Ret->getReturnValue() == Call;
+}
+
+static CallsitePlan planCallsite(CallInst *Call, Function *Caller,
+                                 const DenseMap<Function *, unsigned> &CandidateIDs,
+                                 const DenseSet<Function *> &RecursiveMembers) {
   Function *Callee = directCalledFunction(Call);
-  return Callee && CandidateIDs.count(Callee);
+  if (!Callee || !CandidateIDs.count(Callee))
+    return {};
+
+  bool SelfTail = Caller && Callee == Caller && isTailReturnCall(Call);
+  CallsitePlan Plan;
+  Plan.Domain = (!RecursiveMembers.count(Callee) || SelfTail)
+                    ? CallDomain::InternalEnter
+                    : CallDomain::NativeOperation;
+  Plan.Callee = Callee;
+  if (SelfTail)
+    Plan.ContPolicy = ContinuationPolicy::TailReuse;
+  return Plan;
+}
+
+static bool isInternalEnter(const CallsitePlan &Plan) {
+  return Plan.Domain == CallDomain::InternalEnter && Plan.Callee;
+}
+
+static DenseMap<CallInst *, CallsitePlan>
+makeCallsitePlans(ArrayRef<Function *> Candidates,
+                  const DenseMap<Function *, unsigned> &CandidateIDs,
+                  const DenseSet<Function *> &RecursiveMembers) {
+  DenseMap<CallInst *, CallsitePlan> Plans;
+  for (Function *F : Candidates)
+    for (BasicBlock &BB : *F)
+      for (Instruction &I : BB)
+        if (auto *Call = dyn_cast<CallInst>(&I))
+          Plans[Call] = planCallsite(Call, F, CandidateIDs, RecursiveMembers);
+  return Plans;
+}
+
+static bool isInternalEnterCall(
+    CallInst *Call, const DenseMap<CallInst *, CallsitePlan> &CallsitePlans) {
+  auto It = CallsitePlans.find(Call);
+  return It != CallsitePlans.end() && isInternalEnter(It->second);
+}
+
+static bool isPushContinuationInternalCall(
+    CallInst *Call, const DenseMap<CallInst *, CallsitePlan> &CallsitePlans) {
+  auto It = CallsitePlans.find(Call);
+  return It != CallsitePlans.end() && isInternalEnter(It->second) &&
+         It->second.ContPolicy == ContinuationPolicy::PushContinuation;
 }
 
 static FramePlan
 makeFramePlan(ArrayRef<Function *> Candidates,
               const DenseMap<Function *, unsigned> &CandidateIDs,
+              const DenseMap<CallInst *, CallsitePlan> &CallsitePlans,
               const CallGraphInfo &CandidateGraph, const DataLayout &DL) {
   FramePlan Plan;
   SmallVector<StaticLocalPlan, 8> Locals;
@@ -1091,7 +1028,7 @@ makeFramePlan(ArrayRef<Function *> Candidates,
   for (unsigned I = 0, E = Candidates.size(); I != E; ++I) {
     Function *F = Candidates[I];
     FunctionLayout L;
-    L.ContinuationSlotID = I;
+    L.ContSlot = {I};
     L.Owner = F;
     uint64_t NextOffset = 0;
 
@@ -1108,7 +1045,8 @@ makeFramePlan(ArrayRef<Function *> Candidates,
     for (BasicBlock &BB : *F) {
       for (Instruction &I : BB) {
         if (auto *Call = dyn_cast<CallInst>(&I)) {
-          if (isCPSLoweredCall(Call, CandidateIDs) && !Call->getType()->isVoidTy()) {
+          if (isPushContinuationInternalCall(Call, CallsitePlans) &&
+              !Call->getType()->isVoidTy()) {
             uint64_t Offset = reserveSlot(NextOffset, Call->getType(), DL);
             L.CallResultOffsets[Call] = staticRef(Call->getType(), Offset);
             continue;
@@ -1281,6 +1219,7 @@ struct LoweringContext {
   MFLAArtifacts &Artifacts;
   DenseMap<Function *, FunctionLayout> &Layouts;
   const DenseMap<Function *, unsigned> &CandidateIDs;
+  const DenseMap<CallInst *, CallsitePlan> &CallsitePlans;
   DenseMap<Function *, BasicBlock *> &EntryBlockFor;
   DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>>
       &AddrHelperForFunction;
@@ -1301,6 +1240,71 @@ struct FunctionTerminatorContext {
   const DenseMap<BasicBlock *, BasicBlock *> *AddrHelpers = nullptr;
 };
 
+struct PushedContinuation {
+  ContinuationRecord Record;
+  uint64_t ResumeState = 0;
+  uint64_t CalleeEntryState = 0;
+  BasicBlock *ResumeBlock = nullptr;
+};
+
+static bool lowerSelfTailEnter(CallInst *Call, IRBuilder<> &B,
+                               ValueToValueMapTy &VMap,
+                               const FunctionLayout &Layout,
+                               LoweringContext &LCtx);
+
+static PushedContinuation pushContinuation(
+    IRBuilder<> &B, LoweringContext &LCtx, const FunctionLayout &CallerLayout,
+    const FunctionLayout &CalleeLayout, Function *Callee, CallInst *Call,
+    BasicBlock *CalleeEntry, uint64_t CalleeState) {
+  PushedContinuation Pushed;
+  Pushed.ResumeBlock = BasicBlock::Create(
+      LCtx.Mega.getContext(), "mfla.call.cont", &LCtx.Mega, LCtx.Exit);
+  Pushed.ResumeState = LCtx.StateAlloc.assign(Pushed.ResumeBlock, LCtx.StateFor);
+  Pushed.CalleeEntryState = CalleeState;
+  LCtx.ContinuationsByCallee[Callee].push_back(Pushed.ResumeBlock);
+  Pushed.Record = continuationRecord(
+      CalleeLayout, Pushed.ResumeBlock,
+      CallerLayout.CallResultOffsets.lookup(Call), !Call->getType()->isVoidTy());
+  storeContinuation(
+      B, LCtx.Artifacts, Pushed.Record, CalleeState, Pushed.ResumeState,
+      loadEdgeConstant(B, LCtx.Artifacts, CalleeEntry, Pushed.Record.ResumeBlock,
+                       Pushed.ResumeState));
+  return Pushed;
+}
+
+static bool applyContinuation(IRBuilder<> &B, LoweringContext &LCtx,
+                              FunctionTerminatorContext &FCtx,
+                              uint64_t ReturnState,
+                              uint64_t CalleeEntryState) {
+  Function &Mega = LCtx.Mega;
+  MFLAArtifacts &A = LCtx.Artifacts;
+  ContinuationRecord RetCont = continuationRecord(FCtx.Layout);
+  Value *ContXor = loadContinuationXor(B, A, RetCont, "mfla.ret.cont.xor");
+  Value *HasContinuation = B.CreateICmpNE(ContXor, constI64(Mega.getContext(), 0));
+  BasicBlock *Cur = B.GetInsertBlock();
+  BasicBlock *ReturnBB = BasicBlock::Create(
+      Mega.getContext(), Cur->getName() + ".ret.cont", &Mega, LCtx.Exit);
+  B.CreateCondBr(HasContinuation, ReturnBB, LCtx.Exit);
+
+  IRBuilder<> ReturnB(ReturnBB);
+  Value *ContEdge = loadContinuationEdge(ReturnB, A, RetCont,
+                                         "mfla.ret.cont.edge");
+  clearContinuation(ReturnB, A, RetCont);
+  Value *ReturnCurState = loadState(ReturnB, A, "mfla.ret.cur.state");
+  Value *NextState = ReturnB.CreateXor(
+      ReturnCurState, constI64(Mega.getContext(), CalleeEntryState ^ ReturnState));
+  NextState = ReturnB.CreateXor(NextState, ContXor, "mfla.ret.next.state");
+  storeState(ReturnB, A, NextState);
+  BasicBlock *MappedEntry = FCtx.BBMap.lookup(&FCtx.OldF->getEntryBlock());
+  if (!MappedEntry)
+    return false;
+  Value *Target = encodedTarget(ReturnB, Mega, MappedEntry, ContEdge,
+                                keyForState(ReturnB, A, NextState));
+  auto *End = IndirectBrInst::Create(Target, 0, ReturnBB);
+  FCtx.ReturnDispatches[FCtx.Layout.Owner].push_back(End);
+  return true;
+}
+
 static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
                                      LoweringContext &LCtx,
                                      FunctionTerminatorContext &FCtx) {
@@ -1316,45 +1320,28 @@ static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
 
   if (auto *Ret = dyn_cast<ReturnInst>(OldTerm)) {
     if (Value *RV = Ret->getReturnValue()) {
+      if (auto *Call = dyn_cast<CallInst>(RV)) {
+        CallsitePlan Plan = {};
+        auto It = LCtx.CallsitePlans.find(Call);
+        if (It != LCtx.CallsitePlans.end())
+          Plan = It->second;
+        if (isInternalEnter(Plan) &&
+            Plan.ContPolicy == ContinuationPolicy::TailReuse)
+          return lowerSelfTailEnter(Call, B, VMap, Layout, LCtx);
+      }
       Value *Mapped = mapValueForUse(RV, B, VMap, Layout, A, OldF, &BBMap,
                                      AddrHelperForOldBB);
       if (!Mapped)
         return false;
       storeSlot(B, Mapped, A, Layout.RetOffset);
     }
-    Type *I64 = Type::getInt64Ty(Mega.getContext());
     BasicBlock *Cur = B.GetInsertBlock();
-    BasicBlock *ReturnBB = BasicBlock::Create(
-        Mega.getContext(), Cur->getName() + ".ret.cont", &Mega, LCtx.Exit);
     uint64_t ReturnState = stateFor(Cur, LCtx.StateFor);
     BasicBlock *MappedEntry = BBMap.lookup(&OldF->getEntryBlock());
     if (!MappedEntry)
       return false;
     uint64_t CalleeEntryState = stateFor(MappedEntry, LCtx.StateFor);
-    Value *ContXorSlot = retContPtr(B, A.RetContXor, Layout.ContinuationSlotID);
-    Value *ContXor = B.CreateLoad(I64, ContXorSlot, "mfla.ret.cont.xor");
-    Value *HasContinuation = B.CreateICmpNE(ContXor, constI64(Mega.getContext(), 0));
-    B.CreateCondBr(HasContinuation, ReturnBB, LCtx.Exit);
-
-    IRBuilder<> ReturnB(ReturnBB);
-    Value *ContEdge = ReturnB.CreateLoad(
-        I64, retContPtr(ReturnB, A.RetContEdge, Layout.ContinuationSlotID),
-        "mfla.ret.cont.edge");
-    ReturnB.CreateStore(constI64(Mega.getContext(), 0),
-                        retContPtr(ReturnB, A.RetContXor, Layout.ContinuationSlotID));
-    ReturnB.CreateStore(constI64(Mega.getContext(), 0),
-                        retContPtr(ReturnB, A.RetContEdge, Layout.ContinuationSlotID));
-    Value *ReturnCurState = loadState(ReturnB, A, "mfla.ret.cur.state");
-    Value *NextState = ReturnB.CreateXor(
-        ReturnCurState, constI64(Mega.getContext(),
-                                 CalleeEntryState ^ ReturnState));
-    NextState = ReturnB.CreateXor(NextState, ContXor, "mfla.ret.next.state");
-    storeState(ReturnB, A, NextState);
-    Value *Target = encodedTarget(ReturnB, Mega, MappedEntry, ContEdge,
-                                  keyForState(ReturnB, A, NextState));
-    auto *End = IndirectBrInst::Create(Target, 0, ReturnBB);
-    FCtx.ReturnDispatches[Layout.Owner].push_back(End);
-    return true;
+    return applyContinuation(B, LCtx, FCtx, ReturnState, CalleeEntryState);
   }
 
   auto *Br = dyn_cast<BranchInst>(OldTerm);
@@ -1536,11 +1523,49 @@ static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
   return true;
 }
 
-static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
-                              ValueToValueMapTy &VMap,
-                              const FunctionLayout &CallerLayout,
-                              DenseMap<BasicBlock *, BasicBlock *> &TerminatorBlockFor,
-                              BasicBlock &OldBB, LoweringContext &LCtx) {
+static bool lowerSelfTailEnter(CallInst *Call, IRBuilder<> &B,
+                               ValueToValueMapTy &VMap,
+                               const FunctionLayout &Layout,
+                               LoweringContext &LCtx) {
+  Function *Callee = directCalledFunction(Call);
+  if (!Callee || Callee != Layout.Owner)
+    return false;
+
+  SmallVector<Value *, 8> Args;
+  for (Value *Arg : Call->args()) {
+    Value *MappedArg = mapValueForUse(Arg, B, VMap, Layout, LCtx.Artifacts);
+    if (!MappedArg)
+      return false;
+    Args.push_back(MappedArg);
+  }
+  if (Args.size() != Layout.ArgOffsets.size())
+    return false;
+  for (unsigned I = 0, E = Args.size(); I != E; ++I)
+    storeSlot(B, Args[I], LCtx.Artifacts, Layout.ArgOffsets[I]);
+
+  BasicBlock *CalleeEntry = LCtx.EntryBlockFor[Callee];
+  if (!CalleeEntry)
+    return false;
+  uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
+  uint64_t CalleeState = stateFor(CalleeEntry, LCtx.StateFor);
+  Value *CurState = loadState(B, LCtx.Artifacts, "mfla.tail.cur.state");
+  Value *NextState = transitionState(B, CurState, FromState, CalleeState);
+  storeState(B, LCtx.Artifacts, NextState);
+  Value *Target = encodedTarget(
+      B, LCtx.Mega, B.GetInsertBlock(),
+      loadEdgeConstant(B, LCtx.Artifacts, B.GetInsertBlock(), CalleeEntry,
+                       CalleeState),
+      keyForState(B, LCtx.Artifacts, NextState));
+  auto *Jump = IndirectBrInst::Create(Target, 1, B.GetInsertBlock());
+  Jump->addDestination(CalleeEntry);
+  return true;
+}
+
+static bool lowerInternalEnter(CallInst *Call, IRBuilder<> &B,
+                               ValueToValueMapTy &VMap,
+                               const FunctionLayout &CallerLayout,
+                               DenseMap<BasicBlock *, BasicBlock *> &TerminatorBlockFor,
+                               BasicBlock &OldBB, LoweringContext &LCtx) {
   Function *Callee = directCalledFunction(Call);
   if (!Callee || !LCtx.CandidateIDs.count(Callee))
     return false;
@@ -1555,20 +1580,14 @@ static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
     storeSlot(B, MappedArg, LCtx.Artifacts, CalleeLayout.ArgOffsets[ArgNo++]);
   }
 
-  BasicBlock *Cont = BasicBlock::Create(LCtx.Mega.getContext(),
-                                        "mfla.call.cont", &LCtx.Mega,
-                                        LCtx.Exit);
-  uint64_t ContState = LCtx.StateAlloc.assign(Cont, LCtx.StateFor);
-  LCtx.ContinuationsByCallee[Callee].push_back(Cont);
   BasicBlock *CalleeEntry = LCtx.EntryBlockFor[Callee];
   uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
   uint64_t CalleeState = stateFor(CalleeEntry, LCtx.StateFor);
   Value *CurState = loadState(B, LCtx.Artifacts, "mfla.call.cur.state");
   Value *CallNextState = transitionState(B, CurState, FromState, CalleeState);
-  B.CreateStore(constI64(LCtx.Mega.getContext(), CalleeState ^ ContState),
-                retContPtr(B, LCtx.Artifacts.RetContXor, CalleeLayout.ContinuationSlotID));
-  B.CreateStore(loadEdgeConstant(B, LCtx.Artifacts, CalleeEntry, Cont, ContState),
-                retContPtr(B, LCtx.Artifacts.RetContEdge, CalleeLayout.ContinuationSlotID));
+  PushedContinuation Pushed = pushContinuation(
+      B, LCtx, CallerLayout, CalleeLayout, Callee, Call, CalleeEntry,
+      CalleeState);
   storeState(B, LCtx.Artifacts, CallNextState);
   Value *CallTarget = encodedTarget(
       B, LCtx.Mega, B.GetInsertBlock(),
@@ -1577,15 +1596,12 @@ static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
   auto *Jump = IndirectBrInst::Create(CallTarget, 1, B.GetInsertBlock());
   Jump->addDestination(CalleeEntry);
 
-  B.SetInsertPoint(Cont);
-  TerminatorBlockFor[&OldBB] = Cont;
-  if (!Call->getType()->isVoidTy()) {
+  B.SetInsertPoint(Pushed.ResumeBlock);
+  TerminatorBlockFor[&OldBB] = Pushed.ResumeBlock;
+  if (Pushed.Record.HasResultSlot) {
     Value *RetVal = loadSlot(B, Call->getType(), LCtx.Artifacts,
                              CalleeLayout.RetOffset, "mfla.call.ret");
-    auto It = CallerLayout.CallResultOffsets.find(Call);
-    if (It == CallerLayout.CallResultOffsets.end())
-      return false;
-    storeSlot(B, RetVal, LCtx.Artifacts, It->second);
+    storeSlot(B, RetVal, LCtx.Artifacts, Pushed.Record.ResultSlot);
     VMap[Call] = RetVal;
   }
   return true;
@@ -1594,12 +1610,13 @@ static bool lowerInternalCall(CallInst *Call, IRBuilder<> &B,
 static bool
 buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
                     DenseMap<Function *, FunctionLayout> &Layouts,
-                    const DenseMap<Function *, unsigned> &CandidateIDs) {
+                    const DenseMap<Function *, unsigned> &CandidateIDs,
+                    const DenseMap<CallInst *, CallsitePlan> &CallsitePlans) {
   Function &Mega = *A.Mega;
   Module &M = *Mega.getParent();
   LLVMContext &Ctx = Mega.getContext();
-  Argument *EntryState = Mega.getArg(0);
-  Argument *EntryEdge = Mega.getArg(1);
+  Argument *EntryState = Mega.getArg(1);
+  Argument *EntryEdge = Mega.getArg(2);
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &Mega);
   BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", &Mega);
   DenseMap<Function *, SmallVector<BasicBlock *, 4>> ContinuationsByCallee;
@@ -1676,9 +1693,10 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
         createEdgeConstant(A, Anchor, EntryBlock, EntryStateValue);
   }
 
-  LoweringContext LCtx{Mega, A, Layouts, CandidateIDs, EntryBlockFor,
-                       AddrHelperForFunction, StateFor, StateAlloc, Anchor, Exit,
-                       ContinuationsByCallee, AnchorCandidates};
+  LoweringContext LCtx{Mega, A, Layouts, CandidateIDs, CallsitePlans,
+                       EntryBlockFor, AddrHelperForFunction, StateFor,
+                       StateAlloc, Anchor, Exit, ContinuationsByCallee,
+                       AnchorCandidates};
 
   for (Function *F : Candidates) {
     ValueToValueMapTy VMap;
@@ -1705,9 +1723,13 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
           continue;
         }
         if (auto *Call = dyn_cast<CallInst>(&I)) {
-          if (isCPSLoweredCall(Call, CandidateIDs)) {
-            if (!lowerInternalCall(Call, B, VMap, L, TerminatorBlockFor, BB,
-                                   LCtx))
+          auto PlanIt = LCtx.CallsitePlans.find(Call);
+          if (PlanIt != LCtx.CallsitePlans.end() &&
+              isInternalEnter(PlanIt->second)) {
+            if (PlanIt->second.ContPolicy == ContinuationPolicy::TailReuse)
+              continue;
+            if (!lowerInternalEnter(Call, B, VMap, L, TerminatorBlockFor, BB,
+                                    LCtx))
               return false;
             continue;
           }
@@ -1785,19 +1807,25 @@ static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
 
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &F);
   IRBuilder<> B(Entry);
+  uint64_t CtxSize = std::max<uint64_t>(1, A.CtxSize);
+  auto *CtxTy = ArrayType::get(Type::getInt8Ty(Ctx), CtxSize);
+  AllocaInst *CtxStorage = B.CreateAlloca(CtxTy, nullptr, "mfla.ctx");
+  CtxStorage->setAlignment(Align(16));
+  B.CreateMemSet(CtxStorage, ConstantInt::get(Type::getInt8Ty(Ctx), 0),
+                 CtxSize, Align(16));
+  Value *CtxPtr = B.CreateInBoundsGEP(
+      CtxTy, CtxStorage, {constI64(Ctx, 0), constI64(Ctx, 0)}, "mfla.ctx.ptr");
+
   for (unsigned I = 0, E = Args.size(); I != E; ++I)
-    storeSlot(B, Args[I], A, L.ArgOffsets[I]);
-  B.CreateStore(ConstantInt::get(Type::getInt64Ty(Ctx), 0),
-                retContPtr(B, A.RetContXor, L.ContinuationSlotID));
-  B.CreateStore(ConstantInt::get(Type::getInt64Ty(Ctx), 0),
-                retContPtr(B, A.RetContEdge, L.ContinuationSlotID));
+    storeSlot(B, Args[I], A, CtxPtr, L.ArgOffsets[I]);
+  initializeContinuation(B, A, CtxPtr, continuationRecord(L));
   Value *EntryEdgeValue =
       B.CreateLoad(Type::getInt64Ty(Ctx), EntryEdge, "mfla.entry.edge");
-  B.CreateCall(A.Mega, {constI64(Ctx, EntryState), EntryEdgeValue});
+  B.CreateCall(A.Mega, {CtxPtr, constI64(Ctx, EntryState), EntryEdgeValue});
   if (F.getReturnType()->isVoidTy())
     B.CreateRetVoid();
   else
-    B.CreateRet(loadSlot(B, F.getReturnType(), A, L.RetOffset, ""));
+    B.CreateRet(loadSlot(B, F.getReturnType(), A, CtxPtr, L.RetOffset, ""));
 }
 } // namespace
 
@@ -1820,7 +1848,8 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
   DenseMap<Function *, unsigned> CandidateIDs;
   CallGraphInfo InitialGraph;
   CallGraphInfo CandidateGraph;
-  FramePlan Plan;
+  DenseSet<Function *> RecursiveMembers;
+  DenseMap<CallInst *, CallsitePlan> CallsitePlans;
 
   while (true) {
     std::vector<Function *> CandidateList;
@@ -1832,17 +1861,7 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     SmallVector<SCCInfo, 8> InitialSCCs =
         findCandidateSCCs(CandidateList, InitialGraph);
     DenseSet<Function *> Recursive = recursiveMembers(InitialSCCs);
-    bool Changed = false;
-    for (Function *F : CandidateList) {
-      if (!Recursive.count(F))
-        continue;
-      YANSO_WARN_SKIP_FUNCTION(PassName, *F, "recursive SCC not supported");
-      CandidateSet.erase(F);
-      Changed = true;
-    }
-    if (Changed)
-      continue;
-
+    RecursiveMembers = Recursive;
     std::vector<Function *> NonRecursiveCandidates;
     DenseMap<Function *, unsigned> NonRecursiveIDs;
     for (Function *F : CandidateList) {
@@ -1850,6 +1869,7 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
       NonRecursiveCandidates.push_back(F);
     }
 
+    bool Changed = false;
     for (Function *F : NonRecursiveCandidates) {
       if (supportsCurrentLowering(*F, NonRecursiveIDs))
         continue;
@@ -1877,13 +1897,16 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     }
 
     CandidateGraph = buildCandidateCallGraph(Candidates);
-    Plan = makeFramePlan(Candidates, CandidateIDs, CandidateGraph,
-                         M.getDataLayout());
+    CallsitePlans = makeCallsitePlans(Candidates, CandidateIDs, RecursiveMembers);
     break;
   }
 
+  FramePlan Plan = makeFramePlan(Candidates, CandidateIDs, CallsitePlans,
+                                 CandidateGraph, M.getDataLayout());
+
   MFLAArtifacts Artifacts = createArtifacts(M, Plan.FrameSize, Candidates.size());
-  if (!buildStructuralMega(Artifacts, Candidates, Plan.Layouts, CandidateIDs)) {
+  if (!buildStructuralMega(Artifacts, Candidates, Plan.Layouts, CandidateIDs,
+                           CallsitePlans)) {
     Artifacts.eraseFromParent();
     return PreservedAnalyses::none();
   }

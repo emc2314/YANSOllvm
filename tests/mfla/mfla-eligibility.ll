@@ -6,9 +6,6 @@
 
 ; CHECK: yansollvm: warning: mfla: skip function 'vararg': vararg function
 ; CHECK: yansollvm: warning: mfla: skip function 'has_blockaddress': unsupported blockaddress use
-; CHECK: yansollvm: warning: mfla: skip function 'self_rec': recursive SCC not supported
-; CHECK: yansollvm: warning: mfla: skip function 'mut_a': recursive SCC not supported
-; CHECK: yansollvm: warning: mfla: skip function 'mut_b': recursive SCC not supported
 
 define internal i32 @add1(i32 %x) {
 entry:
@@ -41,7 +38,7 @@ target:
   ret ptr null
 }
 
-define internal i32 @self_rec(i32 %x) {
+define internal i32 @self_rec(i32 %x) nounwind {
 entry:
   %done = icmp eq i32 %x, 0
   br i1 %done, label %ret, label %recur
@@ -53,7 +50,7 @@ ret:
   ret i32 0
 }
 
-define internal i32 @mut_a(i32 %x) {
+define internal i32 @mut_a(i32 %x) nounwind {
 entry:
   %done = icmp eq i32 %x, 0
   br i1 %done, label %ret, label %call
@@ -65,7 +62,7 @@ ret:
   ret i32 0
 }
 
-define internal i32 @mut_b(i32 %x) {
+define internal i32 @mut_b(i32 %x) nounwind {
 entry:
   %done = icmp eq i32 %x, 0
   br i1 %done, label %ret, label %call
