@@ -1,7 +1,7 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=merge,verify -merge-max-group-size=2 -S %s -o %t.out.ll
 ; RUN: %FileCheck %s --input-file=%t.out.ll
 
-; CHECK-LABEL: define {{.*}}i32 @foo(i32 %x)
+; CHECK-LABEL: define private i32 @foo(i32 %x)
 ; CHECK: call i64 @bar.main.merge
 ; CHECK-NOT: add i32 %x, 1
 ; CHECK-LABEL: define internal i64 @bar.main.merge

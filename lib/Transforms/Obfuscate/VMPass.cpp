@@ -66,6 +66,7 @@ class VirtualizeImpl {
 
   static void attrs(Function *F) {
     F->addFnAttr(Attribute::NoInline);
+    F->addFnAttr(Attribute::NoUnwind);
     F->addFnAttr(Attribute::OptimizeNone);
   }
 

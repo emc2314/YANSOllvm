@@ -605,7 +605,9 @@ static void rewriteFunctionAsWrapper(FunctionInfo &TargetInfo,
 
   LLVMContext &Ctx = F->getContext();
 
-  F->deleteBody();
+  F->dropAllReferences();
+  while (!F->empty())
+    F->begin()->eraseFromParent();
   BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
   IRBuilder<> B(Entry);
 

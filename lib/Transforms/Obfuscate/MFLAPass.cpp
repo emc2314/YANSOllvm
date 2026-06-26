@@ -1059,7 +1059,7 @@ static GlobalVariable *createEdgeConstant(MFLAArtifacts &A, BasicBlock *Anchor,
                                           BasicBlock *Target, uint64_t State) {
   Constant *Init = blockDeltaPlusKey(A, Anchor, Target, State);
   auto *GV = new GlobalVariable(*A.Mega->getParent(), Type::getInt64Ty(A.Mega->getContext()),
-                                true, GlobalValue::PrivateLinkage, Init,
+                                false, GlobalValue::PrivateLinkage, Init,
                                 "__yansollvm_mfla_edge");
   GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
   GV->setAlignment(Align(8));
@@ -1080,8 +1080,10 @@ static Value *encodedTarget(IRBuilder<> &B, Function &Mega, BasicBlock *Anchor,
 static LoadInst *loadEdgeConstant(IRBuilder<> &B, MFLAArtifacts &A,
                                   BasicBlock *Anchor, BasicBlock *Target,
                                   uint64_t State, StringRef Name = "mfla.edge") {
-  return B.CreateLoad(Type::getInt64Ty(A.Mega->getContext()),
-                      createEdgeConstant(A, Anchor, Target, State), Name);
+  LoadInst *L = B.CreateLoad(Type::getInt64Ty(A.Mega->getContext()),
+                             createEdgeConstant(A, Anchor, Target, State), Name);
+  L->setVolatile(true);
+  return L;
 }
 
 static Value *encodedTargetConst(IRBuilder<> &B, MFLAArtifacts &A,
@@ -2283,6 +2285,10 @@ PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
     rewriteAsWrapper(*F, Artifacts, Plan.Layouts[F],
                      Artifacts.EntryStateForFunction[F],
                      Artifacts.EntryEdgeForFunction.lookup(F));
+
+  for (Function *F : Candidates)
+    if (F->isDefTriviallyDead())
+      F->eraseFromParent();
 
   return PreservedAnalyses::none();
 }

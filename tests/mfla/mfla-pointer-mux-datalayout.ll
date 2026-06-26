@@ -1,6 +1,7 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %s -o %t.out.ll
 ; RUN: grep 'define internal void @__yansollvm_mfla_main(ptr' %t.out.ll
-; RUN: grep '@__yansollvm_mfla_edge = private unnamed_addr constant i64' %t.out.ll
+; RUN: grep '@__yansollvm_mfla_edge = private unnamed_addr global i64' %t.out.ll
+; RUN: grep 'load volatile i64, ptr @__yansollvm_mfla_edge' %t.out.ll
 ; RUN: grep 'ptrtoint (ptr blockaddress.* to i64' %t.out.ll
 ; RUN: grep 'indirectbr ptr %mfla.target' %t.out.ll
 
