@@ -577,9 +577,9 @@ static Value *convertMergedReturn(IRBuilder<> &B, Value *V, Type *RetTy,
   }
   if (RetTy->isDoubleTy()) {
     if (ToMergedRet)
-      return B.CreateBitCast(V, I64);
+      return B.CreateZExtOrTrunc(B.CreateBitCast(V, I64), MergedTy);
     if (V->getType() != I64)
-      V = B.CreateZExt(V, I64);
+      V = B.CreateTrunc(V, I64);
     return B.CreateBitCast(V, RetTy);
   }
   if (RetTy->isPointerTy())
@@ -720,6 +720,10 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
             /*ToMergedRet=*/false);
         Invoke->replaceAllUsesWith(Converted);
         ConvertB.CreateBr(NormalDest);
+        // The normal edge now flows through ConvertBB, so any PHI in
+        // NormalDest must take its incoming value from ConvertBB rather than
+        // the original invoke block.
+        NormalDest->replacePhiUsesWith(Invoke->getParent(), ConvertBB);
       }
       Invoke->eraseFromParent();
     }

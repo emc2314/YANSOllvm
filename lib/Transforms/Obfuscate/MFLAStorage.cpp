@@ -312,24 +312,41 @@ Value *frameSlotPtr(IRBuilder<> &B, MFLAArtifacts &A, Value *Ctx,
   return frameSlotPtrImpl(B, A, Ctx, Frame, Ref);
 }
 
+// The physical alignment of a frame slot is bounded by the page base
+// alignment (16: malloc / the static ctx alloca) and the slot's compile-time
+// byte offset within a frame (slotIndex*FrameStride is a runtime multiple of
+// 16, so it does not raise the guarantee below 16). A slot type whose ABI
+// alignment exceeds this -- e.g. a 32-aligned vector -- must not have its
+// load/store tagged with the larger type alignment, or the access is
+// misaligned UB. commonAlignment keeps the correct (smaller-or-equal) value
+// for ordinary scalars and caps over-aligned slots at what the storage can
+// actually guarantee.
+static Align frameSlotAccessAlign(StorageRef Ref) {
+  return commonAlignment(Align(16), FrameMetadataBytes + Ref.Offset);
+}
+
 LoadInst *loadFrameSlot(IRBuilder<> &B, Type *Ty, MFLAArtifacts &A,
                         FrameRef Frame, StorageRef Ref, StringRef Name) {
-  return B.CreateLoad(Ty, frameSlotPtr(B, A, Frame, Ref), Name);
+  return B.CreateAlignedLoad(Ty, frameSlotPtr(B, A, Frame, Ref),
+                             frameSlotAccessAlign(Ref), Name);
 }
 
 LoadInst *loadFrameSlot(IRBuilder<> &B, Type *Ty, MFLAArtifacts &A, Value *Ctx,
                         FrameRef Frame, StorageRef Ref, StringRef Name) {
-  return B.CreateLoad(Ty, frameSlotPtr(B, A, Ctx, Frame, Ref), Name);
+  return B.CreateAlignedLoad(Ty, frameSlotPtr(B, A, Ctx, Frame, Ref),
+                             frameSlotAccessAlign(Ref), Name);
 }
 
 void storeFrameSlot(IRBuilder<> &B, Value *V, MFLAArtifacts &A,
                     FrameRef Frame, StorageRef Ref) {
-  B.CreateStore(V, frameSlotPtr(B, A, Frame, Ref));
+  B.CreateAlignedStore(V, frameSlotPtr(B, A, Frame, Ref),
+                       frameSlotAccessAlign(Ref));
 }
 
 void storeFrameSlot(IRBuilder<> &B, Value *V, MFLAArtifacts &A, Value *Ctx,
                     FrameRef Frame, StorageRef Ref) {
-  B.CreateStore(V, frameSlotPtr(B, A, Ctx, Frame, Ref));
+  B.CreateAlignedStore(V, frameSlotPtr(B, A, Ctx, Frame, Ref),
+                       frameSlotAccessAlign(Ref));
 }
 
 void cleanupFrameStorage(IRBuilder<> &B, MFLAArtifacts &A, Value *Ctx) {

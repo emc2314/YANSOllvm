@@ -1419,6 +1419,14 @@ static bool writeIncomingPhis(
     MFLAArtifacts &A, Function *OldF,
     DenseMap<BasicBlock *, BasicBlock *> &BBMap,
     const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
+  // PHI nodes have parallel-copy semantics: every incoming value is the value
+  // held *before* the edge is taken.  Because each PHI is materialized as a
+  // frame slot and an incoming value may itself read a sibling PHI's slot
+  // (mapValueForUse loads the slot), we must compute every store value before
+  // committing any store -- otherwise a later PHI would observe an earlier
+  // PHI's just-written value instead of its old one.
+  SmallVector<std::pair<StorageRef, Value *>, 8> Pending;
+  FrameRef CurFrame = currentFrame(B, A, Layout);
   for (Instruction &I : *Succ) {
     auto *Phi = dyn_cast<PHINode>(&I);
     if (!Phi)
@@ -1432,14 +1440,15 @@ static bool writeIncomingPhis(
     if (It == Layout.PhiOffsets.end())
       return false;
     Value *ToStore = Mapped;
-    FrameRef CurFrame = currentFrame(B, A, Layout);
     if (TakeEdge) {
       Value *Old = loadFrameSlot(B, Phi->getType(), A, CurFrame, It->second,
                                  "mfla.phi.old");
       ToStore = muxValue(B, DL, TakeEdge, Mapped, Old);
     }
-    storeFrameSlot(B, ToStore, A, CurFrame, It->second);
+    Pending.emplace_back(It->second, ToStore);
   }
+  for (auto &Entry : Pending)
+    storeFrameSlot(B, Entry.second, A, CurFrame, Entry.first);
   return true;
 }
 

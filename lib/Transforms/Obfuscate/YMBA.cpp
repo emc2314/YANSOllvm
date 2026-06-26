@@ -393,6 +393,29 @@ static void collectBuiltinBinaryCosts(unsigned Opcode,
 static Value *emitBuiltinBinary(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
                                 Value *X, Value *Y, unsigned Variant,
                                 uint64_t Seed) {
+  // For i1 the value set is {0,1}, so boolean and mod-2 arithmetic coincide and
+  // the multi-bit MBA forms (which rely on a carry-propagating `(x&y) << 1`)
+  // would emit a poison `shl i1, 1`.  Disguise each op as an equivalent
+  // sibling instead: and<->mul, xor<->add<->sub are identities at one bit, and
+  // or is rebuilt from them.
+  if (Ty->getBitWidth() == 1) {
+    switch (Opcode) {
+    case BinaryOperator::And:
+      return B.CreateMul(X, Y);
+    case BinaryOperator::Mul:
+      return B.CreateAnd(X, Y);
+    case BinaryOperator::Add:
+    case BinaryOperator::Sub:
+      return B.CreateXor(X, Y);
+    case BinaryOperator::Xor:
+      return B.CreateAdd(X, Y);
+    case BinaryOperator::Or:
+      // a | b == (a + b) - a*b  (== a + b - (a & b)) for one-bit values.
+      return B.CreateSub(B.CreateAdd(X, Y), B.CreateMul(X, Y));
+    default:
+      break;
+    }
+  }
   switch (Opcode) {
   case BinaryOperator::Add:
     return emitAddExpr(B, Ty, X, Y, Variant);
