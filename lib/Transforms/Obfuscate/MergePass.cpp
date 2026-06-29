@@ -680,7 +680,9 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
         SmallVector<Value *, 8> ActualArgs(Call->args());
         SmallVector<Value *, 8> CallArgs =
             buildMergedCallArgs(B, *TargetInfo, Group, ActualArgs, SelectorKey);
-        CallInst *NewCall = B.CreateCall(NewFunction, CallArgs);
+        SmallVector<OperandBundleDef, 1> Bundles;
+        Call->getOperandBundlesAsDefs(Bundles);
+        CallInst *NewCall = B.CreateCall(NewFunction, CallArgs, Bundles);
         if (GroupNoUnwind)
           NewCall->setDoesNotThrow();
         if (!Target->getReturnType()->isVoidTy())
@@ -707,9 +709,11 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
       SmallVector<Value *, 8> ActualArgs(Invoke->args());
       SmallVector<Value *, 8> CallArgs =
           buildMergedCallArgs(B, *TargetInfo, Group, ActualArgs, SelectorKey);
+      SmallVector<OperandBundleDef, 1> Bundles;
+      Invoke->getOperandBundlesAsDefs(Bundles);
       InvokeInst *NewInvoke =
           B.CreateInvoke(NewFunction, ConvertBB ? ConvertBB : NormalDest,
-                         UnwindDest, CallArgs);
+                         UnwindDest, CallArgs, Bundles);
       if (GroupNoUnwind)
         NewInvoke->setDoesNotThrow();
 
@@ -720,9 +724,8 @@ static Function *emitMergeGroup(Module &M, MergeGroup &Group, YansoRNG &RNG) {
             /*ToMergedRet=*/false);
         Invoke->replaceAllUsesWith(Converted);
         ConvertB.CreateBr(NormalDest);
-        // The normal edge now flows through ConvertBB, so any PHI in
-        // NormalDest must take its incoming value from ConvertBB rather than
-        // the original invoke block.
+        // The normal edge now passes through ConvertBB; repoint NormalDest's
+        // PHIs from the original invoke block to it.
         NormalDest->replacePhiUsesWith(Invoke->getParent(), ConvertBB);
       }
       Invoke->eraseFromParent();

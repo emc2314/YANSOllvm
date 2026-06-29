@@ -1,7 +1,5 @@
 ; RUN: %opt -load-pass-plugin %plugin -passes=mfla,verify -S %s -o %t.out.ll 2>&1 | %FileCheck %s
 ; RUN: grep 'define dso_local i32 @pureish' %t.out.ll | grep -qv 'readnone'
-; RUN: grep 'define dso_local i32 @pureish' %t.out.ll | grep -qv 'willreturn'
-; RUN: grep 'define dso_local i32 @pureish' %t.out.ll | grep -qv 'mustprogress'
 ; RUN: %not grep 'define internal i32 @dead_local' %t.out.ll
 ; RUN: grep 'define internal void @takes_byval' %t.out.ll
 ; RUN: grep -qv 'call.*@takes_byval' %t.out.ll

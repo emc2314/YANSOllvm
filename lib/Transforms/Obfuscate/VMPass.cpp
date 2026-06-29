@@ -70,6 +70,15 @@ class VirtualizeImpl {
     F->addFnAttr(Attribute::OptimizeNone);
   }
 
+  // True if F uses Windows-style funclet EH, where any call must carry the
+  // enclosing pad's "funclet" operand bundle.
+  static bool usesFuncletEH(Function &F) {
+    for (BasicBlock &BB : F)
+      if (BB.isEHPad() && !BB.isLandingPad())
+        return true;
+    return false;
+  }
+
   static bool isSupportedInt(Type *Ty) { return isa<IntegerType>(Ty); }
 
   static bool isSupportedPointer(Type *Ty) { return isa<PointerType>(Ty); }
@@ -1270,6 +1279,11 @@ public:
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
+      // A handler call inserted inside a Windows-EH funclet would need that
+      // funclet's "funclet" operand bundle to verify; deriving it is out of
+      // scope, so leave such functions untouched.
+      if (usesFuncletEH(F))
+        continue;
       for (BasicBlock &BB : F) {
         SmallVector<Instruction *, 32> Roots;
         for (Instruction &I : BB)
@@ -1281,6 +1295,8 @@ public:
 
     PlanCollector Collector(*this, Plans, Consumed);
     for (Function &F : M) {
+      if (usesFuncletEH(F))
+        continue;
       Collector.visit(F);
     }
 

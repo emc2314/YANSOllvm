@@ -98,42 +98,39 @@ static uint64_t alignOffset(uint64_t Offset, Align Alignment) {
   return llvm::alignTo(Offset, Alignment.value());
 }
 
-static bool constantContainsBlockAddress(Constant *C) {
+// Visit every BlockAddress reachable through a constant tree. GlobalValues are
+// opaque leaves (they are not descended into), matching how the rest of the
+// pass treats cross-global references. This single walk backs every read-only
+// blockaddress query below.
+static void forEachBlockAddress(Constant *C,
+                                function_ref<void(BlockAddress *)> Fn) {
   if (!C)
-    return false;
-  if (auto *BA = dyn_cast<BlockAddress>(C))
-    return true;
-  if (isa<GlobalValue>(C))
-    return false;
-  for (Use &U : C->operands()) {
-    auto *OpC = dyn_cast<Constant>(U.get());
-    if (!OpC)
-      continue;
-    if (OpC == C)
-      continue;
-    if (constantContainsBlockAddress(OpC))
-      return true;
+    return;
+  if (auto *BA = dyn_cast<BlockAddress>(C)) {
+    Fn(BA);
+    return;
   }
-  return false;
+  if (isa<GlobalValue>(C))
+    return;
+  for (Use &U : C->operands())
+    if (auto *OpC = dyn_cast<Constant>(U.get()))
+      if (OpC != C)
+        forEachBlockAddress(OpC, Fn);
+}
+
+static bool constantContainsBlockAddress(Constant *C) {
+  bool Found = false;
+  forEachBlockAddress(C, [&](BlockAddress *) { Found = true; });
+  return Found;
 }
 
 static bool constantUsesOnlyBlockAddressesInFunction(Constant *C, Function &F) {
-  if (!C)
-    return true;
-  if (auto *BA = dyn_cast<BlockAddress>(C))
-    return BA->getFunction() == &F;
-  if (isa<GlobalValue>(C))
-    return true;
-  for (Use &U : C->operands()) {
-    auto *OpC = dyn_cast<Constant>(U.get());
-    if (!OpC)
-      continue;
-    if (OpC == C)
-      continue;
-    if (!constantUsesOnlyBlockAddressesInFunction(OpC, F))
-      return false;
-  }
-  return true;
+  bool Ok = true;
+  forEachBlockAddress(C, [&](BlockAddress *BA) {
+    if (BA->getFunction() != &F)
+      Ok = false;
+  });
+  return Ok;
 }
 
 static bool isLocalGlobalPtr(Value *V) {
@@ -150,9 +147,14 @@ static bool instructionBlockAddressUseIsSupported(Instruction &I, Function &F) {
     auto *C = dyn_cast<Constant>(U.get());
     if (!C)
       continue;
-    if (!constantUsesOnlyBlockAddressesInFunction(C, F))
+    bool Foreign = false;
+    forEachBlockAddress(C, [&](BlockAddress *BA) {
+      HasBA = true;
+      if (BA->getFunction() != &F)
+        Foreign = true;
+    });
+    if (Foreign)
       return false;
-    HasBA |= constantContainsBlockAddress(C);
   }
   if (!HasBA)
     return true;
@@ -171,18 +173,7 @@ static bool instructionBlockAddressUseIsSupported(Instruction &I, Function &F) {
 
 static void collectBlockAddressOwners(Constant *C,
                                       SmallPtrSetImpl<Function *> &Owners) {
-  if (!C)
-    return;
-  if (auto *BA = dyn_cast<BlockAddress>(C)) {
-    Owners.insert(BA->getFunction());
-    return;
-  }
-  if (isa<GlobalValue>(C))
-    return;
-  for (Use &U : C->operands())
-    if (auto *OpC = dyn_cast<Constant>(U.get()))
-      if (OpC != C)
-        collectBlockAddressOwners(OpC, Owners);
+  forEachBlockAddress(C, [&](BlockAddress *BA) { Owners.insert(BA->getFunction()); });
 }
 
 static bool hasNonCandidateInstructionUser(
@@ -220,12 +211,13 @@ static bool pruneCandidatesForBlockAddressGlobals(
   SmallPtrSet<Function *, 8> ToRemove;
 
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
-        !constantContainsBlockAddress(GV.getInitializer()))
+    if (!GV.hasInitializer() || !GV.hasLocalLinkage())
       continue;
 
     SmallPtrSet<Function *, 8> Owners;
     collectBlockAddressOwners(GV.getInitializer(), Owners);
+    if (Owners.empty())
+      continue;
 
     bool HasCandidateOwner = false;
     bool HasNonCandidateOwner = false;
@@ -264,19 +256,10 @@ static bool pruneCandidatesForBlockAddressGlobals(
 
 static void collectBlockAddresses(Constant *C, Function &F,
                                   SmallPtrSetImpl<BasicBlock *> &Blocks) {
-  if (!C)
-    return;
-  if (auto *BA = dyn_cast<BlockAddress>(C)) {
+  forEachBlockAddress(C, [&](BlockAddress *BA) {
     if (BA->getFunction() == &F)
       Blocks.insert(BA->getBasicBlock());
-    return;
-  }
-  if (isa<GlobalValue>(C))
-    return;
-  for (Use &U : C->operands())
-    if (auto *OpC = dyn_cast<Constant>(U.get()))
-      if (OpC != C)
-        collectBlockAddresses(OpC, F, Blocks);
+  });
 }
 
 static SmallVector<BasicBlock *, 8> collectAddressTakenBlocks(Function &F) {
@@ -383,6 +366,7 @@ static bool isCandidate(Function &F) {
 
 static bool supportsCurrentLowering(
     Function &F, const DenseMap<Function *, unsigned> &CandidateIDs) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
   Type *RetTy = F.getReturnType();
   if (!RetTy->isVoidTy() && !isFrameScalar(RetTy)) {
     YANSO_WARN_SKIP_FUNCTION(
@@ -439,8 +423,14 @@ static bool supportsCurrentLowering(
           }
         }
       }
-      if (isa<AllocaInst>(&I))
+      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        if (DL.getTypeAllocSize(AI->getAllocatedType()).isScalable()) {
+          YANSO_WARN_SKIP_FUNCTION(
+              PassName, F, "current lowering does not support scalable allocas");
+          return false;
+        }
         continue;
+      }
       if (!I.getType()->isVoidTy() && !isFrameScalar(I.getType())) {
         YANSO_WARN_SKIP_FUNCTION(
             PassName, F,
@@ -793,7 +783,10 @@ static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
   return A;
 }
 
-static Constant *remapConstantWithBlockAddressMapper(
+// Rebuild a constant tree, replacing each BlockAddress via MapBlockAddress and
+// each remapped global via GlobalRemaps/VMap. Returns null (fail closed) on any
+// operand that cannot be mapped.
+static Constant *remapConstant(
     Constant *C, ValueToValueMapTy &VMap,
     const DenseMap<GlobalVariable *, GlobalVariable *> *GlobalRemaps,
     function_ref<Constant *(BlockAddress *)> MapBlockAddress) {
@@ -801,19 +794,13 @@ static Constant *remapConstantWithBlockAddressMapper(
     return nullptr;
   if (auto *BA = dyn_cast<BlockAddress>(C))
     return MapBlockAddress(BA);
-  if (auto *GV = dyn_cast<GlobalVariable>(C)) {
-    if (GlobalRemaps) {
-      auto GlobalIt = GlobalRemaps->find(GV);
-      if (GlobalIt != GlobalRemaps->end())
-        return GlobalIt->second;
-    }
-    auto It = VMap.find(GV);
-    if (It != VMap.end())
-      if (auto *Mapped = dyn_cast<Constant>(It->second))
-        return Mapped;
-    return C;
-  }
   if (auto *GV = dyn_cast<GlobalValue>(C)) {
+    if (GlobalRemaps)
+      if (auto *VarGV = dyn_cast<GlobalVariable>(GV)) {
+        auto GlobalIt = GlobalRemaps->find(VarGV);
+        if (GlobalIt != GlobalRemaps->end())
+          return GlobalIt->second;
+      }
     auto It = VMap.find(GV);
     if (It != VMap.end())
       if (auto *Mapped = dyn_cast<Constant>(It->second))
@@ -827,11 +814,12 @@ static Constant *remapConstantWithBlockAddressMapper(
   for (Use &U : C->operands()) {
     auto *OpC = dyn_cast<Constant>(U.get());
     if (!OpC)
-      return C;
+      return nullptr;
     if (OpC == C)
       return C;
-    Constant *Mapped = remapConstantWithBlockAddressMapper(
-        OpC, VMap, GlobalRemaps, MapBlockAddress);
+    Constant *Mapped = remapConstant(OpC, VMap, GlobalRemaps, MapBlockAddress);
+    if (!Mapped)
+      return nullptr;
     Ops.push_back(Mapped);
     Changed |= Mapped != OpC;
   }
@@ -846,51 +834,6 @@ static Constant *remapConstantWithBlockAddressMapper(
   if (isa<ConstantVector>(C))
     return ConstantVector::get(Ops);
   return C;
-}
-
-static Constant *remapConstant(
-    Constant *C, Function &Mega,
-    DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &FunctionBBMaps,
-    DenseMap<Function *, DenseMap<BasicBlock *, BasicBlock *>> &AddrHelperForFunction,
-    ValueToValueMapTy &VMap,
-    const DenseMap<GlobalVariable *, GlobalVariable *> *GlobalRemaps = nullptr) {
-  return remapConstantWithBlockAddressMapper(
-      C, VMap, GlobalRemaps, [&](BlockAddress *BA) -> Constant * {
-        auto FnIt = FunctionBBMaps.find(BA->getFunction());
-        if (FnIt == FunctionBBMaps.end())
-          return BA;
-        auto HelperFnIt = AddrHelperForFunction.find(BA->getFunction());
-        if (HelperFnIt != AddrHelperForFunction.end()) {
-          auto HelperIt = HelperFnIt->second.find(BA->getBasicBlock());
-          if (HelperIt != HelperFnIt->second.end())
-            return BlockAddress::get(&Mega, HelperIt->second);
-        }
-        BasicBlock *NewBB = FnIt->second.lookup(BA->getBasicBlock());
-        if (NewBB)
-          return BlockAddress::get(&Mega, NewBB);
-        return BA;
-      });
-}
-
-static Constant *remapConstant(Constant *C, Function *OldF, Function &Mega,
-                               DenseMap<BasicBlock *, BasicBlock *> &BBMap,
-                               ValueToValueMapTy &VMap,
-                               const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr,
-                               const DenseMap<GlobalVariable *, GlobalVariable *> *GlobalRemaps = nullptr) {
-  return remapConstantWithBlockAddressMapper(
-      C, VMap, GlobalRemaps, [&](BlockAddress *BA) -> Constant * {
-        if (BA->getFunction() != OldF)
-          return BA;
-        if (AddrHelperForOldBB) {
-          auto HelperIt = AddrHelperForOldBB->find(BA->getBasicBlock());
-          if (HelperIt != AddrHelperForOldBB->end())
-            return BlockAddress::get(&Mega, HelperIt->second);
-        }
-        BasicBlock *NewBB = BBMap.lookup(BA->getBasicBlock());
-        if (NewBB)
-          return BlockAddress::get(&Mega, NewBB);
-        return BA;
-      });
 }
 
 static GlobalVariable *createRemappedGlobalShell(GlobalVariable &GV,
@@ -920,12 +863,13 @@ static bool prepareModuleBlockAddressGlobals(
 
   SmallVector<GlobalVariable *, 8> Globals;
   for (GlobalVariable &GV : M.globals()) {
-    if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
-        !constantContainsBlockAddress(GV.getInitializer()))
+    if (!GV.hasInitializer() || !GV.hasLocalLinkage())
       continue;
 
     SmallPtrSet<Function *, 8> Owners;
     collectBlockAddressOwners(GV.getInitializer(), Owners);
+    if (Owners.empty())
+      continue;
     bool HasCandidateOwner = false;
     bool HasNonCandidateOwner = false;
     for (Function *Owner : Owners) {
@@ -949,9 +893,22 @@ static bool prepareModuleBlockAddressGlobals(
     GlobalVariable *NewGV = A.GlobalRemaps.lookup(GV);
     if (!NewGV)
       return false;
-    Constant *Init = remapConstant(GV->getInitializer(), Mega, FunctionBBMaps,
-                                   AddrHelperForFunction, EmptyVMap,
-                                   &A.GlobalRemaps);
+    Constant *Init = remapConstant(
+        GV->getInitializer(), EmptyVMap, &A.GlobalRemaps,
+        [&](BlockAddress *BA) -> Constant * {
+          auto FnIt = FunctionBBMaps.find(BA->getFunction());
+          if (FnIt == FunctionBBMaps.end())
+            return BA;
+          auto HelperFnIt = AddrHelperForFunction.find(BA->getFunction());
+          if (HelperFnIt != AddrHelperForFunction.end()) {
+            auto HelperIt = HelperFnIt->second.find(BA->getBasicBlock());
+            if (HelperIt != HelperFnIt->second.end())
+              return BlockAddress::get(&Mega, HelperIt->second);
+          }
+          if (BasicBlock *NewBB = FnIt->second.lookup(BA->getBasicBlock()))
+            return BlockAddress::get(&Mega, NewBB);
+          return BA;
+        });
     NewGV->setInitializer(Init);
   }
   return true;
@@ -984,8 +941,19 @@ static Value *mapValueForUse(Value *V, IRBuilder<> &B, ValueToValueMapTy &VMap,
   }
   if (auto *C = dyn_cast<Constant>(V))
     if (OldF && BBMap)
-      return remapConstant(C, OldF, *A.Mega, *BBMap, VMap,
-                           AddrHelperForOldBB, &A.GlobalRemaps);
+      return remapConstant(
+          C, VMap, &A.GlobalRemaps, [&](BlockAddress *BA) -> Constant * {
+            if (BA->getFunction() != OldF)
+              return BA;
+            if (AddrHelperForOldBB) {
+              auto HelperIt = AddrHelperForOldBB->find(BA->getBasicBlock());
+              if (HelperIt != AddrHelperForOldBB->end())
+                return BlockAddress::get(A.Mega, HelperIt->second);
+            }
+            if (BasicBlock *NewBB = BBMap->lookup(BA->getBasicBlock()))
+              return BlockAddress::get(A.Mega, NewBB);
+            return BA;
+          });
   if (auto *Call = dyn_cast<CallInst>(V)) {
     auto It = Layout.CallResultOffsets.find(Call);
     if (It != Layout.CallResultOffsets.end())
@@ -1419,12 +1387,9 @@ static bool writeIncomingPhis(
     MFLAArtifacts &A, Function *OldF,
     DenseMap<BasicBlock *, BasicBlock *> &BBMap,
     const DenseMap<BasicBlock *, BasicBlock *> *AddrHelperForOldBB = nullptr) {
-  // PHI nodes have parallel-copy semantics: every incoming value is the value
-  // held *before* the edge is taken.  Because each PHI is materialized as a
-  // frame slot and an incoming value may itself read a sibling PHI's slot
-  // (mapValueForUse loads the slot), we must compute every store value before
-  // committing any store -- otherwise a later PHI would observe an earlier
-  // PHI's just-written value instead of its old one.
+  // PHIs assign in parallel: each incoming value is read before the edge.
+  // Since a PHI slot may read a sibling PHI's slot, compute all store values
+  // before committing any, or a later PHI sees an earlier one's new value.
   SmallVector<std::pair<StorageRef, Value *>, 8> Pending;
   FrameRef CurFrame = currentFrame(B, A, Layout);
   for (Instruction &I : *Succ) {
@@ -2126,6 +2091,19 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
       for (BasicBlock *Cont : ContinuationsByCallee[Entry.first])
         IB->addDestination(Cont);
 
+  // A candidate that is never called by another candidate has no continuation
+  // resume points, leaving its return indirectbr with zero destinations. That
+  // path is dynamically dead (its continuation is never set), so replace the
+  // empty indirectbr with a direct branch to Exit rather than emit a degenerate
+  // terminator.
+  for (auto &Entry : ReturnDispatches)
+    for (IndirectBrInst *IB : Entry.second)
+      if (IB->getNumDestinations() == 0) {
+        BasicBlock *BB = IB->getParent();
+        IB->eraseFromParent();
+        BranchInst::Create(Exit, BB);
+      }
+
   return true;
 }
 
@@ -2139,17 +2117,11 @@ static void markNoUnwindIfNoThrowingCalls(Function &F) {
 }
 
 static void sanitizeWrapperAttributes(Function &F) {
-  F.removeFnAttr(Attribute::AlwaysInline);
-  F.removeFnAttr(Attribute::InlineHint);
-  F.removeFnAttr(Attribute::NoCallback);
+  // The rebuilt wrapper reads/writes a ctx and the cleanup path calls free, so
+  // the old body's memory-effect attrs are now lies; the rest stay valid.
   F.removeFnAttr(Attribute::NoFree);
-  F.removeFnAttr(Attribute::NoRecurse);
-  F.removeFnAttr(Attribute::NoSync);
-  F.removeFnAttr(Attribute::NoUnwind);
   F.removeFnAttr(Attribute::ReadNone);
   F.removeFnAttr(Attribute::ReadOnly);
-  F.removeFnAttr(Attribute::WillReturn);
-  F.removeFnAttr(Attribute::MustProgress);
   F.removeFnAttr(Attribute::Memory);
 }
 

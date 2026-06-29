@@ -312,15 +312,9 @@ Value *frameSlotPtr(IRBuilder<> &B, MFLAArtifacts &A, Value *Ctx,
   return frameSlotPtrImpl(B, A, Ctx, Frame, Ref);
 }
 
-// The physical alignment of a frame slot is bounded by the page base
-// alignment (16: malloc / the static ctx alloca) and the slot's compile-time
-// byte offset within a frame (slotIndex*FrameStride is a runtime multiple of
-// 16, so it does not raise the guarantee below 16). A slot type whose ABI
-// alignment exceeds this -- e.g. a 32-aligned vector -- must not have its
-// load/store tagged with the larger type alignment, or the access is
-// misaligned UB. commonAlignment keeps the correct (smaller-or-equal) value
-// for ordinary scalars and caps over-aligned slots at what the storage can
-// actually guarantee.
+// Frame storage is only 16-aligned (page base + 16-multiple stride), so an
+// over-aligned slot type (e.g. a 32-aligned vector) must not be tagged with
+// its larger ABI alignment. Cap the access alignment at what storage offers.
 static Align frameSlotAccessAlign(StorageRef Ref) {
   return commonAlignment(Align(16), FrameMetadataBytes + Ref.Offset);
 }
