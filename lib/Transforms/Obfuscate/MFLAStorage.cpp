@@ -1,5 +1,6 @@
 #include "MFLAInternal.h"
 #include "CryptoUtils.h"
+#include "Utils.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -35,10 +36,6 @@ void MFLAArtifacts::eraseFromParent() {
   RemappedGlobals.clear();
   GlobalRemaps.clear();
   EntryEdgeForFunction.clear();
-}
-
-Constant *constI64(LLVMContext &Ctx, uint64_t V) {
-  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
 }
 
 static uint64_t alignStorageOffset(uint64_t Offset, Align Alignment) {

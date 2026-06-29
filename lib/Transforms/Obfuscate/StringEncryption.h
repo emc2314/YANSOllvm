@@ -1,5 +1,4 @@
-#ifndef LLVM_STRING_ENCRYPTION_H
-#define LLVM_STRING_ENCRYPTION_H
+#pragma once
 // LLVM libs
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalValue.h"
@@ -105,4 +104,3 @@ public:
   static bool isRequired() { return true; } // 直接返回true即可
 };
 } // namespace llvm
-#endif

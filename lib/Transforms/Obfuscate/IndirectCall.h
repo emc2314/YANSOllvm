@@ -1,3 +1,4 @@
+#pragma once
 // LLVM libs
 #include "llvm/Analysis/CFG.h"
 #include "llvm/IR/Constants.h"

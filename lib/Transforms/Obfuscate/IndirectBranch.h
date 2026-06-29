@@ -1,5 +1,4 @@
-#ifndef LLVM_INDIRECTBRANCH_H
-#define LLVM_INDIRECTBRANCH_H
+#pragma once
 // LLVM libs
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -35,4 +34,3 @@ public:
   static bool isRequired() { return true; } // 直接返回true即可
 };
 } // namespace llvm
-#endif // LLVM_INDIRECTBRANCH_H

@@ -1,5 +1,4 @@
-#ifndef LLVM_INDIRECTGLOBALVARIABLE_H
-#define LLVM_INDIRECTGLOBALVARIABLE_H
+#pragma once
 // LLVM libs
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -38,4 +37,3 @@ public:
   static bool isRequired() { return true; } // 直接返回true即可
 };
 } // namespace llvm
-#endif // LLVM_INDIRECTGLOBALVARIABLE_H

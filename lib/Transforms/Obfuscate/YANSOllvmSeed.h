@@ -1,5 +1,4 @@
-#ifndef OBFUSCATION_YANSOLLVMSEED_H
-#define OBFUSCATION_YANSOLLVMSEED_H
+#pragma once
 
 #include "llvm/ADT/StringRef.h"
 
@@ -16,4 +15,3 @@ uint64_t yanso_basic_block_seed(const BasicBlock &BB, StringRef PassName);
 
 } // namespace llvm
 
-#endif // OBFUSCATION_YANSOLLVMSEED_H

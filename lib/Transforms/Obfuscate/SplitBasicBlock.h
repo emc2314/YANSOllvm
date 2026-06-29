@@ -1,5 +1,4 @@
-#ifndef LLVM_SPLIT_BASIC_BLOCK_H
-#define LLVM_SPLIT_BASIC_BLOCK_H
+#pragma once
 // LLVM libs
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/BasicBlock.h"
@@ -27,4 +26,3 @@ public:
   static bool isRequired() { return true; } // 直接返回true即可
 };
 } // namespace llvm
-#endif // LLVM_SPLIT_BASIC_BLOCK_H

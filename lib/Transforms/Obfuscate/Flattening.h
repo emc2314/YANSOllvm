@@ -1,5 +1,4 @@
-#ifndef LLVM_FLATTENING_H
-#define LLVM_FLATTENING_H
+#pragma once
 // LLVM libs
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Function.h"
@@ -24,4 +23,3 @@ public:
   static bool isRequired() { return true; }
 };
 } // namespace llvm
-#endif // LLVM_FLATTENING_H

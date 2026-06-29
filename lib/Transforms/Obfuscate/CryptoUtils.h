@@ -1,5 +1,4 @@
-#ifndef OBFUSCATION_CRYPTOUTILS_H
-#define OBFUSCATION_CRYPTOUTILS_H
+#pragma once
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -52,5 +51,3 @@ private:
 };
 
 } // namespace llvm
-
-#endif // OBFUSCATION_CRYPTOUTILS_H

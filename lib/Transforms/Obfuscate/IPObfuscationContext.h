@@ -1,5 +1,4 @@
-#ifndef OBFUSCATION_IPOBFUSCATIONCONTEXT_H
-#define OBFUSCATION_IPOBFUSCATIONCONTEXT_H
+#pragma once
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Function.h"
@@ -51,4 +50,3 @@ struct IPObfuscationContext {
 
 } // namespace llvm
 
-#endif

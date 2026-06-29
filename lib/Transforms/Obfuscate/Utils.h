@@ -1,5 +1,4 @@
-#ifndef LLVM_UTILS_H
-#define LLVM_UTILS_H
+#pragma once
 // LLVM libs
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -20,9 +19,9 @@
 // 常用宏定义
 #define INIT_CONTEXT(F) CONTEXT = &F.getContext()
 #define TYPE_I32 Type::getInt32Ty(*CONTEXT)
-#define CONST_I32(V) ConstantInt::get(TYPE_I32, V, false)
+#define CONST_I32(V) llvm::constI32(*CONTEXT, V)
 #define TYPE_I64 Type::getInt64Ty(*CONTEXT)
-#define CONST_I64(V) ConstantInt::get(TYPE_I64, V, false)
+#define CONST_I64(V) llvm::constI64(*CONTEXT, V)
 #define CONST(T, V) ConstantInt::get(T, V)
 extern llvm::LLVMContext *CONTEXT;
 // fla和bcf在混淆部分函数时会报错, 所以无法用命令行开启整体混淆
@@ -87,6 +86,16 @@ extern bool obf_function_name_cmd;
 using namespace std;
 namespace llvm {
 
+// Canonical helpers for the two integer-constant widths used pervasively across
+// the passes. Prefer these (explicit context, no global state) over the legacy
+// CONST_I32/CONST_I64 macros, which now just forward here through *CONTEXT.
+inline ConstantInt *constI32(LLVMContext &Ctx, uint64_t V) {
+  return ConstantInt::get(Type::getInt32Ty(Ctx), V);
+}
+inline ConstantInt *constI64(LLVMContext &Ctx, uint64_t V) {
+  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
+}
+
 inline BasicBlock::iterator it(Instruction *I) { return I->getIterator(); }
 inline BasicBlock::iterator it(Instruction &I) { return I.getIterator(); }
 inline Function::iterator it(BasicBlock *BB) { return BB->getIterator(); }
@@ -109,4 +118,3 @@ string rand_str(int len);
 // LLVM-MSVC有这个函数, 官方版LLVM没有 (LLVM:17.0.6 | LLVM-MSVC:3.2.6)
 void LowerConstantExpr(Function &F);
 } // namespace llvm
-#endif // LLVM_UTILS_H

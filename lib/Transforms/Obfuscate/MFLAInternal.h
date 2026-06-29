@@ -1,5 +1,4 @@
-#ifndef YANSOLLVM_MFLA_INTERNAL_H
-#define YANSOLLVM_MFLA_INTERNAL_H
+#pragma once
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -224,4 +223,3 @@ void storeState(llvm::IRBuilder<> &B, MFLAArtifacts &A, llvm::Value *State);
 
 } // namespace yansollvm::mfla
 
-#endif // YANSOLLVM_MFLA_INTERNAL_H

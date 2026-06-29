@@ -1,5 +1,4 @@
-#ifndef _BOGUSCONTROLFLOW_H_
-#define _BOGUSCONTROLFLOW_H_
+#pragma once
 // LLVM libs
 #include "llvm/ADT/Statistic.h"
 #include "llvm/CodeGen/ISDOpcodes.h"
@@ -45,5 +44,3 @@ public:
   static bool isRequired() { return true; } // 直接返回true即可
 };
 } // namespace llvm
-
-#endif

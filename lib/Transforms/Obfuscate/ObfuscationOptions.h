@@ -1,5 +1,4 @@
-#ifndef OBFUSCATION_OBFUSCATIONOPTIONS_H
-#define OBFUSCATION_OBFUSCATIONOPTIONS_H
+#pragma once
 #include <llvm/Support/YAMLParser.h>
 #include <set>
 namespace llvm {
@@ -23,4 +22,3 @@ private:
   std::set<std::string> FunctionFilter;
 };
 } // namespace llvm
-#endif

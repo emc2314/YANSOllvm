@@ -67,10 +67,6 @@ struct SCCInfo {
   bool Recursive = false;
 };
 
-static Constant *constI64(LLVMContext &Ctx, uint64_t V) {
-  return ConstantInt::get(Type::getInt64Ty(Ctx), V);
-}
-
 static bool hasUnsupportedCallBr(Function &F) {
   for (BasicBlock &BB : F)
     if (isa<CallBrInst>(BB.getTerminator()))

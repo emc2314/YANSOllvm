@@ -12,8 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef _SUBSTITUTIONS_H_
-#define _SUBSTITUTIONS_H_
+#pragma once
 
 // LLVM include
 #include "CryptoUtils.h"
@@ -88,8 +87,7 @@ public:
   void xorSubstitution(BinaryOperator *bo);
   void xorSubstitutionRand(BinaryOperator *bo);
 
-  static bool isRequired() { return true; } // ֱ�ӷ���true����
+  static bool isRequired() { return true; }
 };
 } // namespace llvm
 
-#endif
