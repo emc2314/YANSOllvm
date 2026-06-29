@@ -7,6 +7,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -251,11 +252,15 @@ static bool pruneCandidatesForBlockAddressGlobals(
 }
 
 static void collectBlockAddresses(Constant *C, Function &F,
-                                  SmallPtrSetImpl<BasicBlock *> &Blocks) {
+                                  SmallVectorImpl<BasicBlock *> &Blocks) {
+  SmallPtrSet<BasicBlock *, 8> Found;
   forEachBlockAddress(C, [&](BlockAddress *BA) {
     if (BA->getFunction() == &F)
-      Blocks.insert(BA->getBasicBlock());
+      Found.insert(BA->getBasicBlock());
   });
+  for (BasicBlock &BB : F)
+    if (Found.contains(&BB))
+      Blocks.push_back(&BB);
 }
 
 static SmallVector<BasicBlock *, 8> collectAddressTakenBlocks(Function &F) {
@@ -272,7 +277,7 @@ static SmallVector<BasicBlock *, 8> collectAddressTakenBlocks(Function &F) {
         auto *C = dyn_cast<Constant>(U.get());
         if (!C)
           continue;
-        SmallPtrSet<BasicBlock *, 8> Found;
+        SmallVector<BasicBlock *, 8> Found;
         collectBlockAddresses(C, F, Found);
         for (BasicBlock *AddrBB : Found)
           Add(AddrBB);
@@ -287,7 +292,7 @@ static SmallVector<BasicBlock *, 8> collectAddressTakenBlocks(Function &F) {
     if (!GV.hasInitializer() || !GV.hasLocalLinkage() ||
         !constantUsesOnlyBlockAddressesInFunction(GV.getInitializer(), F))
       continue;
-    SmallPtrSet<BasicBlock *, 8> Found;
+    SmallVector<BasicBlock *, 8> Found;
     collectBlockAddresses(GV.getInitializer(), F, Found);
     for (BasicBlock *AddrBB : Found)
       Add(AddrBB);
@@ -1083,11 +1088,70 @@ struct MFLAStateAllocator {
   }
 };
 
-static BasicBlock *pickAnchor(ArrayRef<BasicBlock *> Anchors,
-                              MFLAStateAllocator &StateAlloc) {
-  if (Anchors.empty())
-    report_fatal_error("missing mfla anchor candidates");
-  return Anchors[StateAlloc.RNG.range(static_cast<uint32_t>(Anchors.size()))];
+constexpr unsigned MFLAAnchorGroupSize = 8;
+
+struct AnchorPool {
+  SmallVector<SmallVector<BasicBlock *, MFLAAnchorGroupSize>, 32> Groups;
+  DenseMap<BasicBlock *, unsigned> GroupFor;
+};
+
+static void addAnchorConstraint(
+    SmallVectorImpl<SmallVector<BasicBlock *, MFLAAnchorGroupSize>> &Constraints,
+    ArrayRef<BasicBlock *> Blocks) {
+  SmallVector<BasicBlock *, MFLAAnchorGroupSize> Unique;
+  for (BasicBlock *BB : Blocks) {
+    if (!BB || llvm::find(Unique, BB) != Unique.end())
+      continue;
+    Unique.push_back(BB);
+  }
+  if (Unique.size() > 1)
+    Constraints.push_back(std::move(Unique));
+}
+
+static void buildAnchorPool(
+    SmallVectorImpl<BasicBlock *> &Targets,
+    ArrayRef<SmallVector<BasicBlock *, MFLAAnchorGroupSize>> Constraints,
+    MFLAStateAllocator &StateAlloc, AnchorPool &AP) {
+  StateAlloc.RNG.shuffle(Targets);
+
+  EquivalenceClasses<BasicBlock *> Classes;
+  for (BasicBlock *BB : Targets)
+    Classes.insert(BB);
+  for (const auto &Group : Constraints) {
+    if (Group.empty())
+      continue;
+    for (BasicBlock *BB : Group)
+      Classes.unionSets(Group.front(), BB);
+  }
+
+  DenseMap<BasicBlock *, SmallVector<BasicBlock *, MFLAAnchorGroupSize>> ByRoot;
+  SmallVector<BasicBlock *, 32> Roots;
+  for (BasicBlock *BB : Targets) {
+    BasicBlock *Root = *Classes.findLeader(BB);
+    auto It = ByRoot.find(Root);
+    if (It == ByRoot.end()) {
+      Roots.push_back(Root);
+      It = ByRoot.try_emplace(Root).first;
+    }
+    It->second.push_back(BB);
+  }
+
+  for (BasicBlock *Root : Roots) {
+    SmallVector<BasicBlock *, MFLAAnchorGroupSize> &Group = ByRoot[Root];
+    unsigned Index = AP.Groups.size();
+    AP.Groups.push_back(std::move(Group));
+    for (BasicBlock *BB : AP.Groups.back())
+      AP.GroupFor[BB] = Index;
+  }
+}
+
+static BasicBlock *pickAnchorForTarget(BasicBlock *Target, const AnchorPool &AP,
+                                       MFLAStateAllocator &StateAlloc) {
+  auto It = AP.GroupFor.find(Target);
+  if (It == AP.GroupFor.end())
+    report_fatal_error("missing mfla anchor target");
+  const auto &Group = AP.Groups[It->second];
+  return Group[StateAlloc.RNG.range(static_cast<uint32_t>(Group.size()))];
 }
 
 static uint64_t stateFor(BasicBlock *BB,
@@ -1421,10 +1485,10 @@ static void createAddressTakenHelper(Function &Mega, MFLAArtifacts &A,
                                      BasicBlock *Helper, BasicBlock *RealTarget,
                                      DenseMap<BasicBlock *, uint64_t> &StateFor,
                                      MFLAStateAllocator &StateAlloc,
-                                     ArrayRef<BasicBlock *> AnchorCandidates) {
+                                     AnchorPool &Anchors) {
   IRBuilder<> B(Helper);
   uint64_t TargetState = stateFor(RealTarget, StateFor);
-  BasicBlock *EdgeAnchor = pickAnchor(AnchorCandidates, StateAlloc);
+  BasicBlock *EdgeAnchor = pickAnchorForTarget(RealTarget, Anchors, StateAlloc);
   storeState(B, A, constI64(Mega.getContext(), TargetState));
   Value *Target = encodedTarget(
       B, Mega, EdgeAnchor, loadEdgeConstant(B, A, EdgeAnchor, RealTarget, TargetState),
@@ -1447,7 +1511,7 @@ struct LoweringContext {
   BasicBlock *Anchor = nullptr;
   BasicBlock *Exit = nullptr;
   DenseMap<Function *, SmallVector<BasicBlock *, 4>> &ContinuationsByCallee;
-  ArrayRef<BasicBlock *> AnchorCandidates;
+  AnchorPool &Anchors;
 };
 
 struct FunctionTerminatorContext {
@@ -1521,6 +1585,9 @@ static PushedContinuation pushContinuation(
   Pushed.ResumeBlock = BasicBlock::Create(
       LCtx.Mega.getContext(), "mfla.call.cont", &LCtx.Mega, LCtx.Exit);
   Pushed.ResumeState = LCtx.StateAlloc.assign(Pushed.ResumeBlock, LCtx.StateFor);
+  // Return continuations and address-taken helpers are inserted after the
+  // initial target ordering.  Keep them self-anchored for now; they cannot
+  // participate in the fixed-size target groups without post-layout grouping.
   Pushed.CalleeEntryState = CalleeState;
   LCtx.ContinuationsByCallee[Callee].push_back(Pushed.ResumeBlock);
   Pushed.Record = continuationRecord(
@@ -1656,7 +1723,23 @@ static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
     if (!Cond || !NewDefault)
       return false;
 
-    BasicBlock *EdgeAnchor = pickAnchor(LCtx.AnchorCandidates, LCtx.StateAlloc);
+    SmallVector<BasicBlock *, 8> Destinations;
+    auto addDest = [&](BasicBlock *BB) {
+      BasicBlock *NewSucc = BBMap.lookup(BB);
+      if (!NewSucc)
+        return false;
+      if (llvm::find(Destinations, NewSucc) == Destinations.end())
+        Destinations.push_back(NewSucc);
+      return true;
+    };
+    if (!addDest(OldDefault))
+      return false;
+    for (auto Case : Sw->cases())
+      if (!addDest(Case.getCaseSuccessor()))
+        return false;
+
+    BasicBlock *EdgeAnchor = pickAnchorForTarget(Destinations.front(), LCtx.Anchors,
+                                                LCtx.StateAlloc);
     uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
     uint64_t DefaultState = stateFor(NewDefault, LCtx.StateFor);
     Value *CurState = loadState(B, A, "mfla.switch.cur.state");
@@ -1700,21 +1783,6 @@ static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
       if (Entry.first == OldDefault)
         Entry.second = TakeDefault;
 
-    SmallVector<BasicBlock *, 8> Destinations;
-    auto addDest = [&](BasicBlock *BB) {
-      BasicBlock *NewSucc = BBMap.lookup(BB);
-      if (!NewSucc)
-        return false;
-      if (llvm::find(Destinations, NewSucc) == Destinations.end())
-        Destinations.push_back(NewSucc);
-      return true;
-    };
-    if (!addDest(OldDefault))
-      return false;
-    for (auto Case : Sw->cases())
-      if (!addDest(Case.getCaseSuccessor()))
-        return false;
-
     for (auto &Entry : SuccConds) {
       if (hasPhiNodes(Entry.first)) {
         if (!writeIncomingPhis(B, Mega.getParent()->getDataLayout(), Pred,
@@ -1740,7 +1808,8 @@ static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
                                        Pred, OldSucc, nullptr, VMap, Layout, A,
                                        OldF, BBMap, AddrHelperForOldBB))
       return false;
-    BasicBlock *EdgeAnchor = pickAnchor(LCtx.AnchorCandidates, LCtx.StateAlloc);
+    BasicBlock *EdgeAnchor = pickAnchorForTarget(NewSucc, LCtx.Anchors,
+                                                 LCtx.StateAlloc);
     uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
     uint64_t ToState = stateFor(NewSucc, LCtx.StateFor);
     Value *NextState = transitionState(B, loadState(B, A, "mfla.cur.state"),
@@ -1763,7 +1832,8 @@ static bool createThreadedTerminator(IRBuilder<> &B, Instruction *OldTerm,
   if (!Cond || !TrueBB || !FalseBB)
     return false;
 
-  BasicBlock *EdgeAnchor = pickAnchor(LCtx.AnchorCandidates, LCtx.StateAlloc);
+  BasicBlock *EdgeAnchor = pickAnchorForTarget(FalseBB, LCtx.Anchors,
+                                               LCtx.StateAlloc);
   uint64_t FromState = stateFor(B.GetInsertBlock(), LCtx.StateFor);
   uint64_t TrueState = stateFor(TrueBB, LCtx.StateFor);
   uint64_t FalseState = stateFor(FalseBB, LCtx.StateFor);
@@ -1943,11 +2013,16 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   DenseMap<BasicBlock *, uint64_t> StateFor;
   SmallVector<BasicBlock *, 32> AnchorCandidates;
   MFLAStateAllocator StateAlloc(M);
-  for (auto &FnEntry : FunctionBBMaps)
-    for (auto &BBEntry : FnEntry.second) {
-      StateAlloc.assign(BBEntry.second, StateFor);
-      AnchorCandidates.push_back(BBEntry.second);
+  for (Function *F : Candidates) {
+    DenseMap<BasicBlock *, BasicBlock *> &BBMap = FunctionBBMaps[F];
+    for (BasicBlock &BB : *F) {
+      BasicBlock *NewBB = BBMap.lookup(&BB);
+      if (!NewBB)
+        return false;
+      StateAlloc.assign(NewBB, StateFor);
+      AnchorCandidates.push_back(NewBB);
     }
+  }
 
   for (Function *F : Candidates) {
     DenseMap<BasicBlock *, BasicBlock *> &Helpers = AddrHelperForFunction[F];
@@ -1958,20 +2033,82 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
       std::string Name = (RealTarget->getName() + ".addr.helper").str();
       BasicBlock *Helper = BasicBlock::Create(Ctx, Name, &Mega, Exit);
       Helpers[OldBB] = Helper;
+      StateAlloc.assign(Helper, StateFor);
       AnchorCandidates.push_back(Helper);
     }
   }
+
+  AnchorPool AnchorPool;
+  SmallVector<SmallVector<BasicBlock *, MFLAAnchorGroupSize>, 32>
+      AnchorConstraints;
+
+  for (Function *F : Candidates) {
+    DenseMap<BasicBlock *, BasicBlock *> &BBMap = FunctionBBMaps[F];
+    DenseMap<BasicBlock *, BasicBlock *> &Helpers = AddrHelperForFunction[F];
+    for (BasicBlock &BB : *F) {
+      BasicBlock *Pred = BBMap.lookup(&BB);
+      if (!Pred)
+        return false;
+      Instruction *Term = BB.getTerminator();
+      if (auto *Br = dyn_cast<BranchInst>(Term)) {
+        if (Br->isConditional())
+          addAnchorConstraint(
+              AnchorConstraints,
+              {BBMap.lookup(Br->getSuccessor(0)), BBMap.lookup(Br->getSuccessor(1))});
+      } else if (auto *Sw = dyn_cast<SwitchInst>(Term)) {
+        SmallVector<BasicBlock *, 8> Targets;
+        Targets.push_back(BBMap.lookup(Sw->getDefaultDest()));
+        for (auto Case : Sw->cases())
+          Targets.push_back(BBMap.lookup(Case.getCaseSuccessor()));
+        addAnchorConstraint(AnchorConstraints, Targets);
+      }
+
+      for (Instruction &I : BB) {
+        auto *Call = dyn_cast<CallInst>(&I);
+        if (!Call)
+          continue;
+        auto PlanIt = CallsitePlans.find(Call);
+        if (PlanIt == CallsitePlans.end() || !isInternalEnter(PlanIt->second))
+          continue;
+        Function *Callee = directCalledFunction(Call);
+        if (BasicBlock *CalleeEntry = EntryBlockFor.lookup(Callee))
+          addAnchorConstraint(AnchorConstraints, {Pred, CalleeEntry});
+      }
+    }
+
+    SmallVector<BasicBlock *, 8> AddressTaken = collectAddressTakenBlocks(*F);
+    for (BasicBlock *OldBB : AddressTaken) {
+      auto HelperIt = Helpers.find(OldBB);
+      if (HelperIt == Helpers.end())
+        continue;
+      addAnchorConstraint(AnchorConstraints,
+                          {HelperIt->second, BBMap.lookup(OldBB)});
+    }
+  }
+
+  if (!EntryRegions.empty())
+    addAnchorConstraint(AnchorConstraints, EntryRegions);
+  buildAnchorPool(AnchorCandidates, AnchorConstraints, StateAlloc, AnchorPool);
+
   if (!prepareModuleBlockAddressGlobals(M, Mega, Candidates, FunctionBBMaps,
                                         AddrHelperForFunction, A))
     return false;
 
-  for (auto &FnEntry : AddrHelperForFunction)
-    for (auto &HelperEntry : FnEntry.second)
-      createAddressTakenHelper(Mega, A, HelperEntry.second,
-                               FunctionBBMaps[FnEntry.first][HelperEntry.first],
-                               StateFor, StateAlloc, AnchorCandidates);
+  for (Function *F : Candidates) {
+    DenseMap<BasicBlock *, BasicBlock *> &Helpers = AddrHelperForFunction[F];
+    DenseMap<BasicBlock *, BasicBlock *> &BBMap = FunctionBBMaps[F];
+    SmallVector<BasicBlock *, 8> AddressTaken = collectAddressTakenBlocks(*F);
+    for (BasicBlock *OldBB : AddressTaken) {
+      auto HelperIt = Helpers.find(OldBB);
+      if (HelperIt == Helpers.end())
+        continue;
+      createAddressTakenHelper(Mega, A, HelperIt->second, BBMap[OldBB], StateFor,
+                               StateAlloc, AnchorPool);
+    }
+  }
 
-  BasicBlock *Anchor = pickAnchor(AnchorCandidates, StateAlloc);
+  BasicBlock *Anchor = pickAnchorForTarget(EntryRegions.front(), AnchorPool,
+                                           StateAlloc);
   IRBuilder<> EntryB(Entry);
   storeState(EntryB, A, EntryState);
   Value *Target = encodedTarget(EntryB, Mega, Anchor, EntryEdge,
@@ -1991,7 +2128,7 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   LoweringContext LCtx{Mega, A, Layouts, CandidateIDs, CallsitePlans,
                        EntryBlockFor, AddrHelperForFunction, StateFor,
                        StateAlloc, Anchor, Exit, ContinuationsByCallee,
-                       AnchorCandidates};
+                       AnchorPool};
 
   for (Function *F : Candidates) {
     ValueToValueMapTy VMap;
@@ -2082,9 +2219,9 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
     }
   }
 
-  for (auto &Entry : ReturnDispatches)
-    for (IndirectBrInst *IB : Entry.second)
-      for (BasicBlock *Cont : ContinuationsByCallee[Entry.first])
+  for (Function *F : Candidates)
+    for (IndirectBrInst *IB : ReturnDispatches[F])
+      for (BasicBlock *Cont : ContinuationsByCallee[F])
         IB->addDestination(Cont);
 
   // A candidate that is never called by another candidate has no continuation
@@ -2092,8 +2229,8 @@ buildStructuralMega(MFLAArtifacts &A, ArrayRef<Function *> Candidates,
   // path is dynamically dead (its continuation is never set), so replace the
   // empty indirectbr with a direct branch to Exit rather than emit a degenerate
   // terminator.
-  for (auto &Entry : ReturnDispatches)
-    for (IndirectBrInst *IB : Entry.second)
+  for (Function *F : Candidates)
+    for (IndirectBrInst *IB : ReturnDispatches[F])
       if (IB->getNumDestinations() == 0) {
         BasicBlock *BB = IB->getParent();
         IB->eraseFromParent();

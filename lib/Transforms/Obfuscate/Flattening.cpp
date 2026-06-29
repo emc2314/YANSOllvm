@@ -4,10 +4,10 @@
 #include "YANSOllvmCommon.h"
 #include "YANSOllvmSeed.h"
 
+#include "llvm/ADT/IntEqClasses.h"
+
 #include <algorithm>
-#include <numeric>
 #include <optional>
-#include <random>
 #include <set>
 #include <unordered_set>
 #include <vector>
@@ -56,7 +56,7 @@ struct FlattenPlan {
 
   std::vector<BasicBlock *> Blocks;
   DenseMap<BasicBlock *, unsigned> BlockIndex;
-  std::vector<unsigned> Parent;
+  IntEqClasses BlockClasses;
   std::set<std::pair<BasicBlock *, BasicBlock *>> AtomicEdges;
   std::set<BasicBlock *> BlockedEntries;
 
@@ -75,20 +75,6 @@ struct Dispatcher {
   SwitchInst *Switch = nullptr;
 };
 
-static unsigned findRoot(FlattenPlan &P, unsigned I) {
-  while (P.Parent[I] != I) {
-    P.Parent[I] = P.Parent[P.Parent[I]];
-    I = P.Parent[I];
-  }
-  return I;
-}
-
-static unsigned findRoot(const FlattenPlan &P, unsigned I) {
-  while (P.Parent[I] != I)
-    I = P.Parent[I];
-  return I;
-}
-
 static bool inDomain(const FlattenPlan &P, BasicBlock *BB) {
   return P.BlockIndex.find(BB) != P.BlockIndex.end();
 }
@@ -98,10 +84,7 @@ static void unionBlocks(FlattenPlan &P, BasicBlock *A, BasicBlock *B) {
   auto BI = P.BlockIndex.find(B);
   if (AI == P.BlockIndex.end() || BI == P.BlockIndex.end())
     return;
-  unsigned AR = findRoot(P, AI->second);
-  unsigned BR = findRoot(P, BI->second);
-  if (AR != BR)
-    P.Parent[BR] = AR;
+  P.BlockClasses.join(AI->second, BI->second);
 }
 
 static bool sameRegion(const FlattenPlan &P, BasicBlock *A, BasicBlock *B) {
@@ -159,7 +142,7 @@ static BasicBlock *createSyntheticEntry(FlattenPlan &P, BasicBlock *Target,
   BranchInst::Create(Target, Entry);
   P.BlockIndex[Entry] = P.Blocks.size();
   P.Blocks.push_back(Entry);
-  P.Parent.push_back(P.Parent.size());
+  P.BlockClasses.grow(P.Blocks.size());
   return Entry;
 }
 
@@ -297,8 +280,7 @@ static bool collectBlocksAndEntry(FlattenPlan &P) {
       P.Blocks.push_back(&BB);
     }
   }
-  P.Parent.resize(P.Blocks.size());
-  std::iota(P.Parent.begin(), P.Parent.end(), 0);
+  P.BlockClasses.grow(P.Blocks.size());
 
   // Split a multi-successor entry so the dispatcher can own the entry edge.
   Instruction *EntryTerminator = P.EntryBB->getTerminator();
@@ -307,7 +289,7 @@ static bool collectBlocksAndEntry(FlattenPlan &P) {
         P.EntryBB->splitBasicBlock(EntryTerminator, "entry.region");
     P.BlockIndex[EntryRegion] = P.Blocks.size();
     P.Blocks.push_back(EntryRegion);
-    P.Parent.push_back(P.Parent.size());
+    P.BlockClasses.grow(P.Blocks.size());
     P.EntryTarget = EntryRegion;
   }
   return P.EntryTarget != nullptr;
@@ -419,7 +401,7 @@ static bool collectConstraints(FlattenPlan &P) {
 static bool materializeRegions(FlattenPlan &P) {
   DenseMap<unsigned, unsigned> RootToRegion;
   for (BasicBlock *BB : P.Blocks) {
-    unsigned Root = findRoot(P, P.BlockIndex[BB]);
+    unsigned Root = P.BlockClasses.findLeader(P.BlockIndex[BB]);
     auto It = RootToRegion.find(Root);
     unsigned R = 0;
     if (It == RootToRegion.end()) {
