@@ -16,6 +16,8 @@ namespace llvm {
 /// database without generating C++ emitter functions.
 class YMBA {
 public:
+  static constexpr double DefaultCostTemperature = 28.0;
+
   struct Relation {
     Value *L = nullptr;
     Value *R = nullptr;
@@ -23,8 +25,8 @@ public:
 
   static bool isSupportedBinaryOpcode(unsigned LLVMOpcode);
   static Value *emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
-                           Value *X, Value *Y, unsigned Variant,
-                           uint64_t Seed);
+                           Value *X, Value *Y, unsigned Variant, uint64_t Seed,
+                           double Temperature = DefaultCostTemperature);
 
   // Catalog-only hooks kept for the standalone self-test/debugging. Normal VM
   // emission should use emitBinary(), which owns catalog-vs-default fallback.
@@ -35,10 +37,12 @@ public:
 
   static Value *emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
                               ArrayRef<Value *> Args, unsigned Variant,
-                              uint64_t Seed);
+                              uint64_t Seed,
+                              double Temperature = DefaultCostTemperature);
 
   static Relation emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                               Value *Y, unsigned Index, uint64_t Seed);
+                               Value *Y, unsigned Index, uint64_t Seed,
+                               double Temperature = DefaultCostTemperature);
 
   /// Public for tests/debugging and for keeping generator constants stable.
   enum : uint16_t {

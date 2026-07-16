@@ -1,11 +1,11 @@
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang -O0 -emit-llvm -S %s -o %t/native-switch-region.ll
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %t/native-switch-region.ll -o %t/native-switch-region.fla.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=fla -verify-each -S %t/native-switch-region.ll -o %t/native-switch-region.fla.ll
 // RUN: grep 'switch i32' %t/native-switch-region.fla.ll
 // RUN: grep 'switch i64' %t/native-switch-region.fla.ll
 // RUN: %clang %t/native-switch-region.fla.ll -o %t/native-switch-region.fla
 // RUN: %t/native-switch-region.fla | grep '^native-switch:240$'
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -fla -connect -obfcon -sub -bcf -S %t/native-switch-region.ll -o %t/native-switch-region.aggressive.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=vm,merge,bb2func,fla,connect,sub,obfcon,bcf -verify-each -S %t/native-switch-region.ll -o %t/native-switch-region.aggressive.ll
 // RUN: %clang %t/native-switch-region.aggressive.ll -o %t/native-switch-region.aggressive
 // RUN: %t/native-switch-region.aggressive | grep '^native-switch:240$'
 

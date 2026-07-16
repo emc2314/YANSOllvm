@@ -12,8 +12,6 @@
 using namespace llvm;
 
 PreservedAnalyses ConnectPass::run(Function &F, FunctionAnalysisManager &) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
   Function *Func = &F;
   std::vector<BasicBlock *> OrigBB, DownBB, AllBB;
   YansoRNG RNG(yanso_function_seed(F, "connect"));

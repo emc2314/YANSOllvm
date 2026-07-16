@@ -2309,9 +2309,6 @@ static void rewriteAsWrapper(Function &F, MFLAArtifacts &A,
 } // namespace
 
 PreservedAnalyses MFLAPass::run(Module &M, ModuleAnalysisManager &) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
-
   std::vector<Function *> InitialCandidates;
   for (Function &F : M) {
     if (!isCandidate(F))

@@ -1,14 +1,14 @@
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang -O0 -emit-llvm -S %s -o %t/complex.ll
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -sobf -icall -igv -ibr -S %t/complex.ll -o %t/complex.indirect.ll
-// RUN: %clang %t/complex.indirect.ll -o %t/complex.indirect
-// RUN: %t/complex.indirect | grep '^alpha:37$'
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -connect -obfcon -S %t/complex.ll -o %t/complex.mixed.ll
-// RUN: %clang %t/complex.mixed.ll -o %t/complex.mixed
-// RUN: %t/complex.mixed | grep '^alpha:37$'
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -merge -bb2func -fla -connect -obfcon -sub -bcf -S %t/complex.ll -o %t/complex.aggressive.ll
-// RUN: %clang %t/complex.aggressive.ll -o %t/complex.aggressive
-// RUN: %t/complex.aggressive | grep '^alpha:37$'
+// RUN: %opt -load-pass-plugin %plugin -passes=obfcon,vm,bb2func,merge,fla,icall,bb2func -verify-each -S %t/complex.ll -o %t/complex.fla-icall.ll
+// RUN: %clang %t/complex.fla-icall.ll -o %t/complex.fla-icall
+// RUN: %t/complex.fla-icall | grep '^alpha:37$'
+// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -S %t/complex.ll -o %t/complex.yanso.ll
+// RUN: %clang %t/complex.yanso.ll -o %t/complex.yanso
+// RUN: %t/complex.yanso | grep '^alpha:37$'
+// RUN: %opt -load-pass-plugin %plugin -passes=connect,yanso -verify-each -S %t/complex.ll -o %t/complex.connect-yanso.ll
+// RUN: %clang %t/complex.connect-yanso.ll -o %t/complex.connect-yanso
+// RUN: %t/complex.connect-yanso | grep '^alpha:37$'
 
 #include <stdio.h>
 

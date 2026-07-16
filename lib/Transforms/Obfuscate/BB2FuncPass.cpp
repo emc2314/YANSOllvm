@@ -511,12 +511,15 @@ std::optional<RegionCandidate> buildBranchArmRegion(BasicBlock &Header,
 }
 
 void uniqueSuccessors(SwitchInst &SI, SmallVectorImpl<BasicBlock *> &Succs) {
-  Succs.push_back(SI.getDefaultDest());
-  for (auto &C : SI.cases())
-    Succs.push_back(C.getCaseSuccessor());
+  SmallPtrSet<BasicBlock *, 8> Seen;
+  auto Add = [&](BasicBlock *BB) {
+    if (Seen.insert(BB).second)
+      Succs.push_back(BB);
+  };
 
-  llvm::sort(Succs);
-  Succs.erase(std::unique(Succs.begin(), Succs.end()), Succs.end());
+  Add(SI.getDefaultDest());
+  for (auto &C : SI.cases())
+    Add(C.getCaseSuccessor());
 }
 
 std::optional<RegionCandidate> buildSwitchSubsetRegion(BasicBlock &Header,
@@ -689,9 +692,6 @@ static bool runBB2FuncOnFunction(Function &F) {
 } // namespace
 
 PreservedAnalyses BB2FuncPass::run(Module &M, ModuleAnalysisManager &) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
-
   SmallVector<Function *, 32> Worklist;
   for (Function &F : M)
     if (!F.isDeclaration())

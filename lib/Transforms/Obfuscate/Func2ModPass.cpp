@@ -3,6 +3,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -13,6 +14,10 @@
 #include <string>
 
 using namespace llvm;
+
+static cl::opt<unsigned>
+    Func2ModOutputs("func2mod-outputs", cl::init(3),
+                    cl::desc("yansollvm func2mod output partition count"));
 
 static void externalizeForFunc2Mod(GlobalValue &GV) {
   if (GV.isDeclaration())
@@ -28,9 +33,6 @@ static void externalizeForFunc2Mod(GlobalValue &GV) {
 }
 
 PreservedAnalyses Func2ModPass::run(Module &M, ModuleAnalysisManager &) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
-
   // func2mod is a side-effecting pass: it emits split bitcode modules.
   // Keep that behavior, but use LLVM's maintained SplitModule utility.
   // than copying the old partitioning implementation.
@@ -50,7 +52,7 @@ PreservedAnalyses Func2ModPass::run(Module &M, ModuleAnalysisManager &) {
   sys::path::remove_filename(OutputDir);
 
   unsigned I = 0;
-  SplitModule(M, NumOutputs, [&](std::unique_ptr<Module> MPart) {
+  SplitModule(M, Func2ModOutputs, [&](std::unique_ptr<Module> MPart) {
     std::error_code EC;
     bool HasMain = false;
     for (Function &F : *MPart) {

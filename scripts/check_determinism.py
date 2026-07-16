@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Basic yansollvm determinism smoke test.
 
-Runs selected pass flag sets twice on the same input and compares output IR bytes.
-This intentionally stays simple: no normalization, no broad matrix.
+Runs selected pass pipelines twice on the same input and compares output IR
+bytes. This intentionally stays simple: no normalization, no broad matrix.
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ import subprocess
 from pathlib import Path
 
 CASES = [
-    ("tests/shape/shape.ll", "-fla -sub -split"),
-    ("tests/shape/shape.ll", "-vm"),
-    ("tests/shape/shape.ll", "-connect"),
-    ("tests/pipelines/basic-pipeline.c", "-sobf -icall -ibr -igv"),
-    ("tests/pipelines/complex-pipelines.c", "-split -fla -sub -bcf -ibr -icall -igv -vm -merge -bb2func -connect -obfcon"),
+    ("tests/shape/shape.ll", "fla,sub,split"),
+    ("tests/shape/shape.ll", "vm"),
+    ("tests/shape/shape.ll", "connect"),
+    ("tests/pipelines/basic-pipeline.c", "sobf,icall,ibr,igv"),
+    ("tests/pipelines/complex-pipelines.c", "yanso"),
 ]
 
 
@@ -52,32 +52,31 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
 
     failures = []
-    for idx, (rel_input, flags) in enumerate(CASES):
+    for idx, (rel_input, pipeline) in enumerate(CASES):
         src = args.repo / rel_input
-        flag_list = flags.split()
         ll_input = src
         temp_ll = None
         if src.suffix == ".c":
             temp_ll = args.out / f"case{idx}.input.ll"
             cp = run([str(clang), "-std=gnu89", "-O0", "-Xclang", "-disable-O0-optnone", "-emit-llvm", "-S", str(src), "-o", str(temp_ll)])
             if cp.returncode != 0:
-                failures.append((rel_input, flags, "emit_ir", cp.stderr))
+                failures.append((rel_input, pipeline, "emit_ir", cp.stderr))
                 continue
             ll_input = temp_ll
 
         hashes = []
         for run_idx in range(2):
             out = args.out / f"case{idx}.run{run_idx}.ll"
-            cmd = [str(opt), "-load-pass-plugin", str(plugin), "-passes=yanso,verify", f"-yanso-seed={args.seed}", *flag_list, "-S", str(ll_input), "-o", str(out)]
+            cmd = [str(opt), "-load-pass-plugin", str(plugin), f"-passes={pipeline},verify", f"-yanso-seed={args.seed}", "-S", str(ll_input), "-o", str(out)]
             cp = run(cmd)
             if cp.returncode != 0:
-                failures.append((rel_input, flags, "opt", cp.stderr))
+                failures.append((rel_input, pipeline, "opt", cp.stderr))
                 break
             hashes.append(sha256(out))
         if len(hashes) == 2 and hashes[0] != hashes[1]:
-            failures.append((rel_input, flags, "mismatch", f"{hashes[0]} != {hashes[1]}"))
+            failures.append((rel_input, pipeline, "mismatch", f"{hashes[0]} != {hashes[1]}"))
         elif len(hashes) == 2:
-            print(f"PASS {rel_input} {flags} {hashes[0]}")
+            print(f"PASS {rel_input} {pipeline} {hashes[0]}")
 
     if failures:
         for f in failures:

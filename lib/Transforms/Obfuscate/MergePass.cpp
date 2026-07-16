@@ -824,9 +824,6 @@ static uint64_t blockFrequencyForCall(
 } // namespace
 
 PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &MAM) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
-
   FunctionAnalysisManager &FAM =
       MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   std::unordered_map<Function *, BlockFrequencyInfo *> BFICache;

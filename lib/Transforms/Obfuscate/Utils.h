@@ -24,9 +24,6 @@
 #define CONST_I64(V) llvm::constI64(*CONTEXT, V)
 #define CONST(T, V) ConstantInt::get(T, V)
 extern llvm::LLVMContext *CONTEXT;
-// fla和bcf在混淆部分函数时会报错, 所以无法用命令行开启整体混淆
-// 而且Visual Studio似乎没法把 annotate 传给LLVM, 只能用函数名控制
-extern bool obf_function_name_cmd;
 #define YANSO_WARN_STREAM llvm::errs()
 #define YANSO_ERROR_STREAM llvm::errs()
 #define YANSO_WARN_SKIP_FUNCTION(PASS, F, REASON)                              \

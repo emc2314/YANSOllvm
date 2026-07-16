@@ -2,12 +2,12 @@
 // RUN: %clang -O0 -emit-llvm -S %s -o %t/pipeline.ll
 // RUN: %clang %t/pipeline.ll -o %t/orig
 // RUN: %t/orig > %t/orig.stdout
-// RUN: grep '^pipeline-mfla:54$' %t/orig.stdout
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -bb2func -merge -mfla -bb2func -S %t/pipeline.ll -o %t/pipeline.obf.ll
+// RUN: grep '^yanso-recursive:54$' %t/orig.stdout
+// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -S %t/pipeline.ll -o %t/pipeline.obf.ll
 // RUN: grep '__yansollvm_mfla_main' %t/pipeline.obf.ll
 // RUN: %clang %t/pipeline.obf.ll -o %t/obf
 // RUN: %t/obf > %t/obf.stdout
-// RUN: grep '^pipeline-mfla:54$' %t/obf.stdout
+// RUN: grep '^yanso-recursive:54$' %t/obf.stdout
 
 #include <stdio.h>
 
@@ -44,7 +44,7 @@ __attribute__((noinline, used)) static int run_all(int x) {
 int main(void) {
   int r = run_all(5);
   observed_sink = r;
-  printf("pipeline-mfla:%d\n", r);
+  printf("yanso-recursive:%d\n", r);
   if (observed_sink != 54)
     return 2;
   return r == 54 ? 0 : 1;

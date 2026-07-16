@@ -240,8 +240,6 @@ public:
 } // namespace
 
 PreservedAnalyses ObfConPass::run(Function &F, FunctionAnalysisManager &) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
   ObfConImpl Impl;
   return Impl.run(F) ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

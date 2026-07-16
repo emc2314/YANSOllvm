@@ -1,6 +1,6 @@
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang++ -O0 -emit-llvm -S %s -o %t/eh-cleanup.ll
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %t/eh-cleanup.ll -o %t/eh-cleanup.fla.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=fla -verify-each -S %t/eh-cleanup.ll -o %t/eh-cleanup.fla.ll
 // RUN: grep 'switch i64' %t/eh-cleanup.fla.ll
 // RUN: grep 'landingpad' %t/eh-cleanup.fla.ll
 // RUN: %clang++ %t/eh-cleanup.fla.ll -o %t/eh-cleanup

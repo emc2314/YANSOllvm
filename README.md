@@ -2,233 +2,223 @@
 
 Yet Another Not So Obfuscated LLVM.
 
-This branch ports YANSOllvm to LLVM 21 as an out-of-tree pass plugin. The old
-LLVM 9 branch was an in-tree LLVM source overlay; this branch keeps the pass
-implementation in this repository and builds it against an external LLVM 21
-installation.
+YANSOllvm is an LLVM 21 obfuscation pass plugin. `ObfCall` is not currently
+available because it requires LLVM core and X86 backend changes beyond the
+normal plugin interface.
 
-## Layout
+## Build
 
-- Plugin target: `yansollvm`
-- Plugin artifact: `build/yansollvm.so`
-- Plugin entry: `lib/Transforms/Obfuscate/YANSOllvmPlugin.cpp`
-- Pass sources: `lib/Transforms/Obfuscate/`
-- Tests: `tests/`
-- Helper scripts: `scripts/`
+Requirements:
 
-The `lib/Transforms/Obfuscate/` path is retained from the original repository so
-the LLVM 21 port stays visibly related to the main branch. The build is still
-out-of-tree: this repository no longer vendors or overwrites LLVM source files.
-
-## Requirements
-
-- LLVM 21.1.8 build with `clang`, `opt`, and `llvm-lit`
-- CMake 3.20+
-- Ninja
-
-Set `LLVM_BUILD` to the LLVM build directory. It must contain
-`lib/cmake/llvm` and `bin/clang`.
+- LLVM 21 build compatible with 21.1.8 and configured with
+  `-DLLVM_ENABLE_PROJECTS=clang`
+- CMake 3.20+, Ninja, and Python 3
+- Valgrind for the MFLA cleanup test
 
 ```bash
 export LLVM_BUILD=/path/to/llvm-project/build
-```
-
-## Build and test
-
-```bash
 cmake -S . -B build -G Ninja -DLLVM_DIR="$LLVM_BUILD/lib/cmake/llvm"
 ninja -C build check-yansollvm
 ```
 
-Equivalent helper:
-
-```bash
-LLVM_BUILD=/path/to/llvm-project/build scripts/build_and_smoke.sh
-```
-
-The lit tests use the plugin built at `build/yansollvm.so`. Temporary lit output
-is ignored under `tests/Output/`.
+`check-yansollvm` builds `build/yansollvm.so`, runs the YMBA catalog self-test,
+and then runs the lit suite. The `func2mod` test remains unsupported.
 
 ## Usage
-
-Compile source to LLVM IR:
 
 ```bash
 "$LLVM_BUILD/bin/clang" -O0 -Xclang -disable-O0-optnone \
   -emit-llvm -S input.c -o input.ll
-```
 
-Run the plugin through the LLVM new pass manager:
-
-```bash
 "$LLVM_BUILD/bin/opt" \
   -load-pass-plugin build/yansollvm.so \
-  -passes=yanso \
-  -fla -sub -split -bcf \
+  -passes='yanso,verify' \
   -S input.ll -o input.obf.ll
-```
 
-Compile the transformed IR:
-
-```bash
 "$LLVM_BUILD/bin/clang" input.obf.ll -o input.obf
 ```
 
-## Pass flags
+`yanso` appends this fixed sequence at its position in the pipeline:
 
-The LLVM 21 branch exposes a single new-pass-manager plugin pipeline:
-`-passes=yanso`. Individual obfuscation features are enabled by plugin-local
-LLVM command-line options such as `-vm`, `-fla`, or `-sobf`.
-
-This differs from the LLVM 9 main branch, where the original YANSOllvm passes
-were legacy-PM passes registered directly by `RegisterPass` and invoked as
-separate `opt -load LLVMObf.so -vm -merge ...` pass names.
-
-### Current LLVM 21 pass list
-
-| Flag | Current registration / invocation | Implementation origin | Status | Notes |
-| --- | --- | --- | --- | --- |
-| `-vm` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Replaces selected integer binary operators with helper calls. LLVM 9 used direct legacy-PM `RegisterPass("vm")`. |
-| `-merge` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Original YANSOllvm pass. | updated | Merges eligible function definitions into internal dispatchers. Local functions are rewritten at direct callsites; ordinary external definitions keep their public symbol and become wrappers. LLVM 9 used direct legacy-PM `RegisterPass("merge")`. |
-| `-mfla` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | YANSOllvm LLVM 21 module-level flattening pass. | experimental | Merges eligible non-recursive functions into one mega function with threaded `indirectbr` control flow. Uses global frame/state/return-continuation storage; not reentrant or thread-safe. See MFLA limitations below. |
-| `-func2mod` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass and writes side-effect bitcode outputs. | Original YANSOllvm pass. | updated / experimental | Module partitioning tool, not a normal protection pass. LLVM 9 had a direct legacy-PM `RegisterPass("func2mod")`. |
-| `-bb2func` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Extracts eligible basic blocks into new functions. LLVM 9 used direct legacy-PM `RegisterPass("bb2func")`. |
-| `-connect` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Splits/connects basic blocks and adds trap-backed default paths. LLVM 9 used direct legacy-PM `RegisterPass("connect")`. |
-| `-obfcon` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm pass. | updated | Splits and obfuscates integer constants. |
-| `-fla` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Original YANSOllvm flattening pass, updated for the LLVM 21 pipeline. | updated | Replaces the old user spelling `-flattening`; now handles native `switch` terminators without requiring a `LowerSwitch` pre-pass. |
-| `-split` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Imported obfuscation pass family; comments/header lineage point to Naville/OLLVM-style code. | ported | Basic-block splitting. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-sub` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Imported OLLVM-style operator substitution pass. | ported | Instruction substitution. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-bcf` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Imported OLLVM bogus-control-flow lineage with Naville modifications. | ported | Bogus control flow. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-icall` | `cl::opt` flag consumed by `-passes=yanso`; runs through the plugin's function-pass adaptor. | Imported Goron/Hikari-style indirect-call family. | ported | Indirect call. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-sobf` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass inside the plugin pipeline. | Imported Goron/Hikari-style string-encryption family. | ported | String encryption. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-ibr` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass after the function-pass adaptor. | Imported Goron/Hikari-style indirect-branch family; headers also carry Naville lineage. | ported | Indirect branch. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-igv` | `cl::opt` flag consumed by `-passes=yanso`; runs as a module pass after the function-pass adaptor. | Imported Goron/Hikari-style indirect-global-variable family; headers also carry Naville lineage. | ported | Indirect global variable. The LLVM 17 branch wired it by editing LLVM's `PassBuilder` start-extension callback. |
-| `-fncmd` | `cl::opt` flag consumed by `-passes=yanso`; controls `toObfuscate()` function-name marker selection. | Imported LLVM 17 branch control mechanism. | ported | Enables per-function markers such as `_fla_` and `_nofla_`; it is not an obfuscation transform by itself. |
-
-`func2mod` is not a normal protection pass. Keep it out of routine obfuscation
-pipelines unless the downstream multi-module link/package flow is explicit. Its
-output partition count is controlled by the `-func2mod-outputs=N` option, which
-is not a pass.
-
-Current status: `func2mod` is disabled in the default lit test set with
-`REQUIRES: func2mod`. The implementation calls LLVM's `SplitModule()` helper,
-whose definition lives in the `TransformUtils` component. In this out-of-tree
-pass-plugin build, `opt` does not export that symbol to the plugin, so running
-`-func2mod` currently fails at load/run time with an undefined
-`llvm::SplitModule(...)` symbol. Do not fix this by statically linking
-`TransformUtils` into `yansollvm.so`: that pulls duplicate LLVM static globals
-into the plugin and causes duplicate command-line option registration inside
-`opt`. Treat `func2mod` as a separate follow-up: either implement splitting
-without `SplitModule`, build it as a standalone tool, or use an LLVM shared
-library setup where the symbol is exported by the host.
-
-### Merge notes
-
-This LLVM 21 merge pass groups candidates into bounded dispatchers instead of
-one module-wide mega dispatcher. Its dispatcher scalar slots are storage slots,
-not source-level types: `float` reuses `i32`, `double` and pointers reuse `i64`,
-and narrower scalar slots may be promoted into available `i64` slots. Ordinary
-external definitions keep their public symbol and are rewritten as wrappers that
-call an internal dispatcher. The hidden `-merge-max-group-size=N` option caps
-dispatcher group size; default is 8.
-
-### MFLA limitations
-
-`-mfla` is currently experimental. It lowers eligible functions into one mega
-function and stores arguments, return values, PHI spill slots, the current MFLA
-state, and return-continuation metadata in internal globals such as
-`__yansollvm_mfla_frame`, `__yansollvm_mfla_state`,
-`__yansollvm_mfla_ret_cont_xor`, and `__yansollvm_mfla_ret_cont_edge`.
-Because that storage is process-global, transformed functions are not reentrant
-and are not thread-safe: recursive SCCs are skipped, but concurrent calls,
-signal/async reentry, callbacks that reenter transformed code, or other native
-reentry can corrupt the shared frame/state/continuation slots. Use `-mfla` only
-for code paths where calls into the transformed set are externally serialized, or
-keep those functions out of the MFLA candidate set until a TLS/explicit-context
-runtime is implemented.
-
-Other current MFLA constraints: varargs, selected ABI attributes, dynamic stack
-state, EH pads, `callbr`, non-scalar frame values, and escaping or unsupported
-`blockaddress` use domains are skipped. Native input `indirectbr` terminators
-are lowered through address-taken helper blocks that set the MFLA state and then
-use the encoded-edge jump path; destination PHI slots are filled at the original
-indirectbr source through the same mux-based PHI lowering used by switch/branch
-edges.
-
-### Difference from the LLVM 9 main branch
-
-The LLVM 9 main branch was an in-tree LLVM overlay. Its original YANSOllvm pass
-set was registered directly into the legacy pass manager:
-
-- `RegisterPass("vm")`
-- `RegisterPass("merge")`
-- `RegisterPass("bb2func")`
-- `RegisterPass("flattening")`
-- `RegisterPass("connect")`
-- `RegisterPass("obfcon")`
-- `RegisterPass("obfCall")`
-- `RegisterPass("func2mod")`
-
-This LLVM 21 branch changes the call surface:
-
-- The only pipeline name registered with LLVM is `yanso`, via
-  `PassBuilder::registerPipelineParsingCallback` in the out-of-tree plugin.
-- The user now invokes the plugin as `-load-pass-plugin build/yansollvm.so
-  -passes=yanso`, then enables features with `cl::opt` flags.
-- Original YANSOllvm passes are treated as updated implementations, not merely
-  external ports: `-vm`, `-merge`, `-func2mod`, `-bb2func`, `-connect`,
-  `-obfcon`, and `-fla`.
-- `-fla` is the updated LLVM 21 spelling/implementation for the old flattening
-  pass. The old user-facing name was `-flattening`.
-- `-split`, `-sub`, `-bcf`, `-icall`, `-sobf`, `-ibr`, `-igv`, and `-fncmd` are
-  ported imported passes/control logic from the LLVM 17 branch's obfuscation
-  family rather than original YANSOllvm passes.
-- `-obfCall` is not implemented in this LLVM 21 plugin. The original version
-  depends on LLVM core IR calling-convention IDs, X86 backend lowering, register
-  masks, and TableGen-generated calling-convention code. Those changes are not
-  compatible with a normal out-of-tree `opt` plugin and are intentionally not
-  carried in this branch.
-
-## Suggested pipelines
-
-Conservative CFG/data obfuscation:
-
-```bash
--passes=yanso -split -fla -sub -bcf
+```text
+obfcon -> vm -> bb2func -> merge -> mfla -> bb2func
 ```
 
-Call graph + CFG + constants:
+Passes can be placed before or after the alias and may be repeated:
 
 ```bash
--passes=yanso -vm -merge -bb2func -fla -connect -obfcon -sub -bcf
+-passes='sobf,yanso,ibr,verify'
+-passes='obfcon,yanso,bb2func,verify'
 ```
 
-## Determinism smoke test
+Use `-yanso-seed=<string>` to change the deterministic project seed.
 
-After building the plugin:
+### Protection pipeline
 
-```bash
-LLVM_BUILD=/path/to/llvm-project/build python3 scripts/check_determinism.py
+The default sequence builds protection in layers:
+
+1. `vm` selects bounded local operation DAGs and turns them into super-op
+   handlers. Each operation or DAG can choose among seeded expression, YMBA
+   relation, data-mux, and control-flow variants.
+2. `merge` groups those handlers together with eligible program functions
+   behind keyed shared dispatchers. In the VM pipeline this acts as an op-fusion
+   layer: individual helper identities and ABIs are absorbed into larger fused
+   entries.
+3. `mfla` converts eligible calls and returns across the merged set into a
+   threaded continuation machine. At this point handlers, fused operations,
+   business CFG, virtual frames, and dispatch state form one VM-like protection
+   domain rather than separate transformations.
+
+## Passes
+
+| Pass | Provenance | Maturity | Key technique |
+| --- | --- | --- | --- |
+| `vm` | Original | Stable | Fuses local scalar/GEP/load DAGs into super-op handlers. YMBA relations, mutation wrappers, and bounded per-operation variants diversify both expression and CFG shape; stores remain conservative single operations. |
+| `merge` | Original | Stable | Forms cost-guided dispatcher groups using semantic similarity, call weight, ABI shape, and slot pressure. Keyed XOR selectors and shared typed storage hide distinct functions behind ABI- and EH-aware wrappers. |
+| `mfla` | Original | Experimental | Module-wide flattening through CPS: internal calls and returns become continuation records plus frame/state jumps inside a threaded mega function. Recursive SCCs, tail-frame reuse, paged logical frames, encoded targets, and `indirectbr` remove ordinary call/return structure. |
+| `bb2func` | Original | Stable | Reshapes linear and dense CFG regions, scores branch arms, switch subsets, subchains, and single blocks, then extracts legal candidates with `CodeExtractor`. |
+| `obfcon` | Original | Stable | Rebuilds constants with modular inverses, XOR, and additive identities; zero values can be derived from live integer data through seeded opaque expressions. |
+| `connect` | Original | Stable | Splits and shuffles blocks, then replaces direct edges with opaque switch connectors containing decoy destinations and trap-backed defaults. |
+| `func2mod` | Original | Experimental | Externalizes definitions and emits configurable verified bitcode shards through LLVM `SplitModule`; it is a partitioning tool, not a normal protection transform. |
+| `fla` | Enhanced | Stable | Region-aware flattening preserves atomic, EH, native, and address-taken boundaries. Dual state/hash-state transitions feed a rolling `mix64` dispatcher, with encoded transitions for cross-region edges. |
+| `split` | Ported | Unmaintained | Basic-block splitting. |
+| `sub` | Ported | Unmaintained | Instruction substitution. |
+| `bcf` | Ported | Unmaintained | Bogus control flow. |
+| `icall` | Ported | Unmaintained | Indirect calls. |
+| `sobf` | Ported | Unmaintained | String encryption. |
+| `ibr` | Ported | Unmaintained | Indirect branches. |
+| `igv` | Ported | Unmaintained | Indirect global-variable access. |
+
+### MFLA design
+
+MFLA performs module-level flattening through continuation-passing style (CPS).
+Eligible functions become ABI-preserving wrappers around one threaded mega
+function. An internal call no longer executes as a native call:
+
+```text
+store arguments -> push/reuse logical frame -> record continuation
+-> update encoded state -> jump to callee entry
 ```
 
-By default this writes temporary files under `build/determinism/`.
+A return applies the saved continuation, copies the result to its caller slot,
+restores or releases the frame, and jumps to the resume state. Recursive SCCs
+use child frame tokens; eligible self-tail calls reuse the current frame.
 
-## LLVM test-suite matrix helper
+Branch, switch, call, and return transfers share state-keyed encoded targets
+and eventually reach `indirectbr`. Arguments, PHIs, spills, fixed allocas,
+results, and continuation records live in logical frame storage. Frames are
+allocated from linked pages on demand and recycled through a free list, while
+each external wrapper invocation owns an independent context.
 
-For broader local validation:
+The result is not only a larger FLA: ordinary function boundaries, native
+internal call/return edges, and a directly readable call graph are replaced by
+one continuation and state machine. Applied after `vm` and `merge`, this is the
+stage that turns super-op handlers and op fusion into a VM-style protected
+program.
+
+### Tuning options
+
+- `-yanso-seed=<string>`: root seed for deterministic pass choices; default
+  `YANSOllvm`.
+- `-vm-op-max-len=N`: maximum instructions fused into one VM DAG/super-op;
+  default 4. Set 1 for single-operation handlers.
+- `-vm-max-variants-per-op=N`: maximum helper bodies retained per
+  operation/type bucket; default 8. Set 0 for no cap.
+- `-vm-mutation-variant-permille=N`: probability per thousand of selecting VM
+  structural mutation wrappers; default 500.
+- `-vm-relation-app-variant-permille=N`: probability per thousand of embedding
+  a generated YMBA relation application; default 500.
+- `-vm-ymba-temperature=T`: cost temperature for choosing catalog YMBA versus
+  built-in expressions and relations; default 28. Positive values favor lower
+  cost, zero selects the minimum cost, and negative values favor higher-cost
+  MBA. Larger absolute values flatten the distribution toward uniform.
+- `-merge-max-group-size=N`: maximum functions or handlers fused into one
+  merge dispatcher; default 8. Larger groups increase ambiguity but also ABI
+  slot pressure and code size.
+- `-mfla-frames-per-page=N`: logical activation records per MFLA frame page;
+  default 16. Smaller values allocate and resolve more pages.
+- `-mfla-page-table-block-entries=N`: page pointers stored in each linked MFLA
+  page-table block; default 16.
+- `-func2mod-outputs=N`: number of emitted bitcode shards; default 3.
+
+The VM, Merge, and MFLA controls are hidden implementation-tuning options and
+may change.
+
+## Correctness and limitations
+
+### MFLA concurrency and reentry
+
+MFLA no longer stores activation state in process-global frame or continuation
+arrays. Each wrapper invocation creates an independent context, so ordinary
+concurrent calls from different threads do not share MFLA frame state.
+
+Internal CPS calls are state jumps within the current mega-function invocation,
+not native reentry. Direct and mutual recursion use logical child frames and
+are covered by runtime tests. A native boundary callback into a transformed
+wrapper does create a nested mega-function invocation; the separate context
+design should isolate it, but callback reentry and multi-thread stress are not
+currently tested and should still be treated as experimental.
+
+MFLA also changes concurrency-relevant runtime behavior:
+
+- frame pages and page-table blocks use `malloc`/`free`, which may lock,
+  synchronize, invoke allocator hooks, fail, or trap on OOM even when the
+  original function performed no allocation;
+- allocator-backed execution is not async-signal-safe, so signal-handler
+  reentry is unsupported;
+- wrapper attribute sanitization removes memory-effect and `nofree`
+  attributes, but concurrency/progress/call-graph attributes such as `nosync`,
+  `willreturn`, and `norecurse` have not been fully audited;
+- atomic and thread-heavy programs have no dedicated MFLA correctness tests.
+
+### MFLA exceptions and Windows EH
+
+MFLA does not currently lower EH regions. Functions containing landing pads,
+Windows `catchpad`/`cleanuppad` funclets, `invoke`-style terminators, or other
+unsupported EH control are left outside the MFLA domain. Potentially throwing
+internal CPS calls are also rejected.
+
+If a native boundary call unwinds through a transformed wrapper, normal
+`malloc` page cleanup is bypassed because MFLA does not yet emit EH cleanup
+regions; this can leak frame storage. POSIX thread cancellation can have the
+same issue. Windows funclet EH is regression-tested for `fla`, and `merge`
+rewrites supported `invoke` callsites, but neither implies Windows EH support
+inside MFLA.
+
+### MFLA eligibility
+
+MFLA needs at least two eligible functions. It supports integer, pointer,
+floating-point, and fixed-vector frame values. It skips dynamic stack state,
+scalable allocas, varargs, selected ABI attributes, `musttail`, `callbr`,
+unsupported terminators, and unsafe `blockaddress` domains.
+
+### Other passes
+
+VM, Merge, BB2Func, ObfCon, Connect, and FLA do not add shared mutable runtime
+state. VM explicitly leaves volatile and atomic memory operations out of its
+memory handlers. No inherent cross-thread activation-state issue is currently
+known for these passes, although broad multi-thread testing is still missing.
+
+`func2mod` is disabled in the default test set. Its use of `llvm::SplitModule`
+requires a host configuration that exports the symbol; component-style static
+`opt` builds may fail to resolve it.
+
+Dedicated test coverage is still missing for `icall`, `ibr`, `igv`, `split`,
+`sub`, `bcf`, `connect`, and `obfcon`.
+
+## Additional validation
 
 ```bash
 LLVM_BUILD=/path/to/llvm-project/build \
+  python3 scripts/check_determinism.py
+
+LLVM_BUILD=/path/to/llvm-project/build \
 LLVM_TEST_SUITE=/path/to/llvm-test-suite \
-python3 scripts/run_llvm_test_suite_pass_matrix.py
+  python3 scripts/run_llvm_test_suite_pass_matrix.py
 ```
 
-By default this writes results under `build/test-suite-runs/`.
+Outputs are written under `build/determinism/` and `build/test-suite-runs/`.
 
 ## License
 
-The project is released under GPLv3. See `LICENSE`.
-
-Some pass code is derived from or inspired by the original YANSOllvm sources and
-third-party LLVM obfuscation work noted in the main branch history. LLVM itself
-is not vendored in this branch.
+GPLv3. See `LICENSE`.

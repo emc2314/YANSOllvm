@@ -16,10 +16,6 @@
 using namespace llvm;
 
 namespace {
-// Fixed for now: not a runtime pass option, so the self-test can link YMBA
-// without pulling command-line option RTTI into the standalone binary.
-static constexpr double YMBACostTemperature = 16.0;
-
 // Postfix bytecode opcodes. Same-width integer stack only.
 enum : uint8_t {
   BC_VAR_X = 0x01,
@@ -940,22 +936,35 @@ static double unitDouble(uint64_t X) {
   return static_cast<double>(X >> 11) * (1.0 / 9007199254740992.0);
 }
 
-static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed) {
+static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed,
+                                    double Temperature) {
   assert(!Costs.empty());
-  double T = YMBACostTemperature;
-  if (T <= 0.0) {
+  if (std::isnan(Temperature))
+    Temperature = YMBA::DefaultCostTemperature;
+  if (Temperature == 0.0) {
     unsigned Best = 0;
     for (unsigned I = 1, E = Costs.size(); I != E; ++I)
       if (Costs[I] < Costs[Best])
         Best = I;
     return Best;
   }
+  if (std::isinf(Temperature))
+    return yanso_mix64(Seed, 0xd6e8feb86659fd93ULL) % Costs.size();
+
+  SmallVector<double, 16> LogWeights;
+  LogWeights.reserve(Costs.size());
+  double MaxLogWeight = -static_cast<double>(Costs.front()) / Temperature;
+  for (unsigned C : Costs) {
+    double LogWeight = -static_cast<double>(C) / Temperature;
+    LogWeights.push_back(LogWeight);
+    MaxLogWeight = std::max(MaxLogWeight, LogWeight);
+  }
 
   double Total = 0.0;
   SmallVector<double, 16> Weights;
   Weights.reserve(Costs.size());
-  for (unsigned C : Costs) {
-    double W = std::exp(-static_cast<double>(C) / T);
+  for (double LogWeight : LogWeights) {
+    double W = std::exp(LogWeight - MaxLogWeight);
     Weights.push_back(W);
     Total += W;
   }
@@ -971,25 +980,27 @@ static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed) {
   return Weights.size() - 1;
 }
 
-static const RewriteRecord *selectWeightedRewrite(
-    ArrayRef<const RewriteRecord *> Rewrites, ArrayRef<unsigned> BuiltinCosts,
-    uint64_t Seed, unsigned &BuiltinIndex) {
+static const RewriteRecord *
+selectWeightedRewrite(ArrayRef<const RewriteRecord *> Rewrites,
+                      ArrayRef<unsigned> BuiltinCosts, uint64_t Seed,
+                      double Temperature, unsigned &BuiltinIndex) {
   SmallVector<unsigned, 32> Costs;
   Costs.reserve(Rewrites.size() + BuiltinCosts.size());
   for (const RewriteRecord *R : Rewrites)
     Costs.push_back(std::max(1U, catalog().exprCost(R->Expr)));
   Costs.append(BuiltinCosts.begin(), BuiltinCosts.end());
 
-  unsigned Pick = selectWeightedIndex(Costs, Seed);
+  unsigned Pick = selectWeightedIndex(Costs, Seed, Temperature);
   if (Pick < Rewrites.size())
     return Rewrites[Pick];
   BuiltinIndex = Pick - Rewrites.size();
   return nullptr;
 }
 
-static const RelationRecord *selectWeightedRelation(
-    ArrayRef<const RelationRecord *> Relations, ArrayRef<unsigned> BuiltinCosts,
-    uint64_t Seed, unsigned &BuiltinIndex) {
+static const RelationRecord *
+selectWeightedRelation(ArrayRef<const RelationRecord *> Relations,
+                       ArrayRef<unsigned> BuiltinCosts, uint64_t Seed,
+                       double Temperature, unsigned &BuiltinIndex) {
   SmallVector<unsigned, 32> Costs;
   Costs.reserve(Relations.size() + BuiltinCosts.size());
   for (const RelationRecord *R : Relations) {
@@ -999,13 +1010,12 @@ static const RelationRecord *selectWeightedRelation(
   }
   Costs.append(BuiltinCosts.begin(), BuiltinCosts.end());
 
-  unsigned Pick = selectWeightedIndex(Costs, Seed);
+  unsigned Pick = selectWeightedIndex(Costs, Seed, Temperature);
   if (Pick < Relations.size())
     return Relations[Pick];
   BuiltinIndex = Pick - Relations.size();
   return nullptr;
 }
-
 
 bool YMBA::isSupportedBinaryOpcode(unsigned LLVMOpcode) {
   switch (LLVMOpcode) {
@@ -1048,7 +1058,8 @@ Value *YMBA::emitRewrite(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
 }
 
 Value *YMBA::emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
-                        Value *X, Value *Y, unsigned Variant, uint64_t Seed) {
+                        Value *X, Value *Y, unsigned Variant, uint64_t Seed,
+                        double Temperature) {
   auto Op = toYMBAOpcode(LLVMOpcode);
   SmallVector<const RewriteRecord *, 16> Rewrites;
   if (Op)
@@ -1058,8 +1069,8 @@ Value *YMBA::emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
 
   unsigned BuiltinIndex = Variant;
   if (!BuiltinCosts.empty()) {
-    if (const RewriteRecord *R =
-            selectWeightedRewrite(Rewrites, BuiltinCosts, Seed, BuiltinIndex))
+    if (const RewriteRecord *R = selectWeightedRewrite(
+            Rewrites, BuiltinCosts, Seed, Temperature, BuiltinIndex))
       if (Value *V = catalog().emitExpr(B, Ty, X, Y, R->Expr))
         return V;
   }
@@ -1084,7 +1095,7 @@ static bool isSupportedIntrinsicRewriteShape(Intrinsic::ID ID,
 
 Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
                            ArrayRef<Value *> Args, unsigned Variant,
-                           uint64_t Seed) {
+                           uint64_t Seed, double Temperature) {
   auto Op = intrinsicToYMBAOpcode(ID);
   SmallVector<const RewriteRecord *, 16> Rewrites;
   if (Op && isSupportedIntrinsicRewriteShape(ID, Args))
@@ -1093,8 +1104,8 @@ Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
   if (!Rewrites.empty()) {
     unsigned SelectedBuiltin = 0;
     if (const RewriteRecord *R =
-            selectWeightedRewrite(Rewrites, ArrayRef<unsigned>(1U),
-                                  Seed, SelectedBuiltin)) {
+            selectWeightedRewrite(Rewrites, ArrayRef<unsigned>(1U), Seed,
+                                  Temperature, SelectedBuiltin)) {
       Value *X = Args.empty() ? ConstantInt::get(Ty, 0) : Args[0];
       Value *Y = Args.size() >= 2 ? Args[1] : ConstantInt::get(Ty, 0);
       // fshl/fshr have three LLVM operands. YMBA models rotate amount as Y.
@@ -1112,9 +1123,9 @@ Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
   return decorateIntegerResult(B, Ty, R, BuiltinIndex, Seed, "vm.intr.out");
 }
 
-
 YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                                  Value *Y, unsigned Index, uint64_t Seed) {
+                                  Value *Y, unsigned Index, uint64_t Seed,
+                                  double Temperature) {
   SmallVector<const RelationRecord *, 32> Relations;
   catalog().collectRelations(Ty->getBitWidth(), Relations);
   SmallVector<unsigned, 8> BuiltinCosts;
@@ -1122,8 +1133,8 @@ YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
     BuiltinCosts.push_back(builtinRelationCost(I));
 
   unsigned BuiltinIndex = Index;
-  if (const RelationRecord *R =
-          selectWeightedRelation(Relations, BuiltinCosts, Seed, BuiltinIndex)) {
+  if (const RelationRecord *R = selectWeightedRelation(
+          Relations, BuiltinCosts, Seed, Temperature, BuiltinIndex)) {
     Value *L = catalog().emitExpr(B, Ty, X, Y, R->LExpr);
     Value *RV = catalog().emitExpr(B, Ty, X, Y, R->RExpr);
     if (L && RV)

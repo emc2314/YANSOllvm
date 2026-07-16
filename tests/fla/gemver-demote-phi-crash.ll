@@ -1,4 +1,4 @@
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %s -o %t
+; RUN: %opt -load-pass-plugin %plugin -passes=fla -verify-each -S %s -o %t
 ; ModuleID = '/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Polybench/linear-algebra/blas/gemver/gemver.c'
 source_filename = "/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Polybench/linear-algebra/blas/gemver/gemver.c"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"

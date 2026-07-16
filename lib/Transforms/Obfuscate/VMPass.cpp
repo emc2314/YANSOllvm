@@ -1310,8 +1310,6 @@ public:
 } // namespace
 
 PreservedAnalyses VMPass::run(Module &M, ModuleAnalysisManager &) {
-  if (!Enabled)
-    return PreservedAnalyses::all();
   VirtualizeImpl Impl;
   return Impl.run(M) ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

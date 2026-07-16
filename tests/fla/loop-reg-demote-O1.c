@@ -11,7 +11,7 @@
 //
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang -O1 -emit-llvm -S %s -o %t/loop-reg-demote-O1.ll
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %t/loop-reg-demote-O1.ll -o %t/loop-reg-demote-O1.fla.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=fla -verify-each -S %t/loop-reg-demote-O1.ll -o %t/loop-reg-demote-O1.fla.ll
 // RUN: grep 'switch i64' %t/loop-reg-demote-O1.fla.ll
 // RUN: %clang %t/loop-reg-demote-O1.fla.ll -o %t/loop-reg-demote-O1
 // RUN: %t/loop-reg-demote-O1 | grep '^sum=90$'

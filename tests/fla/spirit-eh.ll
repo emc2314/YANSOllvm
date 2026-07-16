@@ -5,7 +5,7 @@
 ; now runs by default as a heavyweight regression guard.  Assert both that opt
 ; finishes and that the flattened IR is still valid enough to lower to an object.
 ; RUN: rm -rf %t && mkdir -p %t
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %s -o %t/spirit-eh.fla.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=fla -verify-each -S %s -o %t/spirit-eh.fla.ll
 ; RUN: %clang -c %t/spirit-eh.fla.ll -o %t/spirit-eh.o
 ; ModuleID = '/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Misc-C++-EH/spirit.cpp'
 source_filename = "/root/yansollvm/work/llvm-test-suite/SingleSource/Benchmarks/Misc-C++-EH/spirit.cpp"

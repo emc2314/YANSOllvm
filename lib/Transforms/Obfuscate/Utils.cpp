@@ -1,12 +1,15 @@
 // Shared yansollvm IR utilities.
 #include "Utils.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 using std::vector;
 
 LLVMContext *CONTEXT = nullptr;
-bool obf_function_name_cmd = false;
+static cl::opt<bool> EnableFunctionNameControl(
+    "fncmd", cl::init(false), cl::Hidden,
+    cl::desc("enable legacy function-name control for ported passes"));
 
 std::string llvm::readAnnotate(Function *f) {
   std::string Annotation;
@@ -61,7 +64,7 @@ bool llvm::toObfuscate(bool flag, Function *f, std::string const &attribute) {
   if (Annotation.find(Attr) != std::string::npos)
     return true;
 
-  if (obf_function_name_cmd) {
+  if (EnableFunctionNameControl) {
     if (f->getName().find("_" + NoAttr + "_") != StringRef::npos)
       return false;
     if (f->getName().find("_" + Attr + "_") != StringRef::npos)

@@ -1,6 +1,6 @@
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang -O0 -emit-llvm -S %s -o %t/smoke.ll
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -sub -split -S %t/smoke.ll -o %t/smoke.obf.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=split,fla,sub -verify-each -S %t/smoke.ll -o %t/smoke.obf.ll
 // RUN: %clang %t/smoke.obf.ll -o %t/smoke
 // RUN: %t/smoke | grep '^-108$'
 

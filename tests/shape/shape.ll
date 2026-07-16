@@ -1,14 +1,14 @@
 ; RUN: rm -rf %t && mkdir -p %t
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -sub -split -S %s -o %t/fla.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=split,fla,sub -verify-each -S %s -o %t/fla.ll
 ; RUN: grep 'switch i64' %t/fla.ll
 ; RUN: grep 'hashState.ptr' %t/fla.ll
 ; RUN: grep 'state.ptr' %t/fla.ll
 ; RUN: grep '421922839' %t/fla.ll
 ; RUN: grep '303814201677840' %t/fla.ll
 ; RUN: ! grep 'select i64' %t/fla.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -S %s -o %t/vm.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -S %s -o %t/vm.ll
 ; RUN: grep '__yansollvm_vm_add' %t/vm.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -connect -S %s -o %t/connect.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=connect -verify-each -S %s -o %t/connect.ll
 ; RUN: grep 'llvm.trap' %t/connect.ll
 
 source_filename = "shape.ll"

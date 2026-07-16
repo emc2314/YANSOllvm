@@ -12,7 +12,7 @@
 //
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: %clang++ -O1 -emit-llvm -S %s -o %t/eh-loop-O1.ll
-// RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -fla -S %t/eh-loop-O1.ll -o %t/eh-loop-O1.fla.ll
+// RUN: %opt -load-pass-plugin %plugin -passes=fla -verify-each -S %t/eh-loop-O1.ll -o %t/eh-loop-O1.fla.ll
 // RUN: grep 'switch i64' %t/eh-loop-O1.fla.ll
 // RUN: grep 'invoke' %t/eh-loop-O1.fla.ll
 // RUN: grep 'landingpad' %t/eh-loop-O1.fla.ll

@@ -4,12 +4,22 @@
 #include "YANSOllvmCommon.h"
 #include "YANSOllvmSeed.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IntEqClasses.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <set>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -814,7 +824,7 @@ static void rewriteRegionExits(FlattenPlan &P, Dispatcher &D, YansoRNG &RNG) {
 PreservedAnalyses FlatteningPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
   Function *Fn = &F;
-  if (toObfuscate(flag, Fn, "fla") && shouldFlatten(*Fn)) {
+  if (shouldFlatten(*Fn)) {
     INIT_CONTEXT(F);
     if (flattenImpl(*Fn))
       ++Flattened;

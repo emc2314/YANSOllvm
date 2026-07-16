@@ -1,5 +1,5 @@
 ; RUN: rm -rf %t && mkdir -p %t
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -vm-op-max-len=1 -S %s -o %t/vm-expanded.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-op-max-len=1 -S %s -o %t/vm-expanded.ll
 ; RUN: grep '^define internal .* @__yansollvm_vm_' %t/vm-expanded.ll
 ; RUN: grep '^attributes #.*noinline nounwind optnone' %t/vm-expanded.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm,vm -verify-each -S %s -o %t/vm-twice.ll
@@ -7,6 +7,8 @@
 ; RUN: grep 'vm.rel\|vm.cast\|vm.intr\|vm.cf.loop\|vm.mux\|vm.pred.mux\|vm.select.mux' %t/vm-expanded.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-op-max-len=1 -vm-max-variants-per-op=1 -S %s -o %t/vm-cap1.ll
 ; RUN: test $(grep -c '^define internal i32 @__yansollvm_vm_add_i32' %t/vm-cap1.ll) -eq 1
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-op-max-len=1 -vm-ymba-temperature=-1.0 -S %s -o %t/vm-ymba-negative.ll
+; RUN: grep 'ymba\.' %t/vm-ymba-negative.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-op-max-len=4 -S %s -o %t/vm-op4.ll
 ; RUN: test $(grep -c '^define internal .* @__yansollvm_vm_' %t/vm-op4.ll) -ge 1
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-mutation-variant-permille=1000 -S %s -o %t/vm-cf.ll
@@ -28,7 +30,7 @@
 ; RUN: grep 'vm.cast.in\|vm.cast.out' %t/vm-expanded.ll
 ; RUN: %opt -load-pass-plugin %plugin -passes=vm,merge -verify-each -S %s -o %t/vm-merge.ll
 ; RUN: grep 'merge' %t/vm-merge.ll
-; RUN: %opt -load-pass-plugin %plugin -passes=yanso -verify-each -vm -icall -vm-op-max-len=1 -S %s -o %t/vm-icall.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm,icall -verify-each -vm-op-max-len=1 -S %s -o %t/vm-icall.ll
 ; RUN: grep '__yansollvm_vm_ctlz_i32' %t/vm-icall.ll
 ; RUN: grep '__yansollvm_vm_add_i32\|__yansollvm_vm_i32' %t/vm-expanded.ll
 ; RUN: grep '__yansollvm_vm_sub_i32\|__yansollvm_vm_i32' %t/vm-expanded.ll

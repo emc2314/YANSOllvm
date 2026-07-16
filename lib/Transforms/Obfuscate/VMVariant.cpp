@@ -6,11 +6,17 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
 namespace {
+
+static cl::opt<double> VMYMBATemperature(
+    "vm-ymba-temperature", cl::init(YMBA::DefaultCostTemperature), cl::Hidden,
+    cl::desc("YMBA cost temperature: positive favors lower cost, zero selects "
+             "minimum cost, negative favors higher cost"));
 
 template <typename VariantT>
 void fillRelationApplication(VariantT &V, uint64_t Seed) {
@@ -466,7 +472,8 @@ Value *VMVariantEmitter::emitSelectExpr(IRBuilder<> &B, Type *Ty, Value *Cond,
 VMVariantEmitter::Relation
 VMVariantEmitter::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
                                Value *Y, unsigned Variant, uint64_t Seed) {
-  YMBA::Relation Rel = YMBA::emitRelation(B, Ty, X, Y, Variant, Seed);
+  YMBA::Relation Rel =
+      YMBA::emitRelation(B, Ty, X, Y, Variant, Seed, VMYMBATemperature);
   if (Rel.L && Rel.R)
     return {Rel.L, Rel.R};
   return {loConst(Ty, 0), loConst(Ty, 0)};
@@ -745,10 +752,12 @@ Value *VMVariantEmitter::emitDataMuxBinaryValue(IRBuilder<> &B, unsigned Opcode,
                                                 Value *Y,
                                                 const BinaryVariant &Variant,
                                                 uint64_t Seed) {
-  Value *R0 = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+  Value *R0 = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed,
+                               VMYMBATemperature);
   R0 = applyRelation(B, Ty, R0, X, Y, Variant, Seed);
   Value *R1 = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant + 1,
-                              yanso_mix64(Seed, 0x13198a2e03707344ULL));
+                               yanso_mix64(Seed, 0x13198a2e03707344ULL),
+                               VMYMBATemperature);
   R1 = applyRelation(B, Ty, R1, X, Y, Variant,
                      yanso_mix64(Seed, 0x13198a2e03707344ULL));
 
@@ -795,7 +804,8 @@ Value *VMVariantEmitter::emitIntrinsicValue(IRBuilder<> &B, Intrinsic::ID ID,
                                             ArrayRef<Value *> Args,
                                             const ScalarVariant &Variant,
                                             uint64_t Seed) {
-  Value *R = YMBA::emitIntrinsic(B, ID, Ty, Args, Variant.ExprVariant, Seed);
+  Value *R = YMBA::emitIntrinsic(B, ID, Ty, Args, Variant.ExprVariant, Seed,
+                                 VMYMBATemperature);
   Value *RelX = Args.empty() ? R : Args[0];
   Value *RelY =
       (Args.size() >= 2 && Args[1]->getType() == Ty) ? Args[1] : loConst(Ty, 0);
@@ -913,11 +923,13 @@ Value *VMVariantEmitter::emitBinaryValue(IRBuilder<> &B, unsigned Opcode,
                                          uint64_t Seed) {
   switch (Variant.Mutation) {
   case MutationKind::None: {
-    Value *R = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+    Value *R = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed,
+                                VMYMBATemperature);
     return applyRelation(B, Ty, R, X, Y, Variant, Seed);
   }
   case MutationKind::BitRebuild: {
-    Value *R = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed);
+    Value *R = YMBA::emitBinary(B, Opcode, Ty, X, Y, Variant.ExprVariant, Seed,
+                                VMYMBATemperature);
     R = applyRelation(B, Ty, R, X, Y, Variant, Seed);
     return emitControlFlowBitRebuild(B, B.GetInsertBlock()->getParent(), Ty, R);
   }
