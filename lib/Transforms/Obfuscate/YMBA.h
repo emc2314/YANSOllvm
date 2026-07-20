@@ -25,24 +25,24 @@ public:
 
   static bool isSupportedBinaryOpcode(unsigned LLVMOpcode);
   static Value *emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
-                           Value *X, Value *Y, unsigned Variant, uint64_t Seed,
-                           double Temperature = DefaultCostTemperature);
+                           Value *X, Value *Y, uint64_t Seed);
 
-  // Catalog-only hooks kept for the standalone self-test/debugging. Normal VM
-  // emission should use emitBinary(), which owns catalog-vs-default fallback.
+  // Catalog-only hooks for the standalone self-test.
   static unsigned rewriteCount(unsigned LLVMOpcode, unsigned BitWidth);
-  static Value *emitRewrite(IRBuilder<> &B, unsigned LLVMOpcode,
-                            IntegerType *Ty, Value *X, Value *Y, unsigned Index,
-                            uint64_t Seed);
+  static Value *emitRewriteByIndex(IRBuilder<> &B, unsigned LLVMOpcode,
+                                   IntegerType *Ty, Value *X, Value *Y,
+                                   unsigned Index);
+  static unsigned relationCount(unsigned BitWidth);
+  static Relation emitRelationByIndex(IRBuilder<> &B, IntegerType *Ty, Value *X,
+                                      Value *Y, unsigned Index);
 
   static Value *emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
-                              ArrayRef<Value *> Args, unsigned Variant,
-                              uint64_t Seed,
-                              double Temperature = DefaultCostTemperature);
+                              ArrayRef<Value *> Args, uint64_t Seed);
 
   static Relation emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                               Value *Y, unsigned Index, uint64_t Seed,
-                               double Temperature = DefaultCostTemperature);
+                               Value *Y, uint64_t Seed);
+  static Relation emitSafeRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
+                                   Value *Y, uint64_t Seed);
 
   /// Public for tests/debugging and for keeping generator constants stable.
   enum : uint16_t {

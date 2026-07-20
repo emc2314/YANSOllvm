@@ -5,7 +5,7 @@
 namespace llvm {
 
 struct ObfConPass : PassInfoMixin<ObfConPass> {
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
 };
 
 } // namespace llvm

@@ -21,7 +21,7 @@ cmake -S . -B build -G Ninja -DLLVM_DIR="$LLVM_BUILD/lib/cmake/llvm"
 ninja -C build check-yansollvm
 ```
 
-`check-yansollvm` builds `build/yansollvm.so`, runs the YMBA catalog self-test,
+`check-yansollvm` builds `build/yansollvm.so`, runs the MBA catalog self-test,
 and then runs the lit suite. The `func2mod` test remains unsupported.
 
 ## Usage
@@ -55,29 +55,44 @@ Use `-yanso-seed=<string>` to change the deterministic project seed.
 
 ### Protection pipeline
 
-The default sequence builds protection in layers:
+The default `yanso` sequence is:
 
-1. `vm` selects bounded local operation DAGs and turns them into super-op
-   handlers. Each operation or DAG can choose among seeded expression, YMBA
-   relation, data-mux, and control-flow variants.
-2. `merge` groups those handlers together with eligible program functions
+```text
+obfcon -> vm -> bb2func -> merge -> mfla -> bb2func
+```
+
+It builds protection in layers:
+
+1. `obfcon` rewrites integer constants (including 0/1 via total MBA relations)
+   and encodes eligible local read-only arrays, including values reached through
+   `memcpy`, before later passes consume them.
+2. `vm` selects bounded local operation DAGs and turns them into super-op
+   handlers. A super-op contains one or more IR operations; scored candidate
+   selection favors semantically deep, mixed constant/data-flow shapes. Each
+   node can choose among seeded MBA, relation, data-mux, and control-flow
+   variants.
+3. `bb2func` (first) extracts dense CFG regions into helpers so later merge/mfla
+   see smaller, more fusible units.
+4. `merge` groups those handlers together with eligible program functions
    behind keyed shared dispatchers. In the VM pipeline this acts as an op-fusion
    layer: individual helper identities and ABIs are absorbed into larger fused
    entries.
-3. `mfla` converts eligible calls and returns across the merged set into a
+5. `mfla` converts eligible calls and returns across the merged set into a
    threaded continuation machine. At this point handlers, fused operations,
    business CFG, virtual frames, and dispatch state form one VM-like protection
    domain rather than separate transformations.
+6. `bb2func` (second) reshapes the post-MFLA CFG again so residual linear
+   regions do not stay as large, readable blocks.
 
 ## Passes
 
 | Pass | Provenance | Maturity | Key technique |
 | --- | --- | --- | --- |
-| `vm` | Original | Stable | Fuses local scalar/GEP/load DAGs into super-op handlers. YMBA relations, mutation wrappers, and bounded per-operation variants diversify both expression and CFG shape; stores remain conservative single operations. |
+| `vm` | Original | Stable | Fuses one or more local scalar/GEP/load operations into scored super-op handlers. MBA relations, mutation wrappers, and bounded per-super-op variants diversify both expression and CFG shape; stores remain conservative single-node super-ops. |
 | `merge` | Original | Stable | Forms cost-guided dispatcher groups using semantic similarity, call weight, ABI shape, and slot pressure. Keyed XOR selectors and shared typed storage hide distinct functions behind ABI- and EH-aware wrappers. |
 | `mfla` | Original | Experimental | Module-wide flattening through CPS: internal calls and returns become continuation records plus frame/state jumps inside a threaded mega function. Recursive SCCs, tail-frame reuse, paged logical frames, encoded targets, and `indirectbr` remove ordinary call/return structure. |
 | `bb2func` | Original | Stable | Reshapes linear and dense CFG regions, scores branch arms, switch subsets, subchains, and single blocks, then extracts legal candidates with `CodeExtractor`. |
-| `obfcon` | Original | Stable | Rebuilds constants with modular inverses, XOR, and additive identities; zero values can be derived from live integer data through seeded opaque expressions. |
+| `obfcon` | Original | Stable | Rebuilds integer constants with operation-aware identities and MBA relations, and encodes eligible local read-only arrays into affine-mapped byte shares, including arrays copied through `memcpy`. |
 | `connect` | Original | Stable | Splits and shuffles blocks, then replaces direct edges with opaque switch connectors containing decoy destinations and trap-backed defaults. |
 | `func2mod` | Original | Experimental | Externalizes definitions and emits configurable verified bitcode shards through LLVM `SplitModule`; it is a partitioning tool, not a normal protection transform. |
 | `fla` | Enhanced | Stable | Region-aware flattening preserves atomic, EH, native, and address-taken boundaries. Dual state/hash-state transitions feed a rolling `mix64` dispatcher, with encoded transitions for cross-region edges. |
@@ -112,23 +127,24 @@ each external wrapper invocation owns an independent context.
 
 The result is not only a larger FLA: ordinary function boundaries, native
 internal call/return edges, and a directly readable call graph are replaced by
-one continuation and state machine. Applied after `vm` and `merge`, this is the
-stage that turns super-op handlers and op fusion into a VM-style protected
-program.
+one continuation and state machine. In the default pipeline it runs after
+`obfcon`, `vm`, the first `bb2func`, and `merge`, and is followed by a second
+`bb2func`; that is the stage that turns super-op handlers and op fusion into a
+VM-style protected program.
 
 ### Tuning options
 
 - `-yanso-seed=<string>`: root seed for deterministic pass choices; default
   `YANSOllvm`.
-- `-vm-op-max-len=N`: maximum instructions fused into one VM DAG/super-op;
-  default 4. Set 1 for single-operation handlers.
-- `-vm-max-variants-per-op=N`: maximum helper bodies retained per
-  operation/type bucket; default 8. Set 0 for no cap.
+- `-vm-superop-max-len=N`: maximum instructions fused into one super-op;
+  default 4. Set 1 for single-node super-ops.
+- `-vm-max-variants-per-superop=N`: maximum bodies retained per super-op
+  shape; default 8. Set 0 for no cap.
 - `-vm-mutation-variant-permille=N`: probability per thousand of selecting VM
   structural mutation wrappers; default 500.
 - `-vm-relation-app-variant-permille=N`: probability per thousand of embedding
-  a generated YMBA relation application; default 500.
-- `-vm-ymba-temperature=T`: cost temperature for choosing catalog YMBA versus
+  a generated MBA relation application; default 500.
+- `-mba-temperature=T`: cost temperature for choosing catalog MBA versus
   built-in expressions and relations; default 28. Positive values favor lower
   cost, zero selects the minimum cost, and negative values favor higher-cost
   MBA. Larger absolute values flatten the distribution toward uniform.
@@ -204,7 +220,7 @@ requires a host configuration that exports the symbol; component-style static
 `opt` builds may fail to resolve it.
 
 Dedicated test coverage is still missing for `icall`, `ibr`, `igv`, `split`,
-`sub`, `bcf`, `connect`, and `obfcon`.
+`sub`, `bcf`, and `connect`.
 
 ## Additional validation
 

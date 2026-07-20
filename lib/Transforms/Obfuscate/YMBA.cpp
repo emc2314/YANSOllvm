@@ -8,6 +8,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/Support/CommandLine.h"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -16,6 +17,11 @@
 using namespace llvm;
 
 namespace {
+static cl::opt<double> MBATemperature(
+    "mba-temperature", cl::init(YMBA::DefaultCostTemperature), cl::Hidden,
+    cl::desc("MBA cost temperature: positive favors lower cost, zero selects "
+             "minimum cost, negative favors higher cost"));
+
 // Postfix bytecode opcodes. Same-width integer stack only.
 enum : uint8_t {
   BC_VAR_X = 0x01,
@@ -321,16 +327,14 @@ static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
     break;
   case 1: {
     Value *K = loConst(Ty, yanso_mix64(Seed, 0x510e527fade682d1ULL));
-    UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.xor0"), K,
-                       "vm.div.x.xor1");
+    UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.xor0"), K, "vm.div.x.xor1");
     break;
   }
   case 2: {
     Value *N = B.CreateOr(
         B.CreateAnd(X, loConst(Ty, yanso_mix64(Seed, 0x9b05688c2b3e6c1fULL))),
         loConst(Ty, 1), "vm.div.y.noise");
-    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.add"), N,
-                       "vm.div.y.sub");
+    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.add"), N, "vm.div.y.sub");
     break;
   }
   default: {
@@ -338,8 +342,8 @@ static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
     Value *N = B.CreateOr(B.CreateXor(X, K, "vm.div.xy.mix"), loConst(Ty, 1));
     UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.mixxor0"), K,
                        "vm.div.x.mixxor1");
-    UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.mixadd"), N,
-                       "vm.div.y.mixsub");
+    UseY =
+        B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.mixadd"), N, "vm.div.y.mixsub");
     break;
   }
   }
@@ -386,9 +390,9 @@ static void collectBuiltinBinaryCosts(unsigned Opcode,
   }
 }
 
-static Value *emitBuiltinBinary(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                                Value *X, Value *Y, unsigned Variant,
-                                uint64_t Seed) {
+static Value *emitBuiltinBinary(IRBuilder<> &B, unsigned Opcode,
+                                IntegerType *Ty, Value *X, Value *Y,
+                                unsigned Variant, uint64_t Seed) {
   // For i1 the multi-bit MBA forms emit a poison `shl i1, 1`. Since the value
   // set is {0,1}, disguise each op as an equivalent sibling instead:
   // and<->mul, xor<->add<->sub coincide at one bit, and or is rebuilt from them.
@@ -492,12 +496,12 @@ static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
   switch (Variant % 3) {
   case 0: {
     Value *A = (Variant & 8)
-                   ? emitRotateRight(B, Ty, X,
-                                     1 + ((Seed >> 21) % (Ty->getBitWidth() - 1)))
+                   ? emitRotateRight(
+                         B, Ty, X, 1 + ((Seed >> 21) % (Ty->getBitWidth() - 1)))
                    : X;
     Value *C = (Variant & 16)
-                   ? emitRotateRight(B, Ty, Y,
-                                     1 + ((Seed >> 29) % (Ty->getBitWidth() - 1)))
+                   ? emitRotateRight(
+                         B, Ty, Y, 1 + ((Seed >> 29) % (Ty->getBitWidth() - 1)))
                    : Y;
     Value *PA = B.CreateUnaryIntrinsic(Intrinsic::ctpop, A);
     Value *PC = B.CreateUnaryIntrinsic(Intrinsic::ctpop, C);
@@ -506,21 +510,21 @@ static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
     Value *PAnd = B.CreateUnaryIntrinsic(
         Intrinsic::ctpop, B.CreateAnd(A, C, "vm.rel.popcarry.and"));
     Value *L = B.CreateAdd(PA, PC, "vm.rel.lhs");
-    Value *R = B.CreateAdd(PXor, B.CreateShl(PAnd, loConst(Ty, 1)),
-                           "vm.rel.rhs");
+    Value *R =
+        B.CreateAdd(PXor, B.CreateShl(PAnd, loConst(Ty, 1)), "vm.rel.rhs");
     return {L, R};
   }
   case 1: {
     Value *Mask = loConst(Ty, yanso_mix64(Seed, 0x8c3d37c819544da2ULL));
     Value *A = (Variant & 8)
-                   ? emitRotateRight(B, Ty, X,
-                                     1 + ((Seed >> 17) % (Ty->getBitWidth() - 1)))
+                   ? emitRotateRight(
+                         B, Ty, X, 1 + ((Seed >> 17) % (Ty->getBitWidth() - 1)))
                    : X;
     Value *L = A;
-    Value *R = B.CreateOr(B.CreateAnd(A, Mask, "vm.rel.maskpart.lo"),
-                          B.CreateAnd(A, B.CreateNot(Mask),
-                                      "vm.rel.maskpart.hi"),
-                          "vm.rel.maskpart.rhs");
+    Value *R =
+        B.CreateOr(B.CreateAnd(A, Mask, "vm.rel.maskpart.lo"),
+                   B.CreateAnd(A, B.CreateNot(Mask), "vm.rel.maskpart.hi"),
+                   "vm.rel.maskpart.rhs");
     return {L, R};
   }
   default: {
@@ -611,14 +615,9 @@ public:
         Bucket.push_back(&R);
   }
 
-  unsigned exprCost(uint32_t ExprIndex) const {
-    if (!Valid || ExprIndex >= Exprs.size())
-      return 0;
-    return Exprs[ExprIndex].Cost;
-  }
-
   void collectRelations(unsigned BitWidth,
-                        SmallVectorImpl<const RelationRecord *> &Bucket) const {
+                        SmallVectorImpl<const RelationRecord *> &Bucket,
+                        bool SafeOnly = false) const {
     if (!Valid)
       return;
     uint16_t WM = widthMaskFor(BitWidth);
@@ -627,8 +626,31 @@ public:
     for (const RelationRecord &R : Relations)
       if ((R.WidthMask & WM) && R.LExpr < Exprs.size() &&
           R.RExpr < Exprs.size() && (Exprs[R.LExpr].WidthMask & WM) &&
-          (Exprs[R.RExpr].WidthMask & WM))
+          (Exprs[R.RExpr].WidthMask & WM) &&
+          (!SafeOnly ||
+           (exprIsTotal(R.LExpr, BitWidth) && exprIsTotal(R.RExpr, BitWidth))))
         Bucket.push_back(&R);
+  }
+
+  unsigned relationCount(unsigned BitWidth) const {
+    SmallVector<const RelationRecord *, 16> Bucket;
+    collectRelations(BitWidth, Bucket);
+    return Bucket.size();
+  }
+
+  const RelationRecord *selectRelation(unsigned BitWidth,
+                                       unsigned Index) const {
+    SmallVector<const RelationRecord *, 16> Bucket;
+    collectRelations(BitWidth, Bucket);
+    if (Bucket.empty())
+      return nullptr;
+    return Bucket[Index % Bucket.size()];
+  }
+
+  unsigned exprCost(uint32_t ExprIndex) const {
+    if (!Valid || ExprIndex >= Exprs.size())
+      return 0;
+    return Exprs[ExprIndex].Cost;
   }
 
   Value *emitExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
@@ -804,6 +826,55 @@ public:
   }
 
 private:
+  bool exprIsTotal(uint32_t ExprIndex, unsigned BitWidth) const {
+    if (!Valid || ExprIndex >= Exprs.size())
+      return false;
+    const ExprRecord &E = Exprs[ExprIndex];
+    if (!(E.WidthMask & widthMaskFor(BitWidth)) ||
+        !rangeInBounds(E.BytecodeOff, E.BytecodeLen, H.BytecodeSize))
+      return false;
+
+    ArrayRef<uint8_t> BC(Data.data() + BytecodeOff + E.BytecodeOff,
+                         E.BytecodeLen);
+    uint32_t Pos = 0;
+    while (Pos < BC.size()) {
+      uint8_t Op = BC[Pos++];
+      switch (Op) {
+      case BC_CONST_U:
+        if (!readULEB(BC, Pos))
+          return false;
+        break;
+      case BC_SHL:
+      case BC_LSHR:
+      case BC_ASHR:
+        return false;
+      case BC_SHL_IMM:
+      case BC_LSHR_IMM:
+      case BC_ASHR_IMM:
+      case BC_ROTL_IMM:
+      case BC_ROTR_IMM: {
+        auto Imm = readULEB(BC, Pos);
+        if (!Imm)
+          return false;
+        if ((Op == BC_SHL_IMM || Op == BC_LSHR_IMM || Op == BC_ASHR_IMM) &&
+            Imm->uge(BitWidth))
+          return false;
+        break;
+      }
+      case BC_UDIV_CONST:
+      case BC_UREM_CONST: {
+        auto Imm = readULEB(BC, Pos);
+        if (!Imm || Imm->zextOrTrunc(BitWidth).isZero())
+          return false;
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    return true;
+  }
+
   bool verifyExprBytecode(const ExprRecord &E) const {
     if (!rangeInBounds(E.BytecodeOff, E.BytecodeLen, H.BytecodeSize))
       return false;
@@ -1045,8 +1116,9 @@ unsigned YMBA::rewriteCount(unsigned LLVMOpcode, unsigned BitWidth) {
   return catalog().rewriteCount(*Op, BitWidth);
 }
 
-Value *YMBA::emitRewrite(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
-                         Value *X, Value *Y, unsigned Index, uint64_t) {
+Value *YMBA::emitRewriteByIndex(IRBuilder<> &B, unsigned LLVMOpcode,
+                                IntegerType *Ty, Value *X, Value *Y,
+                                unsigned Index) {
   auto Op = toYMBAOpcode(LLVMOpcode);
   if (!Op)
     return nullptr;
@@ -1058,8 +1130,7 @@ Value *YMBA::emitRewrite(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
 }
 
 Value *YMBA::emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
-                        Value *X, Value *Y, unsigned Variant, uint64_t Seed,
-                        double Temperature) {
+                        Value *X, Value *Y, uint64_t Seed) {
   auto Op = toYMBAOpcode(LLVMOpcode);
   SmallVector<const RewriteRecord *, 16> Rewrites;
   if (Op)
@@ -1067,10 +1138,10 @@ Value *YMBA::emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,
   SmallVector<unsigned, 8> BuiltinCosts;
   collectBuiltinBinaryCosts(LLVMOpcode, BuiltinCosts);
 
-  unsigned BuiltinIndex = Variant;
+  unsigned BuiltinIndex = 0;
   if (!BuiltinCosts.empty()) {
     if (const RewriteRecord *R = selectWeightedRewrite(
-            Rewrites, BuiltinCosts, Seed, Temperature, BuiltinIndex))
+            Rewrites, BuiltinCosts, Seed, MBATemperature, BuiltinIndex))
       if (Value *V = catalog().emitExpr(B, Ty, X, Y, R->Expr))
         return V;
   }
@@ -1094,18 +1165,16 @@ static bool isSupportedIntrinsicRewriteShape(Intrinsic::ID ID,
 }
 
 Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
-                           ArrayRef<Value *> Args, unsigned Variant,
-                           uint64_t Seed, double Temperature) {
+                           ArrayRef<Value *> Args, uint64_t Seed) {
   auto Op = intrinsicToYMBAOpcode(ID);
   SmallVector<const RewriteRecord *, 16> Rewrites;
   if (Op && isSupportedIntrinsicRewriteShape(ID, Args))
     catalog().collectRewrites(*Op, Ty->getBitWidth(), Rewrites);
-  unsigned BuiltinIndex = Variant;
-  if (!Rewrites.empty()) {
-    unsigned SelectedBuiltin = 0;
-    if (const RewriteRecord *R =
-            selectWeightedRewrite(Rewrites, ArrayRef<unsigned>(1U), Seed,
-                                  Temperature, SelectedBuiltin)) {
+  SmallVector<unsigned, 4> BuiltinCosts = {1, 3, 4, 4};
+  unsigned BuiltinIndex = 0;
+  {
+    if (const RewriteRecord *R = selectWeightedRewrite(
+            Rewrites, BuiltinCosts, Seed, MBATemperature, BuiltinIndex)) {
       Value *X = Args.empty() ? ConstantInt::get(Ty, 0) : Args[0];
       Value *Y = Args.size() >= 2 ? Args[1] : ConstantInt::get(Ty, 0);
       // fshl/fshr have three LLVM operands. YMBA models rotate amount as Y.
@@ -1114,7 +1183,6 @@ Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
       if (Value *V = catalog().emitExpr(B, Ty, X, Y, R->Expr))
         return V;
     }
-    BuiltinIndex = SelectedBuiltin;
   }
 
   FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(
@@ -1123,18 +1191,32 @@ Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
   return decorateIntegerResult(B, Ty, R, BuiltinIndex, Seed, "vm.intr.out");
 }
 
-YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                                  Value *Y, unsigned Index, uint64_t Seed,
-                                  double Temperature) {
+unsigned YMBA::relationCount(unsigned BitWidth) {
+  return catalog().relationCount(BitWidth);
+}
+
+YMBA::Relation YMBA::emitRelationByIndex(IRBuilder<> &B, IntegerType *Ty,
+                                         Value *X, Value *Y, unsigned Index) {
+  const RelationRecord *R = catalog().selectRelation(Ty->getBitWidth(), Index);
+  if (!R)
+    return {};
+  Value *L = catalog().emitExpr(B, Ty, X, Y, R->LExpr);
+  Value *RV = catalog().emitExpr(B, Ty, X, Y, R->RExpr);
+  return (L && RV) ? Relation{L, RV} : Relation{};
+}
+
+static YMBA::Relation emitSelectedRelation(IRBuilder<> &B, IntegerType *Ty,
+                                           Value *X, Value *Y, uint64_t Seed,
+                                           bool SafeOnly) {
   SmallVector<const RelationRecord *, 32> Relations;
-  catalog().collectRelations(Ty->getBitWidth(), Relations);
+  catalog().collectRelations(Ty->getBitWidth(), Relations, SafeOnly);
   SmallVector<unsigned, 8> BuiltinCosts;
   for (unsigned I = 0; I != 3; ++I)
     BuiltinCosts.push_back(builtinRelationCost(I));
 
-  unsigned BuiltinIndex = Index;
+  unsigned BuiltinIndex = 0;
   if (const RelationRecord *R = selectWeightedRelation(
-          Relations, BuiltinCosts, Seed, Temperature, BuiltinIndex)) {
+          Relations, BuiltinCosts, Seed, MBATemperature, BuiltinIndex)) {
     Value *L = catalog().emitExpr(B, Ty, X, Y, R->LExpr);
     Value *RV = catalog().emitExpr(B, Ty, X, Y, R->RExpr);
     if (L && RV)
@@ -1142,4 +1224,14 @@ YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
   }
 
   return emitBuiltinRelation(B, Ty, X, Y, BuiltinIndex, Seed);
+}
+
+YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
+                                  Value *Y, uint64_t Seed) {
+  return emitSelectedRelation(B, Ty, X, Y, Seed, false);
+}
+
+YMBA::Relation YMBA::emitSafeRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
+                                      Value *Y, uint64_t Seed) {
+  return emitSelectedRelation(B, Ty, X, Y, Seed, true);
 }

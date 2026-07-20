@@ -770,9 +770,7 @@ static MFLAArtifacts createArtifacts(Module &M, uint64_t FrameSize,
 
   YansoRNG SaltRNG(yanso_hash_string("state-key-salt",
                                       yanso_module_seed(M, PassName)));
-  do {
-    A.StateKeySalt = SaltRNG.next64();
-  } while (!A.StateKeySalt);
+  A.StateKeySalt = SaltRNG.next64();
 
   FunctionType *FTy = FunctionType::get(Type::getVoidTy(Ctx),
                                         {PointerType::get(Ctx, 0), I64, I64},

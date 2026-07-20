@@ -10,21 +10,8 @@
 
 namespace llvm {
 
-/// VMVariantEmitter owns VM helper-body diversification. VMPass decides which
-/// source instruction is virtualized; this helper decides how the replacement
-/// handler computes the same operation.
-///
-/// Binary handler variation is split into four dimensions:
-/// - ExprVariant: local semantic expression template for the requested opcode.
-/// - Mutation: structural wrapper around one or more equivalent expressions.
-/// - Relation: an equality provider, producing L == R for later use.
-/// - RelationApplication: embeds that equality into the result, optionally via a
-///   Projector P where P(L) == P(R).
-///
-/// This keeps VMPass as a semantic-rewrite planner and leaves handler-body
-/// mutation policy behind this boundary. A later backend can replace the built-in
-/// expression/relation templates with mined MBA/template databases without
-/// changing VMPass.
+/// Per-node handler-body diversification for VM super-ops (mutation, relation).
+/// Binary expr choice is owned by YMBA; VMPass only plans the rewrite.
 class VMVariantEmitter {
 public:
   enum class MutationKind : uint8_t { None, BitRebuild, DataMux };
@@ -37,13 +24,11 @@ public:
   };
 
   struct BinaryVariant {
-    unsigned ExprVariant = 0;
     MutationKind Mutation = MutationKind::None;
     unsigned MutationVariant = 0;
     bool ApplyRelation = false;
     ProjectorKind Projector = ProjectorKind::LowBit;
     RelationApplication RelationApp = RelationApplication::DiffFold;
-    unsigned RelationVariant = 0;
   };
 
   struct PredicateVariant {
@@ -63,7 +48,6 @@ public:
     bool ApplyRelation = false;
     ProjectorKind Projector = ProjectorKind::LowBit;
     RelationApplication RelationApp = RelationApplication::DiffFold;
-    unsigned RelationVariant = 0;
   };
 
   static BinaryVariant selectBinaryVariant(unsigned Opcode, IntegerType *Ty,
@@ -129,7 +113,7 @@ private:
                                       StringRef NamePrefix);
 
   static Relation emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
-                               Value *Y, unsigned Variant, uint64_t Seed);
+                               Value *Y, uint64_t Seed);
   static Value *emitProjector(IRBuilder<> &B, IntegerType *Ty, Value *V,
                               ProjectorKind Kind, uint64_t Seed,
                               StringRef Name);

@@ -1,12 +1,23 @@
 ; RUN: rm -rf %t && mkdir -p %t
-; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-op-max-len=4 -S %s -o %t/vm-memory-alias-barriers.ll
-; RUN: grep '__yansollvm_vm_getelementptr_load_add' %t/vm-memory-alias-barriers.ll
-; RUN: grep '__yansollvm_vm_store_i32_ptr_a4' %t/vm-memory-alias-barriers.ll
-; RUN: grep '__yansollvm_vm_load_i32_ptr_a4' %t/vm-memory-alias-barriers.ll
-; RUN: ! grep '__yansollvm_vm_getelementptr_load_xor_i32' %t/vm-memory-alias-barriers.ll
-; RUN: ! grep '__yansollvm_vm_load_xor_i32' %t/vm-memory-alias-barriers.ll
+; RUN: %opt -load-pass-plugin %plugin -passes=vm -verify-each -vm-superop-max-len=4 -S %s -o %t/vm-memory-alias-barriers.ll
+; RUN: %FileCheck %s < %t/vm-memory-alias-barriers.ll
 ; RUN: %clang %t/vm-memory-alias-barriers.ll -o %t/vm-memory-alias-barriers
 ; RUN: %t/vm-memory-alias-barriers
+
+; CHECK-LABEL: define i32 @safe_fusable
+; CHECK: call i32 @__yansollvm_vm_{{.*}}(i64 %i)
+; CHECK-LABEL: define i32 @store_alias_barrier
+; CHECK: call i32 @__yansollvm_vm_{{.*load.*}}
+; CHECK-NEXT: call void @__yansollvm_vm_{{.*store.*}}(i32 99
+; CHECK-NEXT: call i32 @__yansollvm_vm_{{.*xor.*}}
+; CHECK-LABEL: define i32 @call_alias_barrier
+; CHECK: call i32 @__yansollvm_vm_{{.*load.*}}
+; CHECK-NEXT: call void @clobber
+; CHECK-NEXT: call i32 @__yansollvm_vm_{{.*xor.*}}
+; CHECK-LABEL: define i32 @repeated_pattern_alias
+; CHECK: call i32 @__yansollvm_vm_
+; CHECK: call void @__yansollvm_vm_{{.*store.*}}(i32 123
+; CHECK: call {{.*}}@__yansollvm_vm_
 
 source_filename = "vm-memory-alias-barriers.ll"
 

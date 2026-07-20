@@ -539,8 +539,18 @@ std::optional<RegionCandidate> buildSwitchSubsetRegion(BasicBlock &Header,
     return std::nullopt;
 
   RNG.shuffle(Succs);
-  unsigned Pick = Succs.size() >= 4 ? 2 + RNG.range(Succs.size() - 2)
-                                    : 1 + RNG.range(Succs.size() - 1);
+  // Cap pick so coversTooMuch cannot reject the only switch candidate.
+  unsigned FnSize = Header.getParent()->size();
+  if (FnSize < 5)
+    return std::nullopt;
+  unsigned MinPick = Succs.size() >= 4 ? 2 : 1;
+  unsigned MaxPick =
+      std::min({static_cast<unsigned>(Succs.size() - 1), MaxRegionBlocks - 1,
+                FnSize - 4});
+  if (MaxPick < MinPick)
+    return std::nullopt;
+  unsigned Pick =
+      MinPick + (MaxPick > MinPick ? RNG.range(MaxPick - MinPick + 1) : 0);
 
   SmallPtrSet<BasicBlock *, 8> Region;
   RegionCandidate Candidate;
@@ -560,8 +570,7 @@ std::optional<RegionCandidate> buildSwitchSubsetRegion(BasicBlock &Header,
     addBlock(Succ, Region, Candidate.Blocks);
   }
 
-  if (Candidate.Blocks.size() < 2 || Candidate.Blocks.size() == Succs.size() + 1 ||
-      !hasSingleEntry(Candidate.Blocks) ||
+  if (Candidate.Blocks.size() < 2 || !hasSingleEntry(Candidate.Blocks) ||
       !candidateHasEnoughSemantics(Candidate.Blocks, Candidate.Kind))
     return std::nullopt;
   Candidate.Score = candidateScore(Candidate.Blocks, Candidate.Kind);

@@ -31,7 +31,7 @@ void addFunctionPass(ModulePassManager &MPM, PassT Pass) {
 }
 
 void addDefaultPipeline(ModulePassManager &MPM) {
-  addFunctionPass(MPM, ObfConPass());
+  MPM.addPass(ObfConPass());
   MPM.addPass(VMPass());
   MPM.addPass(BB2FuncPass());
   MPM.addPass(MergePass());
@@ -65,7 +65,7 @@ bool addNamedPass(StringRef Name, ModulePassManager &MPM) {
   else if (Name == "sub")
     addFunctionPass(MPM, SubstitutionPass(true));
   else if (Name == "obfcon")
-    addFunctionPass(MPM, ObfConPass());
+    MPM.addPass(ObfConPass());
   else if (Name == "bcf")
     addFunctionPass(MPM, BogusControlFlowPass(true));
   else if (Name == "ibr")

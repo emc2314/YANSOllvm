@@ -78,15 +78,13 @@ uint16_t widthMaskFor(unsigned BW) {
   }
 }
 
-std::vector<unsigned> minMaxWidths(uint16_t WidthMask) {
+std::vector<unsigned> supportedWidths(uint16_t WidthMask) {
   constexpr std::array<unsigned, 5> AllWidths = {8, 16, 32, 64, 128};
   std::vector<unsigned> Result;
   for (unsigned BW : AllWidths) {
     if (WidthMask & widthMaskFor(BW))
       Result.push_back(BW);
   }
-  if (Result.size() > 2)
-    Result = {Result.front(), Result.back()};
   return Result;
 }
 
@@ -276,8 +274,8 @@ std::optional<APInt> emitAndEvalRewrite(unsigned Opcode, unsigned BW,
   Function *F = Function::Create(FT, Function::ExternalLinkage, "f", M.get());
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
-  Value *Got = YMBA::emitRewrite(B, Opcode, Ty, ConstantInt::get(Ty, X),
-                                 ConstantInt::get(Ty, Y), Index, 0);
+  Value *Got = YMBA::emitRewriteByIndex(B, Opcode, Ty, ConstantInt::get(Ty, X),
+                                        ConstantInt::get(Ty, Y), Index);
   if (!Got)
     return std::nullopt;
   B.CreateRetVoid();
@@ -298,8 +296,8 @@ std::optional<std::pair<APInt, APInt>> emitAndEvalRelation(unsigned BW,
   Function *F = Function::Create(FT, Function::ExternalLinkage, "f", M.get());
   BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
   B.SetInsertPoint(BB);
-  YMBA::Relation R = YMBA::emitRelation(B, Ty, ConstantInt::get(Ty, X),
-                                        ConstantInt::get(Ty, Y), Index, 0);
+  YMBA::Relation R = YMBA::emitRelationByIndex(B, Ty, ConstantInt::get(Ty, X),
+                                               ConstantInt::get(Ty, Y), Index);
   if (!R.L || !R.R)
     return std::nullopt;
   B.CreateRetVoid();
@@ -349,6 +347,16 @@ unsigned rewriteIndexForWidth(ArrayRef<RewriteRecord> Rewrites,
   return Index;
 }
 
+unsigned relationIndexForWidth(ArrayRef<RelationRecord> Relations,
+                               unsigned RecordIndex, unsigned BW) {
+  uint16_t WM = widthMaskFor(BW);
+  unsigned Index = 0;
+  for (unsigned I = 0; I != RecordIndex; ++I)
+    if (Relations[I].WidthMask & WM)
+      ++Index;
+  return Index;
+}
+
 } // namespace
 
 int main() {
@@ -357,7 +365,8 @@ int main() {
   unsigned RewriteChecks = 0;
   unsigned RelationChecks = 0;
   std::random_device RD;
-  std::mt19937_64 RNG(RD());
+  uint64_t SampleSeed = (uint64_t(RD()) << 32) ^ uint64_t(RD());
+  std::mt19937_64 RNG(SampleSeed);
 
   for (unsigned RecordIndex = 0; RecordIndex != Rewrites.size();
        ++RecordIndex) {
@@ -365,7 +374,7 @@ int main() {
     auto LLVMOp = llvmOpcodeForYMBA(R.Opcode);
     if (!LLVMOp)
       return fail("rewrite opcode has no public LLVM opcode mapping");
-    std::vector<unsigned> Widths = minMaxWidths(R.WidthMask);
+    std::vector<unsigned> Widths = supportedWidths(R.WidthMask);
     if (Widths.empty())
       return fail("rewrite has empty width mask");
     for (unsigned BW : Widths) {
@@ -399,20 +408,29 @@ int main() {
 
   for (unsigned Index = 0; Index != Relations.size(); ++Index) {
     const RelationRecord &R = Relations[Index];
-    std::vector<unsigned> Widths = minMaxWidths(R.WidthMask);
+    std::vector<unsigned> Widths = supportedWidths(R.WidthMask);
     if (Widths.empty())
       return fail("relation has empty width mask");
     for (unsigned BW : Widths) {
       auto Samples = makeSamples(BW, RNG);
+      unsigned PublicIndex = relationIndexForWidth(Relations, Index, BW);
+      if (PublicIndex >= YMBA::relationCount(BW)) {
+        std::cerr << "relation index unavailable through YMBA public API:"
+                  << " record=" << Index << " bw=" << BW
+                  << " public_index=" << PublicIndex
+                  << " count=" << YMBA::relationCount(BW)
+                  << " sample_seed=" << SampleSeed << "\n";
+        return 1;
+      }
       for (auto &[X, Y] : Samples) {
-        auto Got = emitAndEvalRelation(BW, X, Y, Index);
+        auto Got = emitAndEvalRelation(BW, X, Y, PublicIndex);
         if (!Got)
           return fail("relation IR eval failed");
         if (Got->first != Got->second) {
-          std::cerr << "relation mismatch bw=" << BW << " index=" << Index
+          std::cerr << "relation mismatch bw=" << BW << " index=" << PublicIndex
                     << " x=" << hex(X) << " y=" << hex(Y)
                     << " lhs=" << hex(Got->first) << " rhs=" << hex(Got->second)
-                    << "\n";
+                    << " sample_seed=" << SampleSeed << "\n";
           return 1;
         }
         ++RelationChecks;
@@ -426,6 +444,7 @@ int main() {
   std::cout << "YMBA catalog self-test passed\n"
             << "rewrite rules: " << Rewrites.size() << "\n"
             << "relation rules: " << Relations.size() << "\n"
-            << "checks: " << (RewriteChecks + RelationChecks) << "\n";
+            << "checks: " << (RewriteChecks + RelationChecks) << "\n"
+            << "sample seed: " << SampleSeed << "\n";
   return 0;
 }

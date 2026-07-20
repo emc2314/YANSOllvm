@@ -1,26 +1,25 @@
 #include "VMPass.h"
 
 #include "CryptoUtils.h"
-#include "YANSOllvmSeed.h"
 #include "VMVariant.h"
+#include "YANSOllvmSeed.h"
 
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <map>
+#include <algorithm>
+#include <cassert>
 #include <string>
-#include <tuple>
 
 using namespace llvm;
 
@@ -30,16 +29,26 @@ static cl::opt<unsigned> VMMutationVariantPermille(
     cl::desc("Permille probability for VM binary-op mutation wrappers"));
 static cl::opt<unsigned> VMRelationAppVariantPermille(
     "vm-relation-app-variant-permille", cl::init(500), cl::Hidden,
-    cl::desc("Permille probability for relation-applied VM binary-op variants"));
-static cl::opt<unsigned> VMMaxVariantsPerOp(
-    "vm-max-variants-per-op", cl::init(8), cl::Hidden,
-    cl::desc("Maximum VM helper-body variants per operation/type bucket; 0 means unlimited"));
-static cl::opt<unsigned> VMOpMaxLen(
-    "vm-op-max-len", cl::init(4), cl::Hidden,
-    cl::desc("Maximum IR instruction count per VM op DAG; 1 keeps single-instruction handlers"));
+    cl::desc(
+        "Permille probability for relation-applied VM binary-op variants"));
+static cl::opt<unsigned> VMMaxVariantsPerSuperOp(
+    "vm-max-variants-per-superop", cl::init(8), cl::Hidden,
+    cl::desc("Maximum body variants per super-op shape; 0 means unlimited"));
+static cl::opt<unsigned>
+    VMSuperOpMaxLen("vm-superop-max-len", cl::init(4), cl::Hidden,
+                    cl::desc("Maximum IR instruction count per super-op DAG"));
 
 class VirtualizeImpl {
-  enum class HandlerKind { Binary, ICmp, Intrinsic, Cast, Select, GEP, Load, Store };
+  enum class HandlerKind {
+    Binary,
+    ICmp,
+    Intrinsic,
+    Cast,
+    Select,
+    GEP,
+    Load,
+    Store
+  };
 
   struct VMOpNode {
     unsigned Opcode = 0;
@@ -56,10 +65,7 @@ class VirtualizeImpl {
   };
 
   StringMap<Function *> Cache;
-  std::map<std::tuple<HandlerKind, unsigned, unsigned, Intrinsic::ID,
-                      CmpInst::Predicate, Type *, Type *, Type *>,
-           SmallVector<uint64_t, 8>>
-      VariantBuckets;
+  StringMap<SmallVector<uint64_t, 8>> SuperOpVariantBuckets;
   uint64_t ModuleSeed = 0;
 
   static constexpr StringRef Prefix = "__yansollvm_vm_";
@@ -70,8 +76,7 @@ class VirtualizeImpl {
     F->addFnAttr(Attribute::OptimizeNone);
   }
 
-  // True if F uses Windows-style funclet EH, where any call must carry the
-  // enclosing pad's "funclet" operand bundle.
+  // Windows funclet EH: calls need a "funclet" bundle.
   static bool usesFuncletEH(Function &F) {
     for (BasicBlock &BB : F)
       if (BB.isEHPad() && !BB.isLandingPad())
@@ -133,11 +138,6 @@ class VirtualizeImpl {
     return sanitizeName(Name);
   }
 
-  static std::string typedName(StringRef Base, Type *Ty,
-                               StringRef Suffix = "") {
-    return (Twine(Prefix) + Base + "_" + sanitizedTypeName(Ty) + Suffix).str();
-  }
-
   static uint64_t instructionSeed(Instruction *I, uint64_t Seed) {
     if (!I)
       return Seed;
@@ -166,255 +166,6 @@ class VirtualizeImpl {
     return Seed;
   }
 
-
-  static std::string castHandlerName(StringRef Base, Type *SrcTy, Type *DstTy) {
-    return (Twine(Prefix) + Base + "_" + sanitizedTypeName(SrcTy) + "_" +
-            sanitizedTypeName(DstTy))
-        .str();
-  }
-
-  Function *createBinaryHandler(Module &M, unsigned Opcode, IntegerType *Ty,
-                                uint64_t VariantSeed) {
-    std::string Name = instructionName(Opcode);
-    if (Name.empty())
-      return nullptr;
-
-    VMVariantEmitter::BinaryVariant Variant =
-        VMVariantEmitter::selectBinaryVariant(
-            Opcode, Ty, VariantSeed, VMMutationVariantPermille,
-            VMRelationAppVariantPermille);
-    std::string FullName = typedName(Name, Ty, VMVariantEmitter::suffix(Variant));
-    Function *&F = Cache[FullName];
-    if (F)
-      return F;
-
-    FunctionType *FuncTy = FunctionType::get(Ty, {Ty, Ty}, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-    auto It = F->arg_begin();
-    Value *X = &*It++;
-    Value *Y = &*It;
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-
-    VMVariantEmitter::emitBinary(B, Opcode, Ty, X, Y, Variant, VariantSeed);
-    attrs(F);
-    return F;
-  }
-
-  Function *createICmpHandler(Module &M, CmpInst::Predicate Pred, Type *Ty,
-                              uint64_t VariantSeed) {
-    std::string Name = (Twine("icmp_") + predicateName(Pred)).str();
-    if (Name.empty())
-      return nullptr;
-
-    VMVariantEmitter::PredicateVariant Variant =
-        VMVariantEmitter::selectPredicateVariant(
-            Ty, VariantSeed, VMMutationVariantPermille);
-    std::string FullName = typedName(Name, Ty, VMVariantEmitter::suffix(Variant));
-    Function *&F = Cache[FullName];
-    if (F)
-      return F;
-
-    IntegerType *I1 = Type::getInt1Ty(M.getContext());
-    FunctionType *FuncTy = FunctionType::get(I1, {Ty, Ty}, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-    auto It = F->arg_begin();
-    Value *X = &*It++;
-    Value *Y = &*It;
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-    VMVariantEmitter::emitICmp(B, Pred, Ty, X, Y, Variant, VariantSeed);
-    attrs(F);
-    return F;
-  }
-
-  Function *createIntrinsicHandler(Module &M, Intrinsic::ID ID, IntegerType *Ty,
-                                   ConstantInt *ImmArg = nullptr,
-                                   uint64_t VariantSeed = 0) {
-    std::string Name = intrinsicName(ID);
-    if (Name.empty())
-      return nullptr;
-
-    VMVariantEmitter::ScalarVariant Variant =
-        VMVariantEmitter::selectIntrinsicVariant(ID, Ty, VariantSeed);
-    std::string FullName = typedName(
-        Name, Ty,
-        (ImmArg ? (ImmArg->isZero() ? "_0" : "_1") : "") +
-            VMVariantEmitter::suffix(Variant));
-    Function *&F = Cache[FullName];
-    if (F)
-      return F;
-
-    unsigned Arity = intrinsicDataArgCount(ID);
-    if (!Arity)
-      return nullptr;
-
-    SmallVector<Type *, 4> Params(Arity, Ty);
-    FunctionType *FuncTy = FunctionType::get(Ty, Params, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-    SmallVector<Value *, 4> Args;
-    for (Argument &Arg : F->args())
-      Args.push_back(&Arg);
-    if (ImmArg)
-      Args.push_back(ConstantInt::get(Type::getInt1Ty(M.getContext()),
-                                      !ImmArg->isZero()));
-
-    VMVariantEmitter::emitIntrinsic(B, ID, Ty, Args, Variant, VariantSeed);
-    attrs(F);
-    return F;
-  }
-
-  static unsigned intrinsicDataArgCount(Intrinsic::ID ID) {
-    switch (ID) {
-    case Intrinsic::fshl:
-    case Intrinsic::fshr:
-      return 3;
-    case Intrinsic::bswap:
-    case Intrinsic::bitreverse:
-    case Intrinsic::ctpop:
-    case Intrinsic::ctlz:
-    case Intrinsic::cttz:
-    case Intrinsic::abs:
-      return 1;
-    case Intrinsic::smin:
-    case Intrinsic::smax:
-    case Intrinsic::umin:
-    case Intrinsic::umax:
-      return 2;
-    default:
-      return 0;
-    }
-  }
-
-  Function *createCastHandler(Module &M, unsigned Opcode, Type *SrcTy,
-                              Type *DstTy, uint64_t VariantSeed) {
-    std::string Name = instructionName(Opcode);
-    if (Name.empty())
-      return nullptr;
-
-    VMVariantEmitter::ScalarVariant Variant =
-        VMVariantEmitter::selectCastVariant(Opcode, SrcTy, DstTy, VariantSeed);
-    std::string FullName = castHandlerName(Name, SrcTy, DstTy) +
-                           VMVariantEmitter::suffix(Variant);
-    Function *&F = Cache[FullName];
-    if (F)
-      return F;
-
-    FunctionType *FuncTy = FunctionType::get(DstTy, {SrcTy}, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-    Value *X = &*F->arg_begin();
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-    VMVariantEmitter::emitCast(B, Opcode, SrcTy, DstTy, X, Variant, VariantSeed);
-    attrs(F);
-    return F;
-  }
-
-  Function *createSelectHandler(Module &M, Type *Ty, uint64_t VariantSeed) {
-    VMVariantEmitter::SelectVariant Variant =
-        VMVariantEmitter::selectSelectVariant(
-            Ty, VariantSeed, VMMutationVariantPermille);
-    std::string FullName = typedName(instructionName(Instruction::Select), Ty,
-                                     VMVariantEmitter::suffix(Variant));
-    Function *&F = Cache[FullName];
-    if (F)
-      return F;
-
-    Type *I1 = Type::getInt1Ty(M.getContext());
-    FunctionType *FuncTy = FunctionType::get(Ty, {I1, Ty, Ty}, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-    auto It = F->arg_begin();
-    Value *Cond = &*It++;
-    Value *TrueV = &*It++;
-    Value *FalseV = &*It;
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-
-    VMVariantEmitter::emitSelect(B, Ty, Cond, TrueV, FalseV, Variant,
-                                 VariantSeed);
-    attrs(F);
-    return F;
-  }
-
-  Function *createGEPHandler(Module &M, Type *RetTy, Type *SourceElementTy,
-                             ArrayRef<Value *> IndexOperands,
-                             ArrayRef<bool> IndexIsConstant,
-                             ArrayRef<Type *> ParamTys, bool InBounds) {
-    std::string FullName =
-        (Twine(Prefix) + "gep_" + sanitizedTypeName(RetTy) + "_" +
-         sanitizedTypeName(SourceElementTy) + (InBounds ? "_inbounds" : ""))
-            .str();
-    std::string CacheKey = FullName;
-    for (Type *ParamTy : ParamTys)
-      CacheKey += "#" + sanitizedTypeName(ParamTy);
-    for (unsigned I = 0, E = IndexOperands.size(); I != E; ++I) {
-      CacheKey += IndexIsConstant[I] ? "#c" : "#v";
-      if (IndexIsConstant[I]) {
-        std::string S;
-        raw_string_ostream OS(S);
-        IndexOperands[I]->print(OS);
-        OS.flush();
-        CacheKey += S;
-      }
-    }
-    Function *&F = Cache[CacheKey];
-    if (F)
-      return F;
-
-    FunctionType *FuncTy = FunctionType::get(RetTy, ParamTys, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-
-    auto It = F->arg_begin();
-    Value *Base = &*It++;
-    SmallVector<Value *, 4> Indices;
-    for (unsigned I = 0, E = IndexOperands.size(); I != E; ++I) {
-      if (IndexIsConstant[I]) {
-        Indices.push_back(cast<Constant>(IndexOperands[I]));
-      } else {
-        Indices.push_back(&*It++);
-      }
-    }
-
-    Value *P = InBounds ? B.CreateInBoundsGEP(SourceElementTy, Base, Indices)
-                        : B.CreateGEP(SourceElementTy, Base, Indices);
-    B.CreateRet(P);
-    attrs(F);
-    return F;
-  }
-
-  Function *createLoadHandler(Module &M, Type *LoadedTy, Type *PtrTy,
-                              Align Alignment) {
-    std::string FullName =
-        (Twine(Prefix) + "load_" + sanitizedTypeName(LoadedTy) + "_" +
-         sanitizedTypeName(PtrTy) + "_a" + Twine(Alignment.value()))
-            .str();
-    Function *&F = Cache[FullName];
-    if (F)
-      return F;
-
-    FunctionType *FuncTy = FunctionType::get(LoadedTy, {PtrTy}, false);
-    F = Function::Create(FuncTy, GlobalValue::InternalLinkage, FullName, M);
-    Value *Ptr = &*F->arg_begin();
-    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", F);
-    IRBuilder<> B(Entry);
-    LoadInst *L = B.CreateLoad(LoadedTy, Ptr);
-    L->setAlignment(Alignment);
-    B.CreateRet(L);
-
-    // Deliberately do not attach readnone/memory(none): this handler performs
-    // a real memory read.  We also drop TBAA/alias metadata instead of copying
-    // it across a function boundary; losing optimization precision is safe, but
-    // stale alias metadata could make later single-threaded load/store ordering
-    // transforms incorrect.
-    attrs(F);
-    return F;
-  }
-
   Function *createStoreHandler(Module &M, Type *StoredTy, Type *PtrTy,
                                Align Alignment) {
     std::string FullName =
@@ -437,11 +188,7 @@ class VirtualizeImpl {
     S->setAlignment(Alignment);
     B.CreateRetVoid();
 
-    // Store handlers are intentionally single-instruction VM ops, not DAG
-    // nodes.  A store is an ordered side effect even in single-threaded code:
-    // fusing it with surrounding loads/stores without MemorySSA/AA could cross
-    // an aliasing access and silently change semantics.  Keep the outer call
-    // conservatively side-effecting by not adding memory attributes.
+    // Single-op store handler; no memory attrs (conservative side effects).
     attrs(F);
     return F;
   }
@@ -454,7 +201,7 @@ class VirtualizeImpl {
     return instructionName(N.Opcode);
   }
 
-  static std::string opDagPatternName(ArrayRef<VMOpNode> Nodes) {
+  static std::string superOpPatternName(ArrayRef<VMOpNode> Nodes) {
     std::string Name;
     raw_string_ostream OS(Name);
     bool First = true;
@@ -468,22 +215,21 @@ class VirtualizeImpl {
     return sanitizeName(Name);
   }
 
-  std::string opDagName(Type *RetTy, ArrayRef<VMOpNode> Nodes) {
-    return (Twine(Prefix) + opDagPatternName(Nodes) + "_" +
+  std::string superOpName(Type *RetTy, ArrayRef<VMOpNode> Nodes) {
+    return (Twine(Prefix) + superOpPatternName(Nodes) + "_" +
             sanitizedTypeName(RetTy))
         .str();
   }
 
   static constexpr int ConstantRefBase = -1000000;
 
-  Function *createOpDagHandler(Module &M, ArrayRef<VMOpNode> Nodes,
+  Function *createSuperOpHandler(Module &M, ArrayRef<VMOpNode> Nodes,
                                  ArrayRef<Type *> ParamTys, Type *RetTy,
-                                 uint64_t PatternHash, uint64_t VariantSeed) {
-    std::string CacheKey = (Twine(opDagName(RetTy, Nodes)) + "#" +
-                            Twine::utohexstr(PatternHash) + "#" +
+                                 StringRef PatternKey, uint64_t VariantSeed) {
+    std::string CacheKey = (Twine(PatternKey.size()) + ":" + PatternKey + "#" +
                             Twine::utohexstr(VariantSeed))
                                .str();
-    std::string FullName = opDagName(RetTy, Nodes);
+    std::string FullName = superOpName(RetTy, Nodes);
     Function *&F = Cache[CacheKey];
     if (F)
       return F;
@@ -510,18 +256,16 @@ class VirtualizeImpl {
       }
 
       Value *R = nullptr;
-      uint64_t NodeSeed = yanso_mix64(N.Opcode + 1,
-                                      yanso_mix64(Results.size() + 1,
-                                                  VariantSeed));
+      uint64_t NodeSeed = yanso_mix64(
+          N.Opcode + 1, yanso_mix64(Results.size() + 1, VariantSeed));
       switch (N.Opcode) {
       case Instruction::Trunc:
       case Instruction::ZExt:
       case Instruction::SExt:
       case Instruction::PtrToInt:
       case Instruction::IntToPtr: {
-        VMVariantEmitter::ScalarVariant V =
-            VMVariantEmitter::selectCastVariant(N.Opcode, N.SrcTy, N.DstTy,
-                                                NodeSeed);
+        VMVariantEmitter::ScalarVariant V = VMVariantEmitter::selectCastVariant(
+            N.Opcode, N.SrcTy, N.DstTy, NodeSeed);
         R = VMVariantEmitter::emitCastValue(B, N.Opcode, N.SrcTy, N.DstTy,
                                             Ops[0], V, NodeSeed);
         break;
@@ -565,9 +309,9 @@ class VirtualizeImpl {
         auto *ITy = cast<IntegerType>(N.Ty);
         R = VMVariantEmitter::emitBinaryValue(
             B, N.Opcode, ITy, Ops[0], Ops[1],
-            VMVariantEmitter::selectBinaryVariant(
-                N.Opcode, ITy, NodeSeed, VMMutationVariantPermille,
-                VMRelationAppVariantPermille),
+            VMVariantEmitter::selectBinaryVariant(N.Opcode, ITy, NodeSeed,
+                                                  VMMutationVariantPermille,
+                                                  VMRelationAppVariantPermille),
             NodeSeed);
         break;
       }
@@ -581,6 +325,8 @@ class VirtualizeImpl {
   }
 
   static bool isSupportedIntrinsicCall(CallInst *CI) {
+    if (CI->getNumOperandBundles() != 0 || CI->isMustTailCall())
+      return false;
     auto *RetTy = dyn_cast<IntegerType>(CI->getType());
     if (!RetTy || intrinsicName(CI->getIntrinsicID()).empty())
       return false;
@@ -618,9 +364,11 @@ class VirtualizeImpl {
     case Instruction::SExt:
       return isSupportedInt(CI->getSrcTy()) && isSupportedInt(CI->getDestTy());
     case Instruction::PtrToInt:
-      return isSupportedPointer(CI->getSrcTy()) && isSupportedInt(CI->getDestTy());
+      return isSupportedPointer(CI->getSrcTy()) &&
+             isSupportedInt(CI->getDestTy());
     case Instruction::IntToPtr:
-      return isSupportedInt(CI->getSrcTy()) && isSupportedPointer(CI->getDestTy());
+      return isSupportedInt(CI->getSrcTy()) &&
+             isSupportedPointer(CI->getDestTy());
     default:
       return false;
     }
@@ -634,27 +382,13 @@ class VirtualizeImpl {
   }
 
   struct HandlerKey {
-    HandlerKind Kind;
-    unsigned Opcode = 0;
-    CmpInst::Predicate Predicate = CmpInst::ICMP_EQ;
-    Intrinsic::ID IntrinsicID = Intrinsic::not_intrinsic;
+    HandlerKind Kind = HandlerKind::Binary;
     Type *Ty = nullptr;
     Type *SrcTy = nullptr;
-    Type *DstTy = nullptr;
-    Type *SourceElementTy = nullptr;
     Align Alignment = Align(1);
-    bool InBounds = false;
-    ConstantInt *ImmArg = nullptr;
-    SmallVector<Value *, 4> GEPIndexOperands;
-    SmallVector<bool, 4> GEPIndexIsConstant;
     SmallVector<VMOpNode, 8> OpNodes;
     SmallVector<Type *, 8> OpParamTys;
-    uint64_t OpHash = 0;
-  };
-
-  struct VMVariant {
-    HandlerKey Key;
-    unsigned Weight = 1;
+    std::string OpKey;
   };
 
   struct VMMatch {
@@ -665,69 +399,8 @@ class VirtualizeImpl {
 
   struct VMRewritePlan {
     VMMatch Match;
-    SmallVector<VMVariant, 4> Variants;
+    HandlerKey Key;
   };
-
-  static HandlerKey binaryKey(BinaryOperator *BO) {
-    HandlerKey Key{HandlerKind::Binary};
-    Key.Opcode = BO->getOpcode();
-    Key.Ty = BO->getType();
-    return Key;
-  }
-
-  static HandlerKey icmpKey(ICmpInst *ICI) {
-    HandlerKey Key{HandlerKind::ICmp};
-    Key.Predicate = ICI->getPredicate();
-    Key.Ty = ICI->getOperand(0)->getType();
-    return Key;
-  }
-
-  static HandlerKey intrinsicKey(CallInst *CI, ConstantInt *ImmArg) {
-    HandlerKey Key{HandlerKind::Intrinsic};
-    Key.IntrinsicID = CI->getIntrinsicID();
-    Key.Ty = CI->getType();
-    Key.ImmArg = ImmArg;
-    return Key;
-  }
-
-  static HandlerKey castKey(CastInst *CI) {
-    HandlerKey Key{HandlerKind::Cast};
-    Key.Opcode = CI->getOpcode();
-    Key.SrcTy = CI->getSrcTy();
-    Key.DstTy = CI->getDestTy();
-    return Key;
-  }
-
-  static HandlerKey selectKey(SelectInst *SI) {
-    HandlerKey Key{HandlerKind::Select};
-    Key.Ty = SI->getType();
-    return Key;
-  }
-
-  static HandlerKey gepKey(GetElementPtrInst *GEP) {
-    HandlerKey Key{HandlerKind::GEP};
-    Key.Ty = GEP->getType();
-    Key.SourceElementTy = GEP->getSourceElementType();
-    Key.SrcTy = GEP->getPointerOperandType();
-    Key.InBounds = GEP->isInBounds();
-    return Key;
-  }
-
-  static HandlerKey loadKey(LoadInst *LI) {
-    HandlerKey Key{HandlerKind::Load};
-    Key.Ty = LI->getType();
-    Key.SrcTy = LI->getPointerOperandType();
-    Key.Alignment = LI->getAlign();
-    return Key;
-  }
-
-  static HandlerKey storeKey(StoreInst *SI) {
-    HandlerKey Key{HandlerKind::Store};
-    Key.Ty = SI->getValueOperand()->getType();
-    Key.SrcTy = SI->getPointerOperandType();
-    Key.Alignment = SI->getAlign();
-    return Key;
-  }
 
   static bool isSupportedGEP(GetElementPtrInst *GEP) {
     if (!isSupportedPointer(GEP->getPointerOperandType()) ||
@@ -751,37 +424,13 @@ class VirtualizeImpl {
            isSupportedPointer(SI->getPointerOperandType());
   }
 
-  static HandlerKey keyForRoot(Instruction *I) {
-    if (auto *BO = dyn_cast<BinaryOperator>(I))
-      return binaryKey(BO);
-    if (auto *ICI = dyn_cast<ICmpInst>(I))
-      return icmpKey(ICI);
-    if (auto *CI = dyn_cast<CastInst>(I))
-      return castKey(CI);
-    if (auto *SI = dyn_cast<SelectInst>(I))
-      return selectKey(SI);
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(I))
-      return gepKey(GEP);
-    if (auto *LI = dyn_cast<LoadInst>(I))
-      return loadKey(LI);
-    if (auto *SI = dyn_cast<StoreInst>(I))
-      return storeKey(SI);
-    if (auto *Call = dyn_cast<CallInst>(I)) {
-      ConstantInt *ImmArg = nullptr;
-      if (Call->arg_size() == 2 &&
-          Call->getArgOperand(1)->getType()->isIntegerTy(1))
-        ImmArg = dyn_cast<ConstantInt>(Call->getArgOperand(1));
-      return intrinsicKey(Call, ImmArg);
-    }
-    return HandlerKey{HandlerKind::Binary};
-  }
-
   static bool isSupportedVMOpInst(Instruction *I) {
     if (auto *BO = dyn_cast<BinaryOperator>(I))
       return isSupportedInt(BO->getType()) &&
              Instruction::isBinaryOp(BO->getOpcode());
     if (auto *ICI = dyn_cast<ICmpInst>(I))
-      return isSupportedScalar(ICI->getOperand(0)->getType()) &&
+      return !ICI->hasSameSign() &&
+             isSupportedScalar(ICI->getOperand(0)->getType()) &&
              ICI->getOperand(0)->getType() == ICI->getOperand(1)->getType() &&
              CmpInst::isIntPredicate(ICI->getPredicate());
     if (auto *SI = dyn_cast<SelectInst>(I))
@@ -790,10 +439,7 @@ class VirtualizeImpl {
       return isSupportedGEP(GEP);
     if (auto *LI = dyn_cast<LoadInst>(I))
       return isSupportedLoad(LI);
-    // Stores are intentionally not supported as DAG nodes.  They are emitted
-    // only as single-op side-effect handlers below; otherwise a local DAG slice
-    // could cross an aliasing load/store in single-threaded code and change the
-    // observable value.
+    // Stores stay out of DAGs; only single-op handlers below.
     if (isa<StoreInst>(I))
       return false;
     if (auto *CI = dyn_cast<CastInst>(I))
@@ -805,19 +451,33 @@ class VirtualizeImpl {
     return false;
   }
 
-  static bool hasMemoryOrderingBarrierBetweenLoadAndRoot(
-      ArrayRef<Instruction *> Insts, Instruction *Root) {
+  static HandlerKind handlerKindForRoot(Instruction *I) {
+    if (isa<BinaryOperator>(I))
+      return HandlerKind::Binary;
+    if (isa<ICmpInst>(I))
+      return HandlerKind::ICmp;
+    if (isa<CallInst>(I))
+      return HandlerKind::Intrinsic;
+    if (isa<CastInst>(I))
+      return HandlerKind::Cast;
+    if (isa<SelectInst>(I))
+      return HandlerKind::Select;
+    if (isa<GetElementPtrInst>(I))
+      return HandlerKind::GEP;
+    if (isa<LoadInst>(I))
+      return HandlerKind::Load;
+    llvm_unreachable("unsupported VM op root");
+  }
+
+  static bool
+  hasMemoryOrderingBarrierBetweenLoadAndRoot(ArrayRef<Instruction *> Insts,
+                                             Instruction *Root) {
     SmallPtrSet<Instruction *, 8> InSlice(Insts.begin(), Insts.end());
     for (Instruction *I : Insts) {
-      if (!isa<LoadInst>(I))
+      if (!isa<LoadInst>(I) || I == Root)
         continue;
 
-      // DAG handlers are inserted at the root instruction.  If a fused load is
-      // earlier than the root, the transformation moves that memory read down to
-      // the call site.  Even without considering multi-threading, moving a load
-      // across an aliasing store/call/other memory op can change the value it
-      // observes.  Until this pass uses MemorySSA/AA, reject any slice that would
-      // move a load across an intervening memory operation or side effect.
+      // Reject moving a load across intervening memory/side-effect ops.
       for (Instruction *Cur = I->getNextNode(); Cur && Cur != Root;
            Cur = Cur->getNextNode()) {
         if (InSlice.contains(Cur))
@@ -829,107 +489,367 @@ class VirtualizeImpl {
     return false;
   }
 
-  static void collectVMOpInsts(Instruction *Root, unsigned Budget,
-                                  SmallVectorImpl<Instruction *> &Nodes) {
-    if (!Root || !isSupportedVMOpInst(Root) || Budget == 0)
-      return;
-    SmallPtrSet<Instruction *, 8> Seen;
-    SmallVector<Instruction *, 8> Worklist;
-    auto Add = [&](Instruction *I) {
-      if (!I || Seen.contains(I) || Nodes.size() >= Budget)
-        return;
-      Seen.insert(I);
-      Nodes.push_back(I);
-      Worklist.push_back(I);
-    };
-    Add(Root);
-    for (unsigned WI = 0; WI != Worklist.size() && Nodes.size() < Budget; ++WI) {
-      Instruction *Cur = Worklist[WI];
-      SmallVector<Instruction *, 4> Deps;
-      for (Value *Op : Cur->operands()) {
+  struct SuperOpCandidate {
+    SmallVector<Instruction *, 8> Nodes;
+    int Score = 0;
+  };
+
+  static unsigned opcodeFamily(const Instruction &I) {
+    if (isa<CastInst>(I))
+      return 1;
+    if (isa<ICmpInst>(I) || isa<SelectInst>(I))
+      return 2;
+    if (isa<GetElementPtrInst>(I) || isa<LoadInst>(I))
+      return 3;
+    if (isa<CallInst>(I))
+      return 4;
+    switch (I.getOpcode()) {
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+      return 5;
+    case Instruction::Shl:
+    case Instruction::LShr:
+    case Instruction::AShr:
+      return 6;
+    default:
+      return 7;
+    }
+  }
+
+  static int scoreSuperOp(ArrayRef<Instruction *> Nodes) {
+    SmallPtrSet<Instruction *, 8> InCandidate(Nodes.begin(), Nodes.end());
+    DenseMap<Instruction *, bool> ConstantDerived;
+    DenseMap<Instruction *, unsigned> DynamicDepth;
+    SmallSet<unsigned, 8> Families;
+    SmallPtrSet<Value *, 8> ExternalValues;
+    unsigned MaxDynamicDepth = 0;
+    unsigned DynamicNodes = 0;
+    unsigned InternalEdges = 0;
+
+    for (Instruction *I : Nodes) {
+      bool IsConstantDerived = true;
+      Families.insert(opcodeFamily(*I));
+      for (Value *Op : I->operands()) {
+        if (auto *Dep = dyn_cast<Instruction>(Op)) {
+          if (InCandidate.contains(Dep)) {
+            if (!ConstantDerived.lookup(Dep))
+              IsConstantDerived = false;
+            continue;
+          }
+        }
+        if (!isa<Constant>(Op)) {
+          IsConstantDerived = false;
+          ExternalValues.insert(Op);
+        }
+      }
+      ConstantDerived[I] = IsConstantDerived;
+      if (IsConstantDerived)
+        continue;
+
+      ++DynamicNodes;
+      unsigned D = 1;
+      for (Value *Op : I->operands())
+        if (auto *Dep = dyn_cast<Instruction>(Op))
+          if (InCandidate.contains(Dep) && !ConstantDerived.lookup(Dep))
+            D = std::max(D, DynamicDepth.lookup(Dep) + 1);
+      DynamicDepth[I] = D;
+      MaxDynamicDepth = std::max(MaxDynamicDepth, D);
+    }
+
+    for (Instruction *I : Nodes) {
+      SmallPtrSet<Instruction *, 4> SeenDeps;
+      for (Value *Op : I->operands()) {
+        if (auto *Dep = dyn_cast<Instruction>(Op))
+          if (InCandidate.contains(Dep) && SeenDeps.insert(Dep).second)
+            ++InternalEdges;
+      }
+    }
+
+    unsigned ContinuousConstantCost = 0;
+    SmallPtrSet<Instruction *, 8> VisitedConstants;
+    for (Instruction *Start : Nodes) {
+      if (!ConstantDerived.lookup(Start) ||
+          !VisitedConstants.insert(Start).second)
+        continue;
+      unsigned ComponentSize = 0;
+      SmallVector<Instruction *, 8> Worklist = {Start};
+      while (!Worklist.empty()) {
+        Instruction *I = Worklist.pop_back_val();
+        ++ComponentSize;
+        for (Value *Op : I->operands())
+          if (auto *Dep = dyn_cast<Instruction>(Op))
+            if (InCandidate.contains(Dep) && ConstantDerived.lookup(Dep) &&
+                VisitedConstants.insert(Dep).second)
+              Worklist.push_back(Dep);
+        for (User *U : I->users())
+          if (auto *UI = dyn_cast<Instruction>(U))
+            if (InCandidate.contains(UI) && ConstantDerived.lookup(UI) &&
+                VisitedConstants.insert(UI).second)
+              Worklist.push_back(UI);
+      }
+      ContinuousConstantCost += ComponentSize - 1;
+    }
+
+    // Score terms peak near 24 at the default 4-node limit.
+    unsigned ExternalArity = std::min<unsigned>(ExternalValues.size(), 6);
+    return static_cast<int>(DynamicNodes) * 6 +
+           static_cast<int>(MaxDynamicDepth) * 8 +
+           static_cast<int>(Families.size()) * 6 +
+           static_cast<int>(InternalEdges) * 4 -
+           static_cast<int>(ContinuousConstantCost) * 12 -
+           static_cast<int>(ExternalArity) * 4;
+  }
+
+  static bool sameCandidate(ArrayRef<Instruction *> A,
+                            ArrayRef<Instruction *> B) {
+    return A.size() == B.size() && std::equal(A.begin(), A.end(), B.begin());
+  }
+
+  static void collectRootCone(Instruction *Root,
+                              SmallPtrSetImpl<Instruction *> &RootCone) {
+    SmallVector<Instruction *, 16> Worklist = {Root};
+    RootCone.insert(Root);
+    while (!Worklist.empty()) {
+      Instruction *I = Worklist.pop_back_val();
+      for (Value *Op : I->operands()) {
         auto *Dep = dyn_cast<Instruction>(Op);
         if (!Dep || Dep->getParent() != Root->getParent() ||
-            !isSupportedVMOpInst(Dep) || !Dep->hasOneUse() || Seen.contains(Dep))
+            !isSupportedVMOpInst(Dep) || !RootCone.insert(Dep).second)
+          continue;
+        Worklist.push_back(Dep);
+      }
+    }
+  }
+
+  static bool
+  isInlineableInRootCone(Instruction *I, Instruction *Root,
+                         const SmallPtrSetImpl<Instruction *> &RootCone) {
+    if (I == Root)
+      return true;
+    for (User *U : I->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI || UI->getParent() != Root->getParent() ||
+          !isSupportedVMOpInst(UI) || !RootCone.contains(UI))
+        return false;
+    }
+    return true;
+  }
+
+  static void
+  collectExpandableDeps(Instruction *Root, ArrayRef<Instruction *> Nodes,
+                        const SmallPtrSetImpl<Instruction *> &RootCone,
+                        SmallVectorImpl<Instruction *> &Deps) {
+    SmallPtrSet<Instruction *, 8> Seen(Nodes.begin(), Nodes.end());
+    for (Instruction *Cur : Nodes) {
+      for (Value *Op : Cur->operands()) {
+        auto *Dep = dyn_cast<Instruction>(Op);
+        if (!Dep || !RootCone.contains(Dep) || Seen.contains(Dep) ||
+            !isInlineableInRootCone(Dep, Root, RootCone))
           continue;
         Deps.push_back(Dep);
       }
-      llvm::sort(Deps, [](Instruction *A, Instruction *B) { return A->comesBefore(B); });
-      for (Instruction *Dep : Deps) {
-        if (Nodes.size() >= Budget)
-          break;
-        Add(Dep);
+    }
+    llvm::sort(
+        Deps, [](Instruction *A, Instruction *B) { return A->comesBefore(B); });
+    Deps.erase(std::unique(Deps.begin(), Deps.end()), Deps.end());
+  }
+
+  static bool
+  expandWithUserClosure(Instruction *Dep, Instruction *Root, unsigned Budget,
+                        const SmallPtrSetImpl<Instruction *> &RootCone,
+                        SuperOpCandidate &Candidate) {
+    SmallPtrSet<Instruction *, 8> InCandidate(Candidate.Nodes.begin(),
+                                              Candidate.Nodes.end());
+    SmallPtrSet<Instruction *, 8> Pending;
+    SmallVector<Instruction *, 8> Worklist = {Dep};
+    while (!Worklist.empty()) {
+      Instruction *I = Worklist.pop_back_val();
+      if (InCandidate.contains(I) || !Pending.insert(I).second)
+        continue;
+      if (!RootCone.contains(I) || !isInlineableInRootCone(I, Root, RootCone) ||
+          InCandidate.size() + Pending.size() > Budget)
+        return false;
+      for (User *U : I->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI)
+          return false;
+        if (!InCandidate.contains(UI))
+          Worklist.push_back(UI);
       }
     }
-    llvm::sort(Nodes, [](Instruction *A, Instruction *B) { return A->comesBefore(B); });
+    Candidate.Nodes.append(Pending.begin(), Pending.end());
+    llvm::sort(Candidate.Nodes, [](Instruction *A, Instruction *B) {
+      return A->comesBefore(B);
+    });
+    return true;
   }
 
-  using HandlerBucketKey =
-      std::tuple<HandlerKind, unsigned, unsigned, Intrinsic::ID,
-                 CmpInst::Predicate, Type *, Type *, Type *>;
-
-  static HandlerBucketKey bucketKey(const HandlerKey &Key) {
-    return {Key.Kind,
-            Key.Opcode,
-            Key.OpNodes.empty()
-                ? (Key.ImmArg ? (Key.ImmArg->isZero() ? 0U : 1U) : 0U)
-                : static_cast<unsigned>(Key.OpHash),
-            Key.IntrinsicID,
-            Key.Predicate,
-            Key.Ty,
-            Key.SrcTy,
-            Key.DstTy};
-  }
-
-  static uint64_t hashValueShape(Value *V, uint64_t H) {
-    if (auto *CI = dyn_cast<ConstantInt>(V)) {
-      H = yanso_mix64(0xC0FFEEULL, H);
-      std::string S;
-      raw_string_ostream OS(S);
-      CI->getValue().print(OS, /*isSigned=*/true);
-      OS.flush();
-      return yanso_hash_string(S, H);
+  static bool isClosedAndSafe(const SuperOpCandidate &Candidate,
+                              Instruction *Root) {
+    SmallPtrSet<Instruction *, 8> InSlice(Candidate.Nodes.begin(),
+                                          Candidate.Nodes.end());
+    if (hasMemoryOrderingBarrierBetweenLoadAndRoot(Candidate.Nodes, Root))
+      return false;
+    for (Instruction *I : Candidate.Nodes) {
+      if (I == Root)
+        continue;
+      for (User *U : I->users()) {
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || !InSlice.contains(UI))
+          return false;
+      }
     }
+    return true;
+  }
+
+  static void enumerateSuperOps(Instruction *Root, unsigned Budget,
+                                SmallVectorImpl<SuperOpCandidate> &Candidates) {
+    if (!Root || !isSupportedVMOpInst(Root) || Budget == 0)
+      return;
+
+    SmallPtrSet<Instruction *, 16> RootCone;
+    collectRootCone(Root, RootCone);
+
+    SmallVector<SuperOpCandidate, 16> Beam;
+    SuperOpCandidate Singleton{{Root}, scoreSuperOp({Root})};
+    Candidates.push_back(Singleton);
+    Beam.push_back(std::move(Singleton));
+    while (!Beam.empty()) {
+      SmallVector<SuperOpCandidate, 32> Next;
+      for (const SuperOpCandidate &Candidate : Beam) {
+        SmallVector<Instruction *, 8> Deps;
+        collectExpandableDeps(Root, Candidate.Nodes, RootCone, Deps);
+        for (Instruction *Dep : Deps) {
+          SuperOpCandidate Expanded = Candidate;
+          if (!expandWithUserClosure(Dep, Root, Budget, RootCone, Expanded))
+            continue;
+          bool Duplicate =
+              llvm::any_of(Candidates,
+                           [&](const auto &Existing) {
+                             return sameCandidate(Existing.Nodes,
+                                                  Expanded.Nodes);
+                           }) ||
+              llvm::any_of(Next, [&](const auto &Existing) {
+                return sameCandidate(Existing.Nodes, Expanded.Nodes);
+              });
+          if (Duplicate)
+            continue;
+          Expanded.Score = scoreSuperOp(Expanded.Nodes);
+          if (isClosedAndSafe(Expanded, Root))
+            Next.push_back(std::move(Expanded));
+        }
+      }
+      llvm::sort(
+          Next, [](const auto &A, const auto &B) { return A.Score > B.Score; });
+      if (Next.size() > 16)
+        Next.resize(16);
+      Candidates.append(Next.begin(), Next.end());
+      Beam.assign(Next.begin(), Next.end());
+    }
+  }
+
+  static void collectVMOpInsts(Instruction *Root, unsigned Budget,
+                               uint64_t Seed,
+                               SmallVectorImpl<Instruction *> &Nodes) {
+    SmallVector<SuperOpCandidate, 32> Candidates;
+    enumerateSuperOps(Root, Budget, Candidates);
+    if (Candidates.empty())
+      return;
+
+    int BestScore = Candidates.front().Score;
+    for (const SuperOpCandidate &Candidate : Candidates)
+      BestScore = std::max(BestScore, Candidate.Score);
+
+    // Softmax-style weights within 24 of the best score; worse candidates get 0.
+    static constexpr unsigned ScoreWindow = 24;
+    SmallVector<unsigned, 32> Weights;
+    SmallVector<unsigned, 32> Eligible;
+    for (unsigned I = 0; I != Candidates.size(); ++I) {
+      const SuperOpCandidate &Candidate = Candidates[I];
+      int Deficit = BestScore - Candidate.Score;
+      unsigned Weight = Deficit <= static_cast<int>(ScoreWindow)
+                            ? ScoreWindow - static_cast<unsigned>(Deficit) + 1
+                            : 0;
+      Weights.push_back(Weight);
+      if (Weight)
+        Eligible.push_back(I);
+    }
+
+    // Weight-proportional rejection sampling via YansoRNG::range.
+    YansoRNG RNG(Seed);
+    unsigned Selected;
+    do {
+      Selected = Eligible[RNG.range(Eligible.size())];
+    } while (RNG.range(ScoreWindow + 1) >= Weights[Selected]);
+    Nodes.append(Candidates[Selected].Nodes.begin(),
+                 Candidates[Selected].Nodes.end());
+  }
+
+  static std::string printKeyValue(Value *V) {
     std::string S;
     raw_string_ostream OS(S);
     V->print(OS);
     OS.flush();
-    return yanso_hash_string(S, yanso_mix64(0xA970ULL, H));
+    return S;
   }
 
-  static uint64_t hashOpDag(ArrayRef<VMOpNode> Nodes, ArrayRef<Type *> ParamTys,
-                            Type *RetTy) {
-    uint64_t H = yanso_hash_string("vmop");
-    H = yanso_hash_string(sanitizedTypeName(RetTy), H);
+  static std::string printKeyType(Type *Ty) {
+    std::string S;
+    raw_string_ostream OS(S);
+    Ty->print(OS);
+    OS.flush();
+    return S;
+  }
+
+  static void appendKeyField(raw_ostream &OS, StringRef Field) {
+    OS << Field.size() << ':' << Field << ';';
+  }
+
+  static void appendTypeKey(raw_ostream &OS, Type *Ty) {
+    appendKeyField(OS, Ty ? printKeyType(Ty) : StringRef());
+  }
+
+  static std::string superOpStructuralKey(ArrayRef<VMOpNode> Nodes,
+                                          ArrayRef<Type *> ParamTys,
+                                          Type *RetTy) {
+    std::string Key;
+    raw_string_ostream OS(Key);
+    OS << "superop;ret=";
+    appendTypeKey(OS, RetTy);
+    OS << "params=" << ParamTys.size() << ';';
     for (Type *ParamTy : ParamTys)
-      H = yanso_hash_string(sanitizedTypeName(ParamTy), H);
+      appendTypeKey(OS, ParamTy);
+    OS << "nodes=" << Nodes.size() << ';';
     for (const VMOpNode &N : Nodes) {
-      H = yanso_mix64(N.Opcode + 1, H);
-      H = yanso_mix64(N.Predicate + 1, H);
-      H = yanso_mix64(N.IntrinsicID + 1, H);
-      if (N.Ty)
-        H = yanso_hash_string(sanitizedTypeName(N.Ty), H);
-      if (N.SrcTy)
-        H = yanso_hash_string(sanitizedTypeName(N.SrcTy), H);
-      if (N.DstTy)
-        H = yanso_hash_string(sanitizedTypeName(N.DstTy), H);
-      if (N.SourceElementTy)
-        H = yanso_hash_string(sanitizedTypeName(N.SourceElementTy), H);
-      H = yanso_mix64(N.Alignment.value(), H);
-      H = yanso_mix64(N.InBounds ? 2 : 1, H);
+      OS << "node;op=" << N.Opcode << ";pred=" << unsigned(N.Predicate)
+         << ";intr=" << unsigned(N.IntrinsicID)
+         << ";align=" << N.Alignment.value()
+         << ";inbounds=" << unsigned(N.InBounds) << ";ty=";
+      appendTypeKey(OS, N.Ty);
+      OS << "src=";
+      appendTypeKey(OS, N.SrcTy);
+      OS << "dst=";
+      appendTypeKey(OS, N.DstTy);
+      OS << "source=";
+      appendTypeKey(OS, N.SourceElementTy);
+      OS << "inputs=" << N.Inputs.size() << ';';
       for (int Ref : N.Inputs)
-        H = yanso_mix64(static_cast<uint64_t>(Ref + 4096), H);
+        OS << Ref << ',';
+      OS << ";constants=" << N.Constants.size() << ';';
       for (Value *C : N.Constants)
-        H = hashValueShape(C, H);
+        appendKeyField(OS, printKeyValue(C));
     }
-    return H;
+    OS.flush();
+    return Key;
   }
 
   uint64_t limitVariantSeed(const HandlerKey &Key, uint64_t Seed) {
-    if (VMMaxVariantsPerOp == 0)
+    if (Key.OpNodes.empty() || VMMaxVariantsPerSuperOp == 0)
       return Seed;
 
-    SmallVector<uint64_t, 8> &Bucket = VariantBuckets[bucketKey(Key)];
-    if (Bucket.size() < VMMaxVariantsPerOp) {
+    SmallVector<uint64_t, 8> &Bucket = SuperOpVariantBuckets[Key.OpKey];
+    if (Bucket.size() < VMMaxVariantsPerSuperOp) {
       Bucket.push_back(Seed);
       return Seed;
     }
@@ -938,26 +858,14 @@ class VirtualizeImpl {
     return Bucket[Pick];
   }
 
-  static void addSingleInstPlan(SmallVectorImpl<VMRewritePlan> &Plans,
-                                Instruction *I, HandlerKey Key,
-                                ArrayRef<Value *> Args) {
-    VMRewritePlan Plan;
-    Plan.Match.Insts.push_back(I);
-    Plan.Match.ResultInst = I;
-    for (Value *Arg : Args)
-      Plan.Match.Args.push_back(Arg);
-    Plan.Variants.push_back({Key, 1});
-    Plans.push_back(std::move(Plan));
-  }
-
   bool addVMOpPlan(SmallVectorImpl<VMRewritePlan> &Plans, Instruction *Root,
-                      SmallPtrSetImpl<Instruction *> &Consumed) {
+                   SmallPtrSetImpl<Instruction *> &Consumed) {
     if (Consumed.contains(Root) || !isSupportedVMOpInst(Root))
       return false;
 
     SmallVector<Instruction *, 8> Insts;
-    unsigned MaxLen = std::max(1U, static_cast<unsigned>(VMOpMaxLen));
-    collectVMOpInsts(Root, MaxLen, Insts);
+    unsigned MaxLen = std::max(1U, static_cast<unsigned>(VMSuperOpMaxLen));
+    collectVMOpInsts(Root, MaxLen, instructionSeed(Root, ModuleSeed), Insts);
     if (Insts.empty())
       return false;
 
@@ -1019,7 +927,8 @@ class VirtualizeImpl {
           }
         }
         if (isa<Constant>(Op)) {
-          N.Inputs.push_back(ConstantRefBase - static_cast<int>(N.Constants.size()));
+          N.Inputs.push_back(ConstantRefBase -
+                             static_cast<int>(N.Constants.size()));
           N.Constants.push_back(Op);
           continue;
         }
@@ -1037,13 +946,12 @@ class VirtualizeImpl {
       Nodes.push_back(std::move(N));
     }
 
-    HandlerKey Key = keyForRoot(Root);
-    if (!Key.Ty && !Key.DstTy)
-      return false;
+    HandlerKey Key;
+    Key.Kind = handlerKindForRoot(Root);
     Key.Ty = Root->getType();
     Key.OpNodes = Nodes;
     Key.OpParamTys = ParamTys;
-    Key.OpHash = hashOpDag(Key.OpNodes, Key.OpParamTys, Key.Ty);
+    Key.OpKey = superOpStructuralKey(Key.OpNodes, Key.OpParamTys, Key.Ty);
 
     VMRewritePlan Plan;
     for (Instruction *I : Insts)
@@ -1051,207 +959,59 @@ class VirtualizeImpl {
     Plan.Match.ResultInst = Root;
     for (Value *Arg : Args)
       Plan.Match.Args.push_back(Arg);
-    Plan.Variants.push_back({Key, 1});
+    Plan.Key = std::move(Key);
     Plans.push_back(std::move(Plan));
     for (Instruction *I : Insts)
       Consumed.insert(I);
     return true;
   }
 
-  void addBinaryPlan(SmallVectorImpl<VMRewritePlan> &Plans, BinaryOperator *BO) {
-    if (!isSupportedInt(BO->getType()) ||
-        !Instruction::isBinaryOp(BO->getOpcode()))
-      return;
-    Value *Args[] = {BO->getOperand(0), BO->getOperand(1)};
-    addSingleInstPlan(Plans, BO, binaryKey(BO), Args);
-  }
-
-  void addICmpPlan(SmallVectorImpl<VMRewritePlan> &Plans, ICmpInst *ICI) {
-    if (!isSupportedScalar(ICI->getOperand(0)->getType()) ||
-        ICI->getOperand(0)->getType() != ICI->getOperand(1)->getType() ||
-        !CmpInst::isIntPredicate(ICI->getPredicate()))
-      return;
-    Value *Args[] = {ICI->getOperand(0), ICI->getOperand(1)};
-    addSingleInstPlan(Plans, ICI, icmpKey(ICI), Args);
-  }
-
-  void addIntrinsicPlan(SmallVectorImpl<VMRewritePlan> &Plans, CallInst *CI) {
-    if (!CI->getCalledFunction() ||
-        CI->getIntrinsicID() == Intrinsic::not_intrinsic ||
-        !isSupportedIntrinsicCall(CI))
-      return;
-
-    ConstantInt *ImmArg = nullptr;
-    if (CI->arg_size() == 2 && CI->getArgOperand(1)->getType()->isIntegerTy(1))
-      ImmArg = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-
-    SmallVector<Value *, 4> Args;
-    for (unsigned I = 0, E = CI->arg_size(); I != E; ++I) {
-      if (ImmArg && I == E - 1)
-        continue;
-      Args.push_back(CI->getArgOperand(I));
-    }
-    addSingleInstPlan(Plans, CI, intrinsicKey(CI, ImmArg), Args);
-  }
-
-  void addCastPlan(SmallVectorImpl<VMRewritePlan> &Plans, CastInst *CI) {
-    if (!isSupportedCast(CI))
-      return;
-    Value *Args[] = {CI->getOperand(0)};
-    addSingleInstPlan(Plans, CI, castKey(CI), Args);
-  }
-
-  void addSelectPlan(SmallVectorImpl<VMRewritePlan> &Plans, SelectInst *SI) {
-    if (!isSupportedSelect(SI))
-      return;
-    Value *Args[] = {SI->getCondition(), SI->getTrueValue(), SI->getFalseValue()};
-    addSingleInstPlan(Plans, SI, selectKey(SI), Args);
-  }
-
-  void addGEPPlan(SmallVectorImpl<VMRewritePlan> &Plans, GetElementPtrInst *GEP) {
-    if (!isSupportedGEP(GEP))
-      return;
-
-    HandlerKey Key = gepKey(GEP);
-    SmallVector<Value *, 4> Args;
-    SmallVector<Value *, 4> IndexOperands;
-    SmallVector<bool, 4> IndexIsConstant;
-    Args.push_back(GEP->getPointerOperand());
-    for (Value *Idx : GEP->indices()) {
-      IndexOperands.push_back(Idx);
-      bool IsConstant = isa<Constant>(Idx);
-      IndexIsConstant.push_back(IsConstant);
-      if (!IsConstant)
-        Args.push_back(Idx);
-    }
-    Key.GEPIndexOperands = IndexOperands;
-    Key.GEPIndexIsConstant = IndexIsConstant;
-    addSingleInstPlan(Plans, GEP, Key, Args);
-  }
-
-  void addLoadPlan(SmallVectorImpl<VMRewritePlan> &Plans, LoadInst *LI) {
-    if (!isSupportedLoad(LI))
-      return;
-    Value *Args[] = {LI->getPointerOperand()};
-    addSingleInstPlan(Plans, LI, loadKey(LI), Args);
-  }
-
   void addStorePlan(SmallVectorImpl<VMRewritePlan> &Plans, StoreInst *SI) {
     if (!isSupportedStore(SI))
       return;
-    Value *Args[] = {SI->getValueOperand(), SI->getPointerOperand()};
-    addSingleInstPlan(Plans, SI, storeKey(SI), Args);
+
+    VMRewritePlan Plan;
+    Plan.Match.Insts.push_back(SI);
+    Plan.Match.Args.push_back(SI->getValueOperand());
+    Plan.Match.Args.push_back(SI->getPointerOperand());
+    Plan.Match.ResultInst = SI;
+    Plan.Key.Kind = HandlerKind::Store;
+    Plan.Key.Ty = SI->getValueOperand()->getType();
+    Plan.Key.SrcTy = SI->getPointerOperandType();
+    Plan.Key.Alignment = SI->getAlign();
+    Plans.push_back(std::move(Plan));
   }
 
-  class PlanCollector : public InstVisitor<PlanCollector> {
-    VirtualizeImpl &Impl;
-    SmallVectorImpl<VMRewritePlan> &Plans;
-    SmallPtrSetImpl<Instruction *> &Consumed;
-
-  public:
-    PlanCollector(VirtualizeImpl &Impl, SmallVectorImpl<VMRewritePlan> &Plans,
-                  SmallPtrSetImpl<Instruction *> &Consumed)
-        : Impl(Impl), Plans(Plans), Consumed(Consumed) {}
-
-    void visitBinaryOperator(BinaryOperator &BO) {
-      if (!Consumed.contains(&BO))
-        Impl.addBinaryPlan(Plans, &BO);
-    }
-    void visitICmpInst(ICmpInst &ICI) {
-      if (!Consumed.contains(&ICI))
-        Impl.addICmpPlan(Plans, &ICI);
-    }
-    void visitCallInst(CallInst &CI) {
-      if (!Consumed.contains(&CI))
-        Impl.addIntrinsicPlan(Plans, &CI);
-    }
-    void visitCastInst(CastInst &CI) {
-      if (!Consumed.contains(&CI))
-        Impl.addCastPlan(Plans, &CI);
-    }
-    void visitSelectInst(SelectInst &SI) {
-      if (!Consumed.contains(&SI))
-        Impl.addSelectPlan(Plans, &SI);
-    }
-    void visitGetElementPtrInst(GetElementPtrInst &GEP) {
-      if (!Consumed.contains(&GEP))
-        Impl.addGEPPlan(Plans, &GEP);
-    }
-    void visitLoadInst(LoadInst &LI) {
-      if (!Consumed.contains(&LI))
-        Impl.addLoadPlan(Plans, &LI);
-    }
-    void visitStoreInst(StoreInst &SI) {
-      // Store is always a single side-effecting VM op: no DAG fusion.
-      if (!Consumed.contains(&SI))
-        Impl.addStorePlan(Plans, &SI);
-    }
-  };
-
-  Function *createHandler(Module &M, const HandlerKey &Key, uint64_t VariantSeed) {
+  Function *createHandler(Module &M, const HandlerKey &Key,
+                          uint64_t VariantSeed) {
     if (!Key.OpNodes.empty())
-      return createOpDagHandler(M, Key.OpNodes, Key.OpParamTys, Key.Ty,
-                                Key.OpHash, VariantSeed);
+      return createSuperOpHandler(M, Key.OpNodes, Key.OpParamTys, Key.Ty,
+                                  Key.OpKey, VariantSeed);
 
-    switch (Key.Kind) {
-    case HandlerKind::Binary:
-      return createBinaryHandler(M, Key.Opcode, cast<IntegerType>(Key.Ty),
-                                 VariantSeed);
-    case HandlerKind::ICmp:
-      return createICmpHandler(M, Key.Predicate, Key.Ty, VariantSeed);
-    case HandlerKind::Intrinsic:
-      return createIntrinsicHandler(M, Key.IntrinsicID,
-                                    cast<IntegerType>(Key.Ty), Key.ImmArg,
-                                    VariantSeed);
-    case HandlerKind::Cast:
-      return createCastHandler(M, Key.Opcode, Key.SrcTy, Key.DstTy,
-                               VariantSeed);
-    case HandlerKind::Select:
-      return createSelectHandler(M, Key.Ty, VariantSeed);
-    case HandlerKind::GEP: {
-      SmallVector<Type *, 4> ParamTys;
-      ParamTys.push_back(Key.SrcTy);
-      for (unsigned I = 0, E = Key.GEPIndexOperands.size(); I != E; ++I)
-        if (!Key.GEPIndexIsConstant[I])
-          ParamTys.push_back(Key.GEPIndexOperands[I]->getType());
-      return createGEPHandler(M, Key.Ty, Key.SourceElementTy,
-                              Key.GEPIndexOperands, Key.GEPIndexIsConstant,
-                              ParamTys, Key.InBounds);
-    }
-    case HandlerKind::Load:
-      return createLoadHandler(M, Key.Ty, Key.SrcTy, Key.Alignment);
-    case HandlerKind::Store:
-      return createStoreHandler(M, Key.Ty, Key.SrcTy, Key.Alignment);
-    }
-    llvm_unreachable("unknown VM handler kind");
-  }
-
-  static VMVariant *selectVariant(VMRewritePlan &Plan) {
-    if (Plan.Variants.empty())
-      return nullptr;
-    return &Plan.Variants.front();
+    if (Key.Kind != HandlerKind::Store)
+      llvm_unreachable("non-store VM plan has no super-op nodes");
+    return createStoreHandler(M, Key.Ty, Key.SrcTy, Key.Alignment);
   }
 
   bool rewritePlan(Module &M, VMRewritePlan &Plan) {
     if (!Plan.Match.ResultInst || Plan.Match.Insts.empty())
       return false;
 
-    VMVariant *Variant = selectVariant(Plan);
-    if (!Variant)
-      return false;
-
     uint64_t VariantSeed = ModuleSeed;
-    VariantSeed = yanso_mix64(static_cast<uint64_t>(Variant->Key.Kind) + 1,
-                              VariantSeed);
-    VariantSeed = yanso_mix64(Variant->Key.Opcode + 1, VariantSeed);
-    VariantSeed = yanso_mix64(Variant->Key.Predicate + 1, VariantSeed);
-    VariantSeed = yanso_mix64(Variant->Key.IntrinsicID + 1, VariantSeed);
+    VariantSeed =
+        yanso_mix64(static_cast<uint64_t>(Plan.Key.Kind) + 1, VariantSeed);
+    if (!Plan.Key.OpNodes.empty()) {
+      const VMOpNode &RootNode = Plan.Key.OpNodes.back();
+      VariantSeed = yanso_mix64(RootNode.Opcode + 1, VariantSeed);
+      VariantSeed = yanso_mix64(RootNode.Predicate + 1, VariantSeed);
+      VariantSeed = yanso_mix64(RootNode.IntrinsicID + 1, VariantSeed);
+    } else {
+      VariantSeed = yanso_mix64(1, VariantSeed);
+      VariantSeed = yanso_mix64(CmpInst::ICMP_EQ + 1, VariantSeed);
+      VariantSeed = yanso_mix64(Intrinsic::not_intrinsic + 1, VariantSeed);
+    }
     VariantSeed = instructionSeed(Plan.Match.ResultInst, VariantSeed);
-    VariantSeed = limitVariantSeed(Variant->Key, VariantSeed);
-
-    Function *Func = createHandler(M, Variant->Key, VariantSeed);
-    if (!Func)
-      return false;
+    VariantSeed = limitVariantSeed(Plan.Key, VariantSeed);
 
     SmallVector<Value *, 8> Args;
     for (TrackingVH<Value> &Arg : Plan.Match.Args) {
@@ -1259,6 +1019,10 @@ class VirtualizeImpl {
         return false;
       Args.push_back(Arg);
     }
+
+    Function *Func = createHandler(M, Plan.Key, VariantSeed);
+    if (!Func)
+      return false;
 
     IRBuilder<> B(Plan.Match.ResultInst);
     CallInst *Call = B.CreateCall(Func, Args);
@@ -1279,25 +1043,28 @@ public:
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
-      // A handler call inserted inside a Windows-EH funclet would need that
-      // funclet's "funclet" operand bundle to verify; deriving it is out of
-      // scope, so leave such functions untouched.
+      // Skip funclet EH: VM calls would need matching "funclet" bundles.
       if (usesFuncletEH(F))
         continue;
       for (BasicBlock &BB : F) {
         SmallVector<Instruction *, 32> Roots;
         for (Instruction &I : BB)
           Roots.push_back(&I);
-        for (Instruction *I : reverse(Roots))
+        for (Instruction *I : reverse(Roots)) {
           addVMOpPlan(Plans, I, Consumed);
+          assert((!isSupportedVMOpInst(I) || Consumed.contains(I)) &&
+                 "supported VM op was not assigned to a super-op plan");
+        }
       }
     }
 
-    PlanCollector Collector(*this, Plans, Consumed);
     for (Function &F : M) {
       if (usesFuncletEH(F))
         continue;
-      Collector.visit(F);
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *SI = dyn_cast<StoreInst>(&I); SI && isSupportedStore(SI))
+            addStorePlan(Plans, SI);
     }
 
     bool Modified = false;

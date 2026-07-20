@@ -19,13 +19,13 @@ static uint64_t rotr64(uint64_t V, unsigned Amount) {
 
 uint64_t yanso_mix64(uint64_t A, uint64_t B) {
   A ^= rotr64(A + B, YansoMixRotate);
-  __uint128_t R = static_cast<__uint128_t>(A) * B;
-  B += static_cast<uint64_t>(R >> 64) + YansoMixAddend;
-  return B ^ static_cast<uint64_t>(R);
+  APInt R = APInt(64, A).zext(128) * APInt(64, B).zext(128);
+  B += R.extractBitsAsZExtValue(64, 64) + YansoMixAddend;
+  return B ^ R.extractBitsAsZExtValue(64, 0);
 }
 
 uint64_t yanso_hash_string(StringRef S, uint64_t Seed) {
-  uint64_t H = Seed;
+  uint64_t H = yanso_mix64(Seed, YansoMixBasis);
   for (unsigned char C : S.bytes())
     H = yanso_mix64(static_cast<uint64_t>(C) + 1, H);
   H = yanso_mix64(static_cast<uint64_t>(S.size()), H);

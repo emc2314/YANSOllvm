@@ -40,6 +40,7 @@ add_llvm_pass_plugin(yansollvm
   lib/Transforms/Obfuscate/Func2ModPass.cpp
   lib/Transforms/Obfuscate/BB2FuncPass.cpp
   lib/Transforms/Obfuscate/ConnectPass.cpp
+  lib/Transforms/Obfuscate/YConstants.cpp
   lib/Transforms/Obfuscate/ObfConPass.cpp
 )
 
@@ -48,6 +49,7 @@ add_executable(ymba-catalog-selftest
   lib/Transforms/Obfuscate/YMBA.cpp
   lib/Transforms/Obfuscate/CryptoUtils.cpp
 )
+llvm_update_compile_flags(ymba-catalog-selftest)
 target_include_directories(ymba-catalog-selftest PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/lib/Transforms/Obfuscate
 )
