@@ -6,12 +6,13 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
+
 #include <algorithm>
+#include <cassert>
 #include <cmath>
-#include <cstddef>
 #include <optional>
 
 using namespace llvm;
@@ -188,126 +189,131 @@ static ConstantInt *loConst(IntegerType *Ty, uint64_t V) {
 
 static Value *notV(IRBuilder<> &B, Value *V) { return B.CreateNot(V); }
 
+enum class XorForm : uint8_t { Direct, OrMinusAnd, AddMinusCarry, DisjointOr };
+
+enum class AndForm : uint8_t { Direct, DeMorgan };
+
+enum class OrForm : uint8_t { Direct, DeMorgan, XorPlusAnd, AddMinusAnd };
+
+enum class AddForm : uint8_t {
+  Direct,
+  XorPlusCarry,
+  SubNegated,
+  NoiseRoundTrip
+};
+
+enum class SubForm : uint8_t { Direct, AddNotPlusOne, NoiseRoundTrip };
+
+enum class ShiftForm : uint8_t { Direct, ArithmeticNoise, BitNoise };
+
+enum class DivRemForm : uint8_t {
+  Direct,
+  XorDividend,
+  NoiseDivisor,
+  MixedOperands
+};
+
+enum class MulForm : uint8_t { Direct, OrMinusAndNoise, AddMinusCarryNoise };
+
 static Value *emitXorExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                          unsigned Variant) {
-  switch (Variant % 4) {
-  case 0:
+                          XorForm Form) {
+  switch (Form) {
+  case XorForm::Direct:
     return B.CreateXor(X, Y);
-  case 1:
+  case XorForm::OrMinusAnd:
     return B.CreateSub(B.CreateOr(X, Y), B.CreateAnd(X, Y));
-  case 2: {
+  case XorForm::AddMinusCarry: {
     Value *A = B.CreateAdd(X, Y);
     Value *C = B.CreateShl(B.CreateAnd(X, Y), loConst(Ty, 1));
     return B.CreateSub(A, C);
   }
-  default: {
+  case XorForm::DisjointOr: {
     Value *A = B.CreateAnd(X, notV(B, Y));
     Value *C = B.CreateAnd(notV(B, X), Y);
     return B.CreateOr(A, C);
   }
   }
+  llvm_unreachable("unknown YMBA xor form");
 }
 
 static Value *emitAndExpr(IRBuilder<> &B, IntegerType *, Value *X, Value *Y,
-                          unsigned Variant) {
-  switch (Variant % 2) {
-  case 0:
+                          AndForm Form) {
+  switch (Form) {
+  case AndForm::Direct:
     return B.CreateAnd(X, Y);
-  default:
+  case AndForm::DeMorgan:
     return notV(B, B.CreateOr(notV(B, X), notV(B, Y)));
   }
+  llvm_unreachable("unknown YMBA and form");
 }
 
 static Value *emitOrExpr(IRBuilder<> &B, IntegerType *, Value *X, Value *Y,
-                         unsigned Variant) {
-  switch (Variant % 4) {
-  case 0:
+                         OrForm Form) {
+  switch (Form) {
+  case OrForm::Direct:
     return B.CreateOr(X, Y);
-  case 1:
+  case OrForm::DeMorgan:
     return notV(B, B.CreateAnd(notV(B, X), notV(B, Y)));
-  case 2:
+  case OrForm::XorPlusAnd:
     return B.CreateAdd(B.CreateXor(X, Y), B.CreateAnd(X, Y));
-  default:
+  case OrForm::AddMinusAnd:
     return B.CreateSub(B.CreateAdd(X, Y), B.CreateAnd(X, Y));
   }
+  llvm_unreachable("unknown YMBA or form");
 }
 
 static Value *emitAddExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                          unsigned Variant) {
-  switch (Variant % 4) {
-  case 0:
+                          AddForm Form) {
+  switch (Form) {
+  case AddForm::Direct:
     return B.CreateAdd(X, Y);
-  case 1:
+  case AddForm::XorPlusCarry:
     return B.CreateAdd(B.CreateXor(X, Y),
                        B.CreateShl(B.CreateAnd(X, Y), loConst(Ty, 1)));
-  case 2:
+  case AddForm::SubNegated:
     return B.CreateSub(X, B.CreateSub(loConst(Ty, 0), Y));
-  default: {
+  case AddForm::NoiseRoundTrip: {
     Value *R = B.CreateAdd(X, Y);
     Value *Noise = B.CreateMul(B.CreateXor(X, Y), loConst(Ty, 3));
     return B.CreateSub(B.CreateAdd(R, Noise), Noise);
   }
   }
+  llvm_unreachable("unknown YMBA add form");
 }
 
 static Value *emitSubExpr(IRBuilder<> &B, IntegerType *Ty, Value *X, Value *Y,
-                          unsigned Variant) {
-  switch (Variant % 3) {
-  case 0:
+                          SubForm Form) {
+  switch (Form) {
+  case SubForm::Direct:
     return B.CreateSub(X, Y);
-  case 1: {
+  case SubForm::AddNotPlusOne: {
     Value *R = B.CreateAdd(X, notV(B, Y));
     return B.CreateAdd(R, loConst(Ty, 1));
   }
-  default: {
+  case SubForm::NoiseRoundTrip: {
     Value *R = B.CreateAdd(X, notV(B, Y));
     R = B.CreateAdd(R, loConst(Ty, 1));
-    Value *Noise = B.CreateMul(emitOrExpr(B, Ty, X, Y, 0), loConst(Ty, 3));
+    Value *Noise =
+        B.CreateMul(emitOrExpr(B, Ty, X, Y, OrForm::Direct), loConst(Ty, 3));
     return B.CreateSub(B.CreateAdd(R, Noise), Noise);
   }
   }
-}
-
-static Value *decorateIntegerResult(IRBuilder<> &B, IntegerType *Ty, Value *V,
-                                    unsigned Variant, uint64_t Seed,
-                                    StringRef NamePrefix) {
-  switch (Variant % 4) {
-  case 0:
-    return V;
-  case 1: {
-    Value *K = loConst(Ty, yanso_mix64(Seed, 0x6a09e667f3bcc909ULL));
-    return B.CreateXor(B.CreateXor(V, K, Twine(NamePrefix) + ".xor0"), K,
-                       Twine(NamePrefix) + ".xor1");
-  }
-  case 2: {
-    Value *N = B.CreateOr(
-        B.CreateAnd(V, loConst(Ty, yanso_mix64(Seed, 0xbb67ae8584caa73bULL))),
-        loConst(Ty, 1), Twine(NamePrefix) + ".noise");
-    return B.CreateSub(B.CreateAdd(V, N, Twine(NamePrefix) + ".add"), N,
-                       Twine(NamePrefix) + ".sub");
-  }
-  default: {
-    Value *K = loConst(Ty, yanso_mix64(Seed, 0x3c6ef372fe94f82bULL));
-    Value *M = B.CreateOr(V, K, Twine(NamePrefix) + ".mix");
-    return B.CreateXor(B.CreateXor(V, M, Twine(NamePrefix) + ".mixxor0"), M,
-                       Twine(NamePrefix) + ".mixxor1");
-  }
-  }
+  llvm_unreachable("unknown YMBA sub form");
 }
 
 static Value *emitShiftExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                            Value *X, Value *Y, unsigned Variant) {
+                            Value *X, Value *Y, ShiftForm Form) {
   unsigned BW = Ty->getBitWidth();
-  switch (Variant % 3) {
-  case 0:
+  switch (Form) {
+  case ShiftForm::Direct:
     return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X, Y);
-  case 1: {
+  case ShiftForm::ArithmeticNoise: {
     Value *Noise = B.CreateMul(B.CreateXor(X, Y), loConst(Ty, 3));
     Value *UseAmt = B.CreateSub(B.CreateAdd(Y, Noise), Noise);
     return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X,
                          UseAmt);
   }
-  default: {
+  case ShiftForm::BitNoise: {
     Value *Salt = loConst(Ty, (BW * 13u) | 1u);
     Value *Noise = B.CreateOr(B.CreateAnd(X, Y), Salt);
     Value *UseAmt = B.CreateSub(B.CreateAdd(Y, Noise), Noise);
@@ -315,30 +321,37 @@ static Value *emitShiftExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
                          UseAmt);
   }
   }
+  llvm_unreachable("unknown YMBA shift form");
 }
 
 static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                             Value *X, Value *Y, unsigned Variant,
+                             Value *X, Value *Y, DivRemForm Form,
                              uint64_t Seed) {
+  YansoChoiceStream Choices(Seed, "ymba.divrem.emit");
+  uint64_t XorKey = Choices.next64();
+  uint64_t NoiseKey = Choices.next64();
+  uint64_t MixKey = Choices.next64();
+  YMBA::IntegerDecoration Decoration =
+      static_cast<YMBA::IntegerDecoration>(Choices.range(4));
+  uint64_t DecorationSeed = Choices.next64();
   Value *UseX = X;
   Value *UseY = Y;
-  switch (Variant % 4) {
-  case 0:
+  switch (Form) {
+  case DivRemForm::Direct:
     break;
-  case 1: {
-    Value *K = loConst(Ty, yanso_mix64(Seed, 0x510e527fade682d1ULL));
+  case DivRemForm::XorDividend: {
+    Value *K = loConst(Ty, XorKey);
     UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.xor0"), K, "vm.div.x.xor1");
     break;
   }
-  case 2: {
-    Value *N = B.CreateOr(
-        B.CreateAnd(X, loConst(Ty, yanso_mix64(Seed, 0x9b05688c2b3e6c1fULL))),
-        loConst(Ty, 1), "vm.div.y.noise");
+  case DivRemForm::NoiseDivisor: {
+    Value *N = B.CreateOr(B.CreateAnd(X, loConst(Ty, NoiseKey)), loConst(Ty, 1),
+                          "vm.div.y.noise");
     UseY = B.CreateSub(B.CreateAdd(Y, N, "vm.div.y.add"), N, "vm.div.y.sub");
     break;
   }
-  default: {
-    Value *K = loConst(Ty, yanso_mix64(Seed, 0x1f83d9abfb41bd6bULL));
+  case DivRemForm::MixedOperands: {
+    Value *K = loConst(Ty, MixKey);
     Value *N = B.CreateOr(B.CreateXor(X, K, "vm.div.xy.mix"), loConst(Ty, 1));
     UseX = B.CreateXor(B.CreateXor(X, K, "vm.div.x.mixxor0"), K,
                        "vm.div.x.mixxor1");
@@ -349,7 +362,8 @@ static Value *emitDivRemExpr(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
   }
   Value *R = B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), UseX,
                            UseY, "vm.divrem.core");
-  return decorateIntegerResult(B, Ty, R, Variant + 1, Seed, "vm.divrem.out");
+  return YMBA::decorateInteger(B, Ty, R, Decoration, DecorationSeed,
+                               "vm.divrem.out");
 }
 
 static void collectBuiltinBinaryCosts(unsigned Opcode,
@@ -392,7 +406,7 @@ static void collectBuiltinBinaryCosts(unsigned Opcode,
 
 static Value *emitBuiltinBinary(IRBuilder<> &B, unsigned Opcode,
                                 IntegerType *Ty, Value *X, Value *Y,
-                                unsigned Variant, uint64_t Seed) {
+                                unsigned FormIndex, uint64_t Seed) {
   // For i1 the multi-bit MBA forms emit a poison `shl i1, 1`. Since the value
   // set is {0,1}, disguise each op as an equivalent sibling instead:
   // and<->mul, xor<->add<->sub coincide at one bit, and or is rebuilt from them.
@@ -416,33 +430,39 @@ static Value *emitBuiltinBinary(IRBuilder<> &B, unsigned Opcode,
   }
   switch (Opcode) {
   case BinaryOperator::Add:
-    return emitAddExpr(B, Ty, X, Y, Variant);
+    return emitAddExpr(B, Ty, X, Y, static_cast<AddForm>(FormIndex));
   case BinaryOperator::Sub:
-    return emitSubExpr(B, Ty, X, Y, Variant);
+    return emitSubExpr(B, Ty, X, Y, static_cast<SubForm>(FormIndex));
   case BinaryOperator::And:
-    return emitAndExpr(B, Ty, X, Y, Variant);
+    return emitAndExpr(B, Ty, X, Y, static_cast<AndForm>(FormIndex));
   case BinaryOperator::Or:
-    return emitOrExpr(B, Ty, X, Y, Variant);
+    return emitOrExpr(B, Ty, X, Y, static_cast<OrForm>(FormIndex));
   case BinaryOperator::Xor:
-    return emitXorExpr(B, Ty, X, Y, Variant);
-  case BinaryOperator::Mul:
-    if (Variant == 0)
+    return emitXorExpr(B, Ty, X, Y, static_cast<XorForm>(FormIndex));
+  case BinaryOperator::Mul: {
+    MulForm Form = static_cast<MulForm>(FormIndex);
+    if (Form == MulForm::Direct)
       return B.CreateMul(X, Y);
-    else {
-      Value *Base = B.CreateMul(X, Y);
-      Value *Noise = B.CreateMul(emitXorExpr(B, Ty, X, Y, Variant),
-                                 loConst(Ty, (Seed % 7) | 1));
-      return B.CreateSub(B.CreateAdd(Base, Noise), Noise);
-    }
+    XorForm NoiseForm = Form == MulForm::OrMinusAndNoise
+                            ? XorForm::OrMinusAnd
+                            : XorForm::AddMinusCarry;
+    YansoChoiceStream Choices(Seed, "ymba.mul.emit");
+    Value *Base = B.CreateMul(X, Y);
+    Value *Noise = B.CreateMul(emitXorExpr(B, Ty, X, Y, NoiseForm),
+                               loConst(Ty, Choices.range(7) | 1));
+    return B.CreateSub(B.CreateAdd(Base, Noise), Noise);
+  }
   case BinaryOperator::Shl:
   case BinaryOperator::LShr:
   case BinaryOperator::AShr:
-    return emitShiftExpr(B, Opcode, Ty, X, Y, Variant);
+    return emitShiftExpr(B, Opcode, Ty, X, Y,
+                         static_cast<ShiftForm>(FormIndex));
   case BinaryOperator::UDiv:
   case BinaryOperator::SDiv:
   case BinaryOperator::URem:
   case BinaryOperator::SRem:
-    return emitDivRemExpr(B, Opcode, Ty, X, Y, Variant, Seed);
+    return emitDivRemExpr(B, Opcode, Ty, X, Y,
+                          static_cast<DivRemForm>(FormIndex), Seed);
   default:
     return B.CreateBinOp(static_cast<Instruction::BinaryOps>(Opcode), X, Y);
   }
@@ -490,19 +510,47 @@ static Value *emitRotateRight(IRBuilder<> &B, IntegerType *Ty, Value *X,
   return B.CreateOr(Lo, Hi, "vm.rel.rot");
 }
 
+enum class BuiltinRelationKind : uint8_t {
+  PopcountCarry,
+  MaskPartition,
+  Affine
+};
+
+struct BuiltinRelationDesc {
+  BuiltinRelationKind Kind;
+  bool RotateX;
+  bool RotateY;
+  bool UseXOnly;
+  unsigned Cost;
+};
+
+static constexpr BuiltinRelationDesc BuiltinRelations[] = {
+    {BuiltinRelationKind::PopcountCarry, false, false, false, 6},
+    {BuiltinRelationKind::PopcountCarry, true, false, false, 9},
+    {BuiltinRelationKind::PopcountCarry, false, true, false, 9},
+    {BuiltinRelationKind::PopcountCarry, true, true, false, 12},
+    {BuiltinRelationKind::MaskPartition, false, false, true, 3},
+    {BuiltinRelationKind::MaskPartition, true, false, true, 6},
+    {BuiltinRelationKind::Affine, false, false, false, 5},
+    {BuiltinRelationKind::Affine, false, false, true, 4},
+};
+
 static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
-                                          Value *X, Value *Y, unsigned Variant,
+                                          Value *X, Value *Y,
+                                          const BuiltinRelationDesc &Desc,
                                           uint64_t Seed) {
-  switch (Variant % 3) {
-  case 0: {
-    Value *A = (Variant & 8)
-                   ? emitRotateRight(
-                         B, Ty, X, 1 + ((Seed >> 21) % (Ty->getBitWidth() - 1)))
-                   : X;
-    Value *C = (Variant & 16)
-                   ? emitRotateRight(
-                         B, Ty, Y, 1 + ((Seed >> 29) % (Ty->getBitWidth() - 1)))
-                   : Y;
+  YansoChoiceStream Choices(Seed, "ymba.builtin.relation");
+  unsigned RotateRange = std::max(1U, Ty->getBitWidth() - 1);
+  unsigned RotateX = 1 + Choices.range(RotateRange);
+  unsigned RotateY = 1 + Choices.range(RotateRange);
+  uint64_t MaskValue = Choices.next64();
+  uint64_t Multiplier = Choices.next64() | 1ULL;
+  uint64_t Addend = Choices.next64();
+
+  switch (Desc.Kind) {
+  case BuiltinRelationKind::PopcountCarry: {
+    Value *A = Desc.RotateX ? emitRotateRight(B, Ty, X, RotateX) : X;
+    Value *C = Desc.RotateY ? emitRotateRight(B, Ty, Y, RotateY) : Y;
     Value *PA = B.CreateUnaryIntrinsic(Intrinsic::ctpop, A);
     Value *PC = B.CreateUnaryIntrinsic(Intrinsic::ctpop, C);
     Value *PXor = B.CreateUnaryIntrinsic(
@@ -514,12 +562,9 @@ static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
         B.CreateAdd(PXor, B.CreateShl(PAnd, loConst(Ty, 1)), "vm.rel.rhs");
     return {L, R};
   }
-  case 1: {
-    Value *Mask = loConst(Ty, yanso_mix64(Seed, 0x8c3d37c819544da2ULL));
-    Value *A = (Variant & 8)
-                   ? emitRotateRight(
-                         B, Ty, X, 1 + ((Seed >> 17) % (Ty->getBitWidth() - 1)))
-                   : X;
+  case BuiltinRelationKind::MaskPartition: {
+    Value *Mask = loConst(Ty, MaskValue);
+    Value *A = Desc.RotateX ? emitRotateRight(B, Ty, X, RotateX) : X;
     Value *L = A;
     Value *R =
         B.CreateOr(B.CreateAnd(A, Mask, "vm.rel.maskpart.lo"),
@@ -527,14 +572,13 @@ static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
                    "vm.rel.maskpart.rhs");
     return {L, R};
   }
-  default: {
-    uint64_t AConst = yanso_mix64(Seed, 0xd1b54a32d192ed03ULL) | 1ULL;
-    uint64_t CConst = yanso_mix64(Seed, 0x94d049bb133111ebULL);
-    Value *A = loConst(Ty, AConst);
+  case BuiltinRelationKind::Affine: {
+    Value *A = loConst(Ty, Multiplier);
     Value *AInv = ConstantInt::get(
-        Ty, yanso_mod_inverse(APInt(Ty->getBitWidth(), AConst, false, true)));
-    Value *C = loConst(Ty, CConst);
-    Value *Base = (Variant & 8) ? X : B.CreateXor(X, Y, "vm.rel.aff.base");
+        Ty,
+        yanso_mod_inverse(APInt(Ty->getBitWidth(), Multiplier, false, true)));
+    Value *C = loConst(Ty, Addend);
+    Value *Base = Desc.UseXOnly ? X : B.CreateXor(X, Y, "vm.rel.aff.base");
     Value *Enc = B.CreateAdd(B.CreateMul(Base, A, "vm.rel.aff.mul"), C,
                              "vm.rel.aff.enc");
     Value *Dec = B.CreateMul(B.CreateSub(Enc, C, "vm.rel.aff.sub"), AInv,
@@ -542,17 +586,7 @@ static YMBA::Relation emitBuiltinRelation(IRBuilder<> &B, IntegerType *Ty,
     return {Base, Dec};
   }
   }
-}
-
-static unsigned builtinRelationCost(unsigned Variant) {
-  switch (Variant % 3) {
-  case 0:
-    return 6;
-  case 1:
-    return (Variant & 8) ? 5 : 3;
-  default:
-    return 5;
-  }
+  llvm_unreachable("unknown builtin relation kind");
 }
 
 class Catalog {
@@ -597,9 +631,9 @@ public:
           (Exprs[R.Expr].WidthMask & WM))
         Bucket.push_back(&R);
     }
-    if (Bucket.empty())
+    if (Index >= Bucket.size())
       return nullptr;
-    return Bucket[Index % Bucket.size()];
+    return Bucket[Index];
   }
 
   void collectRewrites(uint16_t Opcode, unsigned BitWidth,
@@ -642,9 +676,9 @@ public:
                                        unsigned Index) const {
     SmallVector<const RelationRecord *, 16> Bucket;
     collectRelations(BitWidth, Bucket);
-    if (Bucket.empty())
+    if (Index >= Bucket.size())
       return nullptr;
-    return Bucket[Index % Bucket.size()];
+    return Bucket[Index];
   }
 
   unsigned exprCost(uint32_t ExprIndex) const {
@@ -1003,6 +1037,37 @@ static const Catalog &catalog() {
 
 } // namespace
 
+Value *YMBA::decorateInteger(IRBuilder<> &B, IntegerType *Ty, Value *V,
+                             IntegerDecoration Decoration, uint64_t Seed,
+                             StringRef NamePrefix) {
+  YansoChoiceStream Choices(Seed, "integer.decoration");
+  uint64_t XorKey = Choices.next64();
+  uint64_t NoiseKey = Choices.next64();
+  uint64_t MixKey = Choices.next64();
+  switch (Decoration) {
+  case IntegerDecoration::Identity:
+    return V;
+  case IntegerDecoration::XorRoundTrip: {
+    Value *K = loConst(Ty, XorKey);
+    return B.CreateXor(B.CreateXor(V, K, Twine(NamePrefix) + ".xor0"), K,
+                       Twine(NamePrefix) + ".xor1");
+  }
+  case IntegerDecoration::AddSubRoundTrip: {
+    Value *N = B.CreateOr(B.CreateAnd(V, loConst(Ty, NoiseKey)), loConst(Ty, 1),
+                          Twine(NamePrefix) + ".noise");
+    return B.CreateSub(B.CreateAdd(V, N, Twine(NamePrefix) + ".add"), N,
+                       Twine(NamePrefix) + ".sub");
+  }
+  case IntegerDecoration::MixXorRoundTrip: {
+    Value *K = loConst(Ty, MixKey);
+    Value *M = B.CreateOr(V, K, Twine(NamePrefix) + ".mix");
+    return B.CreateXor(B.CreateXor(V, M, Twine(NamePrefix) + ".mixxor0"), M,
+                       Twine(NamePrefix) + ".mixxor1");
+  }
+  }
+  llvm_unreachable("unknown YMBA integer decoration");
+}
+
 static double unitDouble(uint64_t X) {
   return static_cast<double>(X >> 11) * (1.0 / 9007199254740992.0);
 }
@@ -1010,6 +1075,7 @@ static double unitDouble(uint64_t X) {
 static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed,
                                     double Temperature) {
   assert(!Costs.empty());
+  YansoChoiceStream Choices(Seed, "ymba.weighted-choice");
   if (std::isnan(Temperature))
     Temperature = YMBA::DefaultCostTemperature;
   if (Temperature == 0.0) {
@@ -1020,7 +1086,7 @@ static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed,
     return Best;
   }
   if (std::isinf(Temperature))
-    return yanso_mix64(Seed, 0xd6e8feb86659fd93ULL) % Costs.size();
+    return Choices.range(Costs.size());
 
   SmallVector<double, 16> LogWeights;
   LogWeights.reserve(Costs.size());
@@ -1040,9 +1106,9 @@ static unsigned selectWeightedIndex(ArrayRef<unsigned> Costs, uint64_t Seed,
     Total += W;
   }
   if (!(Total > 0.0))
-    return yanso_mix64(Seed, 0xd6e8feb86659fd93ULL) % Costs.size();
+    return Choices.range(Costs.size());
 
-  double Pick = unitDouble(yanso_mix64(Seed, 0xa4093822299f31d0ULL)) * Total;
+  double Pick = unitDouble(Choices.next64()) * Total;
   for (unsigned I = 0, E = Weights.size(); I != E; ++I) {
     if (Pick < Weights[I])
       return I;
@@ -1188,7 +1254,9 @@ Value *YMBA::emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
   FunctionCallee Intr = Intrinsic::getOrInsertDeclaration(
       B.GetInsertBlock()->getModule(), ID, {Ty});
   Value *R = B.CreateCall(Intr, Args, "vm.intr.core");
-  return decorateIntegerResult(B, Ty, R, BuiltinIndex, Seed, "vm.intr.out");
+  YansoChoiceStream DecorationSeeds(Seed, "ymba.intrinsic.emit");
+  return decorateInteger(B, Ty, R, static_cast<IntegerDecoration>(BuiltinIndex),
+                         DecorationSeeds.next64(), "vm.intr.out");
 }
 
 unsigned YMBA::relationCount(unsigned BitWidth) {
@@ -1211,8 +1279,8 @@ static YMBA::Relation emitSelectedRelation(IRBuilder<> &B, IntegerType *Ty,
   SmallVector<const RelationRecord *, 32> Relations;
   catalog().collectRelations(Ty->getBitWidth(), Relations, SafeOnly);
   SmallVector<unsigned, 8> BuiltinCosts;
-  for (unsigned I = 0; I != 3; ++I)
-    BuiltinCosts.push_back(builtinRelationCost(I));
+  for (const BuiltinRelationDesc &Desc : BuiltinRelations)
+    BuiltinCosts.push_back(Desc.Cost);
 
   unsigned BuiltinIndex = 0;
   if (const RelationRecord *R = selectWeightedRelation(
@@ -1223,7 +1291,7 @@ static YMBA::Relation emitSelectedRelation(IRBuilder<> &B, IntegerType *Ty,
       return {L, RV};
   }
 
-  return emitBuiltinRelation(B, Ty, X, Y, BuiltinIndex, Seed);
+  return emitBuiltinRelation(B, Ty, X, Y, BuiltinRelations[BuiltinIndex], Seed);
 }
 
 YMBA::Relation YMBA::emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,

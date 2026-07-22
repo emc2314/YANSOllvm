@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 
@@ -22,6 +23,17 @@ public:
     Value *L = nullptr;
     Value *R = nullptr;
   };
+
+  enum class IntegerDecoration : uint8_t {
+    Identity,
+    XorRoundTrip,
+    AddSubRoundTrip,
+    MixXorRoundTrip
+  };
+
+  static Value *decorateInteger(IRBuilder<> &B, IntegerType *Ty, Value *V,
+                                IntegerDecoration Decoration, uint64_t Seed,
+                                StringRef NamePrefix);
 
   static bool isSupportedBinaryOpcode(unsigned LLVMOpcode);
   static Value *emitBinary(IRBuilder<> &B, unsigned LLVMOpcode, IntegerType *Ty,

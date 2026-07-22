@@ -133,8 +133,7 @@ class VirtualizeImpl {
 
   static std::string intrinsicName(Intrinsic::ID ID) {
     StringRef Name = Intrinsic::getBaseName(ID);
-    if (Name.consume_front("llvm."))
-      return sanitizeName(Name);
+    Name.consume_front("llvm.");
     return sanitizeName(Name);
   }
 
@@ -264,8 +263,8 @@ class VirtualizeImpl {
       case Instruction::SExt:
       case Instruction::PtrToInt:
       case Instruction::IntToPtr: {
-        VMVariantEmitter::ScalarVariant V = VMVariantEmitter::selectCastVariant(
-            N.Opcode, N.SrcTy, N.DstTy, NodeSeed);
+        VMVariantEmitter::CastVariant V =
+            VMVariantEmitter::selectCastVariant(N.SrcTy, N.DstTy, NodeSeed);
         R = VMVariantEmitter::emitCastValue(B, N.Opcode, N.SrcTy, N.DstTy,
                                             Ops[0], V, NodeSeed);
         break;
@@ -300,9 +299,7 @@ class VirtualizeImpl {
         auto *ITy = cast<IntegerType>(N.Ty);
         R = VMVariantEmitter::emitIntrinsicValue(
             B, N.IntrinsicID, ITy, Ops,
-            VMVariantEmitter::selectIntrinsicVariant(N.IntrinsicID, ITy,
-                                                     NodeSeed),
-            NodeSeed);
+            VMVariantEmitter::selectIntrinsicVariant(ITy, NodeSeed), NodeSeed);
         break;
       }
       default: {

@@ -3,6 +3,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <random>
@@ -26,6 +27,28 @@ APInt yanso_mod_inverse(const APInt &A);
 APInt yanso_mod_inverse(const APInt &A, const APInt &Modulus);
 Value *yanso_create_mix64_ir(Value *A, Value *B, BasicBlock *InsertAtEnd,
                              Module &M);
+
+class YansoChoiceStream {
+public:
+  YansoChoiceStream(uint64_t Seed, StringRef Domain)
+      : Root(yanso_hash_string(Domain, Seed)) {}
+
+  uint64_t next64() { return yanso_mix64(Root, ++Sequence); }
+
+  unsigned range(unsigned Count) {
+    assert(Count != 0 && "choice range must not be empty");
+    return static_cast<unsigned>(next64() % Count);
+  }
+
+  bool chance(unsigned Permille) {
+    unsigned Pick = range(1000);
+    return Permille >= 1000 || Pick < Permille;
+  }
+
+private:
+  uint64_t Root;
+  uint64_t Sequence = 0;
+};
 
 class YansoRNG {
 public:

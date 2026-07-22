@@ -1,12 +1,14 @@
 #pragma once
 
+#include "YMBA.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 
 #include <cstdint>
-#include <string>
+#include <optional>
 
 namespace llvm {
 
@@ -14,7 +16,16 @@ namespace llvm {
 /// Binary expr choice is owned by YMBA; VMPass only plans the rewrite.
 class VMVariantEmitter {
 public:
-  enum class MutationKind : uint8_t { None, BitRebuild, DataMux };
+  enum class BinaryMutation : uint8_t {
+    None,
+    BitRebuild,
+    DataMuxAddSub,
+    DataMuxOrAbsorb,
+    DataMuxXorRoundTrip
+  };
+  using IntegerDecoration = YMBA::IntegerDecoration;
+  enum class PredicateExpr : uint8_t { Direct, DoubleNot, XorRoundTrip };
+  enum class SelectExpr : uint8_t { Direct, Inverted, XorRoundTrip };
   enum class ProjectorKind : uint8_t { LowBit, Parity, KeyedBit };
   enum class RelationApplication : uint8_t {
     DiffFold,
@@ -23,31 +34,34 @@ public:
     OpaqueFork
   };
 
-  struct BinaryVariant {
-    MutationKind Mutation = MutationKind::None;
-    unsigned MutationVariant = 0;
-    bool ApplyRelation = false;
+  struct RelationVariant {
     ProjectorKind Projector = ProjectorKind::LowBit;
-    RelationApplication RelationApp = RelationApplication::DiffFold;
+    RelationApplication Application = RelationApplication::DiffFold;
+  };
+
+  struct BinaryVariant {
+    BinaryMutation Mutation = BinaryMutation::None;
+    std::optional<RelationVariant> Relation;
   };
 
   struct PredicateVariant {
-    unsigned ExprVariant = 0;
-    MutationKind Mutation = MutationKind::None;
-    unsigned MutationVariant = 0;
+    PredicateExpr Primary = PredicateExpr::Direct;
+    std::optional<PredicateExpr> Alternate;
   };
 
   struct SelectVariant {
-    unsigned ExprVariant = 0;
-    MutationKind Mutation = MutationKind::None;
-    unsigned MutationVariant = 0;
+    SelectExpr Primary = SelectExpr::Direct;
+    std::optional<SelectExpr> Alternate;
   };
 
-  struct ScalarVariant {
-    unsigned ExprVariant = 0;
-    bool ApplyRelation = false;
-    ProjectorKind Projector = ProjectorKind::LowBit;
-    RelationApplication RelationApp = RelationApplication::DiffFold;
+  struct IntrinsicVariant {
+    std::optional<RelationVariant> Relation;
+  };
+
+  struct CastVariant {
+    IntegerDecoration InputDecoration = IntegerDecoration::Identity;
+    IntegerDecoration OutputDecoration = IntegerDecoration::Identity;
+    std::optional<RelationVariant> Relation;
   };
 
   static BinaryVariant selectBinaryVariant(unsigned Opcode, IntegerType *Ty,
@@ -55,49 +69,29 @@ public:
                                            unsigned MutationPermille,
                                            unsigned RelationAppPermille);
 
-  static std::string suffix(const BinaryVariant &Variant);
-  static std::string suffix(const PredicateVariant &Variant);
-  static std::string suffix(const SelectVariant &Variant);
-
-  static void emitBinary(IRBuilder<> &B, unsigned Opcode, IntegerType *Ty,
-                         Value *X, Value *Y, const BinaryVariant &Variant,
-                         uint64_t Seed);
   static Value *emitBinaryValue(IRBuilder<> &B, unsigned Opcode,
                                 IntegerType *Ty, Value *X, Value *Y,
                                 const BinaryVariant &Variant, uint64_t Seed);
   static PredicateVariant selectPredicateVariant(Type *Ty, uint64_t Seed,
                                                  unsigned MutationPermille);
-  static void emitICmp(IRBuilder<> &B, CmpInst::Predicate Pred, Type *Ty,
-                       Value *X, Value *Y, const PredicateVariant &Variant,
-                       uint64_t Seed);
   static Value *emitICmpValue(IRBuilder<> &B, CmpInst::Predicate Pred, Type *Ty,
                               Value *X, Value *Y,
                               const PredicateVariant &Variant, uint64_t Seed);
   static SelectVariant selectSelectVariant(Type *Ty, uint64_t Seed,
                                            unsigned MutationPermille);
-  static void emitSelect(IRBuilder<> &B, Type *Ty, Value *Cond, Value *TrueV,
-                         Value *FalseV, const SelectVariant &Variant,
-                         uint64_t Seed);
   static Value *emitSelectValue(IRBuilder<> &B, Type *Ty, Value *Cond,
                                 Value *TrueV, Value *FalseV,
                                 const SelectVariant &Variant, uint64_t Seed);
-  static ScalarVariant selectIntrinsicVariant(Intrinsic::ID ID, IntegerType *Ty,
-                                              uint64_t Seed);
-  static ScalarVariant selectCastVariant(unsigned Opcode, Type *SrcTy,
-                                         Type *DstTy, uint64_t Seed);
-  static std::string suffix(const ScalarVariant &Variant);
-  static void emitIntrinsic(IRBuilder<> &B, Intrinsic::ID ID, IntegerType *Ty,
-                            ArrayRef<Value *> Args,
-                            const ScalarVariant &Variant, uint64_t Seed);
+  static IntrinsicVariant selectIntrinsicVariant(IntegerType *Ty,
+                                                 uint64_t Seed);
+  static CastVariant selectCastVariant(Type *SrcTy, Type *DstTy, uint64_t Seed);
   static Value *emitIntrinsicValue(IRBuilder<> &B, Intrinsic::ID ID,
                                    IntegerType *Ty, ArrayRef<Value *> Args,
-                                   const ScalarVariant &Variant, uint64_t Seed);
-  static void emitCast(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
-                       Type *DstTy, Value *X, const ScalarVariant &Variant,
-                       uint64_t Seed);
+                                   const IntrinsicVariant &Variant,
+                                   uint64_t Seed);
   static Value *emitCastValue(IRBuilder<> &B, unsigned Opcode, Type *SrcTy,
-                              Type *DstTy, Value *X,
-                              const ScalarVariant &Variant, uint64_t Seed);
+                              Type *DstTy, Value *X, const CastVariant &Variant,
+                              uint64_t Seed);
 
 private:
   struct Relation {
@@ -106,11 +100,6 @@ private:
   };
 
   static Value *loConst(IntegerType *Ty, uint64_t V);
-  static Value *notV(IRBuilder<> &B, Value *V);
-
-  static Value *decorateIntegerResult(IRBuilder<> &B, IntegerType *Ty, Value *V,
-                                      unsigned Variant, uint64_t Seed,
-                                      StringRef NamePrefix);
 
   static Relation emitRelation(IRBuilder<> &B, IntegerType *Ty, Value *X,
                                Value *Y, uint64_t Seed);
@@ -119,7 +108,8 @@ private:
                               StringRef Name);
 
   static Value *applyRelation(IRBuilder<> &B, IntegerType *Ty, Value *R,
-                              Value *X, Value *Y, const BinaryVariant &Variant,
+                              Value *X, Value *Y,
+                              const std::optional<RelationVariant> &Variant,
                               uint64_t Seed);
   static Value *applyRelationDiffFold(IRBuilder<> &B, IntegerType *Ty, Value *R,
                                       const Relation &Rel);
@@ -134,10 +124,6 @@ private:
   static Value *applyRelationOpaqueFork(IRBuilder<> &B, IntegerType *Ty,
                                         Value *R, const Relation &Rel,
                                         ProjectorKind Projector, uint64_t Seed);
-  static Value *applyScalarRelation(IRBuilder<> &B, IntegerType *Ty, Value *R,
-                                    Value *X, Value *Y,
-                                    const ScalarVariant &Variant,
-                                    uint64_t Seed);
   static bool supportsLoopMutation(unsigned Opcode, unsigned BitWidth);
   static bool supportsDataMuxMutation(unsigned Opcode, unsigned BitWidth);
   static bool supportsRelation(unsigned BitWidth);
@@ -145,20 +131,17 @@ private:
   static bool supportsSelectMutation(Type *Ty);
 
   static Value *emitICmpExpr(IRBuilder<> &B, CmpInst::Predicate Pred, Type *Ty,
-                             Value *X, Value *Y, unsigned ExprVariant,
+                             Value *X, Value *Y, PredicateExpr Expr,
                              uint64_t Seed);
   static Value *emitSelectExpr(IRBuilder<> &B, Type *Ty, Value *Cond,
-                               Value *TrueV, Value *FalseV,
-                               unsigned ExprVariant, uint64_t Seed);
+                               Value *TrueV, Value *FalseV, SelectExpr Expr,
+                               uint64_t Seed);
   static Value *emitControlFlowBitRebuild(IRBuilder<> &B, Function *F,
                                           IntegerType *Ty, Value *Input);
   static Value *emitDataMuxBinaryValue(IRBuilder<> &B, unsigned Opcode,
                                        IntegerType *Ty, Value *X, Value *Y,
                                        const BinaryVariant &Variant,
                                        uint64_t Seed);
-  static void emitDataMuxBinary(IRBuilder<> &B, unsigned Opcode,
-                                IntegerType *Ty, Value *X, Value *Y,
-                                const BinaryVariant &Variant, uint64_t Seed);
 };
 
 } // namespace llvm
